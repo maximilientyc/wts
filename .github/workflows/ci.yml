@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies
+        run: brew install fzf jq tmux tmuxinator
+
+      - name: Lint
+        run: make lint
+
+      - name: Smoke test
+        run: make test

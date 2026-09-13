@@ -1,0 +1,308 @@
+#!/usr/bin/env zsh
+# wts-brief — where each session stands: collected facts, summarized by Claude.
+#
+# Usage: wts-brief [name...]   (normally through `wts brief`, which fixes typos
+#                              in names)
+#
+# For each registered session whose worktree exists — all of them by default —
+# in wts-status urgency order:
+#
+#   rate-limit  idle  feature/rate-limit  +322/-0 ^4  PR #42
+#     done: per-key token bucket on the public API, with tests
+#     next: decide the default quota for anonymous clients
+#
+# The facts come from sources already on disk, no call needed: git (commits,
+# delta, changes), wts-status (agent state) and the worktree's Claude transcript
+# (title, PR link, last prompt, latest agent messages). Claude (Haiku, headless,
+# same precautions as wts-name) turns them into two lines. The summary is cached
+# as long as neither HEAD, nor the changes, nor the transcript have moved:
+# running `wts brief` again is then instant.
+#
+# Variables: WTS_MODEL (haiku), WTS_BRIEF_TIMEOUT (45 s),
+#            WTS_BRIEF_JOBS (4 concurrent calls: each `claude` is heavy),
+#            WTS_NO_LLM=1 (facts only, no call)
+
+# No `set -e`: git and jq legitimately fail (worktree without commits, missing
+# transcript) and one unreadable session must not deprive the others.
+set -uo pipefail
+
+WTS_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wts"
+WTS_BIN="${0:A:h}"
+CACHE_DIR="$WTS_STATE_DIR/brief"
+CACHE_VERSION=v2
+MODEL="${WTS_MODEL:-haiku}"
+TIMEOUT="${WTS_BRIEF_TIMEOUT:-45}"
+JOBS="${WTS_BRIEF_JOBS:-4}"
+
+# zstat rather than stat: the `stat` in PATH may be GNU coreutils', whose
+# options have nothing in common with the macOS one.
+zmodload -F zsh/stat b:zstat 2>/dev/null
+
+SYSTEM_PROMPT="You summarize the progress of a development session for its \
+author, who is coming back to it after a break. Answer in English, exactly two \
+lines and nothing else:
+done: <what has been accomplished, concrete, 100 characters at most>
+next: <what remains to be done, or the decision the author must make, 100 characters at most>
+If nothing indicates what remains, write \"next: nothing identified\"."
+
+command -v jq >/dev/null 2>&1 || { print -u2 "wts-brief: jq is required"; exit 1 }
+[[ -x "$WTS_BIN/wts-status" ]] || { print -u2 "wts-brief: $WTS_BIN/wts-status not found"; exit 1 }
+
+use_llm=false
+if [[ -z "${WTS_NO_LLM:-}" ]] && command -v claude >/dev/null 2>&1; then
+  use_llm=true
+fi
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+# Same rule as `claude_project_dir` in wts: every non-alphanumeric -> "-".
+claude_project_dir() {
+  print -r -- "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/${1//[^a-zA-Z0-9]/-}"
+}
+
+# Headless call: same options, for the same reasons, as wts-name.
+ask_claude() {
+  (
+    cd "$WTS_STATE_DIR" 2>/dev/null || cd /
+    perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" \
+      claude -p --model "$MODEL" --safe-mode --strict-mcp-config \
+        --no-session-persistence --settings '{"disableAllHooks":true}' \
+        --tools "" --system-prompt "$SYSTEM_PROMPT"
+  ) 2>/dev/null
+}
+
+# transcript_last <file> <type> <field> — last value of a record (ai-title,
+# pr-link, last-prompt). grep over the whole file: these lines can be far from
+# the end of a long conversation.
+transcript_last() {
+  grep -F "\"type\":\"$2\"" "$1" 2>/dev/null | tail -n 1 \
+    | jq -r --arg f "$3" '.[$f] // empty' 2>/dev/null
+}
+
+# oneline <text> — on one line, whitespace squeezed.
+oneline() {
+  print -r -- "$1" | tr -s '\n\t\r ' ' ' | sed -E 's/^ //; s/ $//'
+}
+
+# collect <json-object> <idx> — prepares, in $tmpdir:
+#   <idx>.head      header (fields separated by \x1f)
+#   <idx>.facts     facts sent to Claude
+#   <idx>.fallback  raw facts shown without a summary
+#   <idx>.key       cache key
+#   <idx>.brief     the summary, if cached
+#   <idx>.note      nothing to summarize (no visible work)
+collect() {
+  local obj="$1" idx="$2"
+  local name branch worktree subdir base state waiting sid prompt created
+  local added removed ahead dirty
+  eval "$(print -r -- "$obj" | jq -r '@sh "
+    name=\(.name) branch=\(.branch) worktree=\(.worktree) subdir=\(.subdir)
+    base=\(.base) sid=\(.agent_session // "") prompt=\(.prompt // "")
+    state=\(if .stale then "stuck?" else (.agent_state // "-") end)
+    waiting=\(.agent_waiting_for // "" | if type == "string" then . else tojson end)
+    created=\(.created_at // "" | try fromdateiso8601 catch 0)
+    added=\(.added) removed=\(.removed) ahead=\(.ahead) dirty=\(.dirty)"')"
+
+  # --- Claude transcript ----------------------------------------------------
+  # The live agent's one if there is one, otherwise the most recent one of the
+  # worktree or its subdirectory — exact paths, never a prefix (fix-login must
+  # not read fix-login-2).
+  local -a dirs
+  local d f tr="" m best=0
+  dirs=("$(claude_project_dir "$worktree")")
+  [[ -n "$subdir" ]] && dirs+=("$(claude_project_dir "$worktree/$subdir")")
+  if [[ -n "$sid" ]]; then
+    for d in "${dirs[@]}"; do
+      [[ -f "$d/$sid.jsonl" ]] && { tr="$d/$sid.jsonl"; break }
+    done
+  fi
+  if [[ -z "$tr" ]]; then
+    for d in "${dirs[@]}"; do
+      for f in "$d"/*.jsonl(N); do
+        m=$(zstat +mtime "$f" 2>/dev/null) || continue
+        # Older than the session: a previous incarnation of the same name
+        # (wts rm, then wts <name>), whose work is unrelated.
+        (( m >= created && m > best )) && { best=$m; tr="$f" }
+      done
+    done
+  fi
+
+  local title="" pr="" last_prompt="" texts=""
+  if [[ -n "$tr" ]]; then
+    title=$(transcript_last "$tr" ai-title aiTitle)
+    pr=$(transcript_last "$tr" pr-link prUrl)
+    last_prompt=$(transcript_last "$tr" last-prompt lastPrompt)
+    texts=$(tail -n 300 "$tr" | jq -Rrn '
+      [inputs | fromjson? | select(.type == "assistant" and (.isSidechain | not))
+       | .message.content[]? | select(.type == "text") | .text]
+      | join("\n\n") | .[-1500:]' 2>/dev/null)
+    # Not history.jsonl for the starting task: pasted content is replaced there
+    # by "[Pasted text #1]".
+    if [[ -z "$prompt" ]]; then
+      prompt=$(head -n 200 "$tr" | jq -Rrn '
+        first(inputs | fromjson? | select(.type == "user")
+              | .message.content | select(type == "string" and (startswith("<") | not)))
+        // ""' 2>/dev/null)
+    fi
+  fi
+  prompt=${prompt[1,600]}
+
+  # --- git ------------------------------------------------------------------
+  # The branch's own commits: exclude the local base AND origin/<base>,
+  # otherwise a stale local base would pass upstream commits off as the
+  # branch's (wts-fresh cuts branches from origin).
+  local log="" shortstat="" porcelain="" head_sha="" r
+  local -a nots
+  head_sha=$(git -C "$worktree" rev-parse HEAD 2>/dev/null)
+  if [[ -n "$base" ]]; then
+    for r in "$base" "origin/$base"; do
+      git -C "$worktree" rev-parse --verify --quiet "$r^{commit}" >/dev/null 2>&1 && nots+=("$r")
+    done
+  fi
+  (( ${#nots} )) && log=$(git -C "$worktree" log --oneline -n 15 HEAD --not "${nots[@]}" 2>/dev/null)
+  porcelain=$(git -C "$worktree" status --porcelain 2>/dev/null)
+  shortstat=$(git -C "$worktree" diff HEAD --shortstat 2>/dev/null)
+
+  # --- header ---------------------------------------------------------------
+  local pr_label="" delta="+$added/-$removed"
+  [[ "$pr" =~ '/pull/([0-9]+)' ]] && pr_label="PR #${match[1]}"
+  (( ahead > 0 )) && delta+=" ^$ahead"
+  (( dirty > 0 )) && delta+=" · $dirty changed"
+  print -r -- "$name"$'\x1f'"$state"$'\x1f'"$branch"$'\x1f'"$delta"$'\x1f'"$pr_label" \
+    > "$tmpdir/$idx.head"
+
+  if [[ -z "$tr" && -z "$log" && -z "$porcelain" ]]; then
+    print -r -- "nothing yet: no commit, no change, no conversation" > "$tmpdir/$idx.note"
+    return 0
+  fi
+
+  # --- facts ----------------------------------------------------------------
+  {
+    print -r -- "Session: $name"
+    print -r -- "Branch: $branch (base: ${base:-unknown}), $ahead commit(s) ahead, delta +$added/-$removed"
+    print -r -- "Uncommitted changes: $dirty file(s)${shortstat:+ —$shortstat}"
+    print -r -- "Claude agent state: $state${waiting:+ (waiting for: $waiting)}"
+    [[ -n "$pr" ]] && print -r -- "Pull request: $pr"
+    [[ -n "$title" ]] && print -r -- "Conversation title: $title"
+    [[ -n "$prompt" ]] && print -r -- "Starting task: $prompt"
+    [[ -n "$last_prompt" ]] && print -r -- "Author's last message: $last_prompt"
+    [[ -n "$log" ]] && print -r -- $'Branch commits:\n'"$log"
+    [[ -n "$texts" ]] && print -r -- $'Latest agent messages:\n'"$texts"
+  } > "$tmpdir/$idx.facts"
+
+  {
+    local flat
+    [[ -n "$title" ]] && print -r -- "title: $title"
+    [[ -z "$title" && -n "$prompt" ]] && print -r -- "task:  $(oneline "${prompt[1,120]}")"
+    [[ -n "$last_prompt" ]] && print -r -- "you:   $(oneline "${last_prompt[1,120]}")"
+    if [[ -n "$texts" ]]; then
+      flat=$(oneline "$texts")
+      (( ${#flat} > 160 )) && flat="…${flat[-159,-1]}"
+      print -r -- "agent: $flat"
+    fi
+  } > "$tmpdir/$idx.fallback"
+
+  # --- cache ----------------------------------------------------------------
+  local tr_sig="-" key cache="$CACHE_DIR/$name"
+  if [[ -n "$tr" ]]; then
+    tr_sig="$tr:$(zstat +size "$tr" 2>/dev/null):$(zstat +mtime "$tr" 2>/dev/null)"
+  fi
+  key="$CACHE_VERSION|$MODEL|$head_sha|$(print -r -- "$porcelain" | shasum | cut -d' ' -f1)|$tr_sig|$(print -r -- "$prompt" | shasum | cut -d' ' -f1)"
+  print -r -- "$key" > "$tmpdir/$idx.key"
+  if [[ -s "$cache" && "$(head -n 1 "$cache")" == "$key" ]]; then
+    tail -n +2 "$cache" > "$tmpdir/$idx.brief"
+  fi
+}
+
+# summarize <idx> — asks Claude; only writes the summary (and the cache) if the
+# answer has the expected shape, otherwise the display falls back to raw facts.
+summarize() {
+  local idx="$1" out done_line next_line name
+  out=$(ask_claude < "$tmpdir/$idx.facts")
+  done_line=$(print -r -- "$out" | grep -m1 -iE '^[[:space:]*_]*done[[:space:]*_]*:' \
+              | sed -E 's/^[^:]*:[[:space:]*_]*//; s/[*_[:space:]]+$//')
+  next_line=$(print -r -- "$out" | grep -m1 -iE '^[[:space:]*_]*next[[:space:]*_]*:' \
+              | sed -E 's/^[^:]*:[[:space:]*_]*//; s/[*_[:space:]]+$//')
+  [[ -n "$done_line" && -n "$next_line" ]] || return 1
+
+  name=${"$(<"$tmpdir/$idx.head")"%%$'\x1f'*}
+  printf 'done: %s\nnext: %s\n' "$done_line" "$next_line" > "$tmpdir/$idx.brief"
+  cat "$tmpdir/$idx.key" "$tmpdir/$idx.brief" > "$CACHE_DIR/$name.tmp.$$.$idx" \
+    && mv "$CACHE_DIR/$name.tmp.$$.$idx" "$CACHE_DIR/$name"
+}
+
+# ─── Target sessions ─────────────────────────────────────────────────────────
+
+status_json=$("$WTS_BIN/wts-status" --json 2>/dev/null)
+print -r -- "$status_json" | jq -e 'type == "array"' >/dev/null 2>&1 || status_json='[]'
+
+typeset -a sessions
+sessions=("${(@f)$(print -r -- "$status_json" | jq -c --args '
+  $ARGS.positional as $want
+  | .[] | select(.exists)
+  | select(($want | length) == 0 or (.name | IN($want[])))' "$@")}")
+sessions=("${(@)sessions:#}")
+
+for want in "$@"; do
+  print -r -- "$status_json" | jq -e --arg n "$want" 'any(.[]; .name == $n and .exists)' >/dev/null 2>&1 \
+    || print -u2 -r -- "⚠ $want: unknown session, or worktree gone"
+done
+
+if (( ${#sessions} == 0 )); then
+  print -r -- "No session to summarize."
+  exit 0
+fi
+
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/wts-brief.XXXXXX")
+trap 'rm -rf "$tmpdir"' EXIT
+mkdir -p "$CACHE_DIR"
+
+# ─── Collection (sequential: git and jq are fast) ────────────────────────────
+
+typeset -a pending
+integer i=0 total
+for obj in "${sessions[@]}"; do
+  (( ++i ))
+  collect "$obj" "$i"
+  [[ -e "$tmpdir/$i.brief" || -e "$tmpdir/$i.note" ]] || pending+=("$i")
+done
+total=$i
+
+# ─── Summaries (parallel, in batches) ────────────────────────────────────────
+# Batches of $JOBS: zsh has no `wait -n`, and starting every `claude` at once
+# would spike memory without gaining anything on the API side.
+
+if $use_llm && (( ${#pending} )); then
+  print -u2 -r -- "→ summarizing ${#pending} session(s) with Claude…"
+  integer n=0
+  for idx in "${pending[@]}"; do
+    summarize "$idx" &
+    (( ++n % JOBS == 0 )) && wait
+  done
+  wait
+fi
+
+# ─── Rendering, in urgency order ─────────────────────────────────────────────
+
+bold="" dim="" reset=""
+if [[ -t 1 ]]; then
+  bold=$'\e[1m' dim=$'\e[2m' reset=$'\e[0m'
+fi
+
+for (( i = 1; i <= total; i++ )); do
+  IFS=$'\x1f' read -r name state branch delta pr_label < "$tmpdir/$i.head"
+  (( i > 1 )) && print
+  print -r -- "${bold}${name}${reset}  ${state}  ${dim}${branch}  ${delta}${pr_label:+  $pr_label}${reset}"
+  if [[ -s "$tmpdir/$i.note" ]]; then
+    sed 's/^/  /' "$tmpdir/$i.note"
+  elif [[ -s "$tmpdir/$i.brief" ]]; then
+    sed 's/^/  /' "$tmpdir/$i.brief"
+  else
+    $use_llm && print -r -- "  ${dim}(summary unavailable, raw facts)${reset}"
+    if [[ -s "$tmpdir/$i.fallback" ]]; then
+      sed 's/^/  /' "$tmpdir/$i.fallback"
+    else
+      print -r -- "  (no information)"
+    fi
+  fi
+done

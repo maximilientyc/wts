@@ -1,0 +1,435 @@
+#!/usr/bin/env zsh
+# wts-gc — garbage collector for worktrees, branches and registry entries.
+#
+# Usage: wts gc [--apply] [--no-fetch]
+#
+# Default: DRY RUN. Nothing is deleted without --apply.
+#
+# Five categories, all restricted to the current repository:
+#   1. husk folders        — `git worktree remove` does NOT delete git-ignored
+#                            files, so a folder without `.git` is left behind
+#                            in <repo>-worktrees/.
+#   2. worktrees to remove — those holding a dead branch.
+#   3. dead branches       — content entirely present in the base.
+#   4. orphan branches     — remote gone, content MISSING from the base.
+#   5. orphan registry     — entries whose worktree has disappeared. Those of
+#                            the worktrees removed in 2. go along with them.
+#
+# The remote is the source of truth. Fetch --prune first (unless --no-fetch),
+# then compare against `origin/<base>` whenever it exists, not against the local
+# copy of the base, which may lag behind.
+#
+# Why `git branch --merged` is not enough: it only recognizes merges by
+# ancestry. PRs merged by squash or rebase rewrite SHAs, so the branch is never
+# an ancestor of the base and `--merged` does not see it. So we also compare by
+# patch-id (`git cherry`): a branch with no commit marked `+` is entirely
+# present in the base, whatever the merge mode.
+#
+# Caution:
+#   - only <repo>-worktrees/ is scanned for husks, and a folder that has a
+#     `.git` is NEVER proposed (live worktree or independent repository);
+#   - a brand-new branch (no commit since its creation) is never "dead": with
+#     zero commits it is an ancestor of the base, exactly like a merged one;
+#   - a worktree with uncommitted changes is never removed;
+#   - a worktree whose Claude agent is busy (working, blocked, stuck) is never
+#     removed;
+#   - the current tmux session is never killed;
+#   - orphan branches (cat. 4) are NEVER deleted automatically: a deleted remote
+#     branch does not prove its work landed anywhere.
+
+set -uo pipefail
+
+APPLY=false
+FETCH=true
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply)    APPLY=true ;;
+    --no-fetch) FETCH=false ;;
+    --dry-run)  ;;
+    *) print -u2 "wts gc: unknown option '$1' (--apply, --no-fetch)"; exit 2 ;;
+  esac
+  shift
+done
+
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  print -u2 "wts: not in a git repository"
+  exit 1
+fi
+
+repo_root=$(git rev-parse --show-toplevel)
+repo_name=$(basename "$repo_root")
+parent=$(dirname "$repo_root")
+worktree_base="${WTS_WORKTREES_BASE:-${parent}/${repo_name}-worktrees}"
+
+WTS_STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/wts/sessions.json"
+
+# Base branch (same priority order as the wrapper).
+base="${WTS_BASE_BRANCH:-}"
+if [[ -z "$base" ]]; then
+  head_ref=$(git -C "$repo_root" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)
+  if [[ -n "$head_ref" ]]; then
+    base="${head_ref#origin/}"
+  else
+    for c in main master; do
+      git -C "$repo_root" show-ref --verify --quiet "refs/heads/$c" && { base="$c"; break }
+    done
+  fi
+fi
+
+print "Garbage collection — $repo_name (base: ${base:-?})"
+$APPLY && print "Mode: DELETE" || print "Mode: dry run (--apply to execute)"
+
+# ─── Sync with the remote ────────────────────────────────────────────────────
+# Without --prune, a branch deleted on origin keeps its local tracking ref and
+# goes unnoticed. The prune is what makes `[gone]` appear.
+if $FETCH && [[ -n "$(git -C "$repo_root" remote 2>/dev/null)" ]]; then
+  if git -C "$repo_root" fetch --all --prune --quiet 2>/dev/null; then
+    print "Remote: fetch --prune ok"
+  else
+    print "Remote: fetch failed — analysis on local state (results may be stale)"
+  fi
+else
+  print "Remote: not consulted (--no-fetch)"
+fi
+
+# The reference base: origin/<base> if it exists, otherwise the local one.
+base_ref="$base"
+if [[ -n "$base" ]] && git -C "$repo_root" show-ref --verify --quiet "refs/remotes/origin/$base"; then
+  base_ref="origin/$base"
+fi
+[[ -n "$base" ]] && print "Comparing against: $base_ref"
+print ""
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+# Live worktrees according to git (source of truth), and their branch.
+#
+# \x1f separator rather than TAB throughout this file: TAB is an IFS
+# whitespace, so `read` merges consecutive delimiters and swallows empty fields
+# (a detached HEAD has no branch, a session may be unknown to the registry).
+typeset -a live
+typeset -A branch_wt
+while IFS=$'\x1f' read -r wt br; do
+  [[ -n "$wt" ]] || continue
+  live+=("$wt")
+  [[ -n "$br" ]] && branch_wt[$br]="$wt"
+done < <(git -C "$repo_root" worktree list --porcelain 2>/dev/null | awk '
+  /^worktree /{wt=substr($0,10); br=""}
+  /^branch /{br=$2; sub("refs/heads/","",br)}
+  /^$/{if(wt!=""){printf "%s%c%s\n", wt, 31, br; wt=""}}
+  END{if(wt!="")printf "%s%c%s\n", wt, 31, br}')
+
+is_live() {
+  local d="$1" w
+  for w in "${live[@]}"; do
+    [[ "$w" == "$d" ]] && return 0
+  done
+  return 1
+}
+
+human() {
+  local kb="$1"
+  if (( kb >= 1048576 )); then printf '%.1fG' $(( kb / 1048576.0 ))
+  elif (( kb >= 1024 )); then printf '%.0fM' $(( kb / 1024.0 ))
+  else printf '%dK' "$kb"; fi
+}
+
+# Tracking state of each local branch. `track` is "[gone]" when an upstream is
+# configured but its tracking ref no longer exists (branch deleted on the
+# remote, revealed by the --prune above).
+# The `--format` of for-each-ref does not interpret \t (it would print the two
+# literal characters); %1f does produce the 0x1f byte.
+typeset -A track_of
+while IFS=$'\x1f' read -r b tr; do
+  [[ -n "$b" ]] && track_of[$b]="$tr"
+done < <(git -C "$repo_root" for-each-ref \
+  --format='%(refname:short)%1f%(upstream:track)' refs/heads/ 2>/dev/null)
+
+# Branches merged by ancestry (fast-forward or merge commit).
+typeset -A ancestry_merged
+if [[ -n "$base" ]]; then
+  for b in "${(@f)$(git -C "$repo_root" branch --merged "$base_ref" --format '%(refname:short)' 2>/dev/null)}"; do
+    [[ -n "$b" ]] && ancestry_merged[$b]=1
+  done
+fi
+
+# True if every commit of <branch> has an equivalent (patch-id) in the base.
+# `git cherry` marks `+` what is missing and `-` what is already there: no `+`
+# line => content entirely present, squash and rebase included.
+content_merged() {
+  local b="$1" out
+  [[ -n "$base_ref" ]] || return 1
+  out=$(git -C "$repo_root" cherry "$base_ref" "$b" 2>/dev/null) || return 1
+  [[ -z "${out//[[:space:]]/}" ]] && return 0
+  print -r -- "$out" | grep -q '^+' && return 1
+  return 0
+}
+
+# True if <branch> was created and never received a commit. With zero commits
+# of its own, a fresh branch is an ancestor of the base — exactly like a branch
+# merged by fast-forward — and `git cherry` prints nothing for it: both would
+# be classified as merged. `wts <name>` creates such a branch, and its agent
+# may well be thinking without having written anything yet.
+#
+# The reflog tells them apart: `git worktree add -b` (and `git branch`) write a
+# single "branch: Created from <base>" entry, and every commit, merge, rebase or
+# reset adds another. A branch whose remote is `[gone]` was pushed, hence
+# worked on: it is not new. An empty reflog (expired, or disabled with
+# core.logAllRefUpdates) proves nothing, so the branch is judged as before.
+is_new_branch() {
+  local b="$1" ahead line
+  local -a entries
+  [[ "${track_of[$b]:-}" == "[gone]" ]] && return 1
+  ahead=$(git -C "$repo_root" rev-list --count "$base_ref..$b" 2>/dev/null) || return 1
+  (( ${ahead:-1} == 0 )) || return 1
+  entries=("${(@f)$(git -C "$repo_root" reflog show --format=%gs "refs/heads/$b" 2>/dev/null)}")
+  entries=("${(@)entries:#}")
+  (( ${#entries} )) || return 1
+  for line in "${entries[@]}"; do
+    [[ "$line" == "branch: Created from"* ]] || return 1
+  done
+  return 0
+}
+
+# Registered session for a given worktree (empty if unknown).
+session_for_worktree() {
+  local w="$1"
+  [[ -s "$WTS_STATE_FILE" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  jq -r --arg w "$w" 'to_entries[] | select(.value.worktree == $w) | .key' \
+    "$WTS_STATE_FILE" 2>/dev/null | head -1
+}
+
+# Busy agents, by worktree: the agent state comes from wts-status, the single
+# collector of it — not duplicated here. A merged branch whose agent is still
+# working (or waiting for a permission, or looks stuck) is not torn down under
+# its feet. Without wts-status or jq, nothing is known and nothing is held back
+# for this reason: the other safeguards still apply.
+typeset -A busy_wt
+if [[ -x "${0:A:h}/wts-status" ]] && command -v jq >/dev/null 2>&1; then
+  while IFS=$'\x1f' read -r w st; do
+    [[ -n "$w" ]] && busy_wt[$w]="$st"
+  done < <("${0:A:h}/wts-status" --json 2>/dev/null | jq -r '
+    .[]? | select(.stale == true or .agent_state == "working" or .agent_state == "blocked")
+    | "\(.worktree)\(if .stale == true then "stuck?" else .agent_state end)"' 2>/dev/null)
+fi
+
+# Outside tmux, `display-message` falls back to the most recently used session,
+# which would then be spared as if it were the one running this command. Only
+# a real client has a current session.
+cur_session=""
+[[ -n "${TMUX:-}" ]] && cur_session=$(tmux display-message -p '#S' 2>/dev/null)
+
+# ─── 1. Husk folders ─────────────────────────────────────────────────────────
+# Candidates: <repo>-worktrees/* only, where wts creates its worktrees. Sibling
+# folders of the repository are never scanned: a `<repo>-notes/` without `.git`
+# has nothing to do with wts and must not be proposed for `rm -rf`.
+total_kb=0
+typeset -a husks candidates
+husks=(); candidates=()
+[[ -d "$worktree_base" ]] && candidates+=("$worktree_base"/*(N/))
+
+for d in "${candidates[@]}"; do
+  d="${d:A}"
+  [[ "$d" == "$repo_root" ]] && continue
+  # A `.git` (file for a worktree, folder for a repository) => hands off.
+  [[ -e "$d/.git" ]] && continue
+  is_live "$d" && continue
+  husks+=("$d")
+done
+
+if (( ${#husks} )); then
+  print "Husk folders (no .git, leftovers of \`git worktree remove\`):"
+  for d in "${husks[@]}"; do
+    kb=$(du -sk "$d" 2>/dev/null | cut -f1)
+    total_kb=$(( total_kb + ${kb:-0} ))
+    printf '  %8s  %s\n' "$(human ${kb:-0})" "$d"
+  done
+  print "  → $(human $total_kb) reclaimable"
+else
+  print "Husk folders: none"
+fi
+print ""
+
+# ─── Classifying branches ────────────────────────────────────────────────────
+# dead   : content entirely in the base (whatever the merge mode)
+# orphan : remote gone, but some content is still missing from the base
+# new    : created, never committed to — left alone
+typeset -a teardown held free_branches gone_branches new_branches
+teardown=(); held=(); free_branches=(); gone_branches=(); new_branches=()
+
+if [[ -n "$base" ]]; then
+  for b in "${(@f)$(git -C "$repo_root" for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null)}"; do
+    [[ -n "$b" && "$b" != "$base" ]] || continue
+
+    if content_merged "$b"; then
+      if is_new_branch "$b"; then
+        new_branches+=("$b")
+        continue
+      fi
+
+      if [[ -n "${ancestry_merged[$b]:-}" ]]; then why="merged"; else why="squashed/rebased"; fi
+      [[ "${track_of[$b]:-}" == "[gone]" ]] && why="$why, remote deleted"
+
+      wt="${branch_wt[$b]:-}"
+      if [[ -z "$wt" ]]; then
+        free_branches+=("$b"$'\x1f'"$why")
+      elif [[ "$wt" == "$repo_root" ]]; then
+        : # the working branch of the main repository: never touched
+      else
+        dirty=$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+        if (( ${dirty:-0} > 0 )); then
+          held+=("$b"$'\x1f'"$wt"$'\x1f'"${dirty} modified file(s)")
+        elif [[ -n "${busy_wt[$wt]:-}" ]]; then
+          held+=("$b"$'\x1f'"$wt"$'\x1f'"agent busy (${busy_wt[$wt]})")
+        else
+          teardown+=("$b"$'\x1f'"$wt"$'\x1f'"$(session_for_worktree "$wt")"$'\x1f'"$why")
+        fi
+      fi
+
+    elif [[ "${track_of[$b]:-}" == "[gone]" ]]; then
+      gone_branches+=("$b")
+    fi
+  done
+fi
+
+# ─── 2. Worktrees to remove ──────────────────────────────────────────────────
+if (( ${#teardown} )); then
+  print "Worktrees on a dead branch (worktree + session + branch):"
+  for rec in "${teardown[@]}"; do
+    IFS=$'\x1f' read -r b wt sess why <<< "$rec"
+    printf '  %-28s %s\n' "$b" "$wt"
+    printf '  %-28s   → %s%s\n' "" "$why" "${sess:+, tmux session '$sess'}"
+  done
+else
+  print "Worktrees on a dead branch: none"
+fi
+if (( ${#held} )); then
+  print "  (left in place:)"
+  for rec in "${held[@]}"; do
+    IFS=$'\x1f' read -r b wt reason <<< "$rec"
+    printf '  %-28s %s — %s\n' "$b" "$wt" "$reason"
+  done
+fi
+print ""
+
+# ─── 3. Dead branches without a worktree ─────────────────────────────────────
+if (( ${#free_branches} )); then
+  print "Dead branches in '$base_ref', without a worktree:"
+  for rec in "${free_branches[@]}"; do
+    IFS=$'\x1f' read -r b why <<< "$rec"
+    printf '  %-28s (%s)\n' "$b" "$why"
+  done
+else
+  print "Dead branches without a worktree: none"
+fi
+(( ${#new_branches} )) && print "New branches without commits, left alone: ${(j:, :)new_branches}"
+print ""
+
+# ─── 4. Orphan branches ──────────────────────────────────────────────────────
+if (( ${#gone_branches} )); then
+  print "Branches whose remote is gone, content MISSING from '$base_ref':"
+  for b in "${gone_branches[@]}"; do
+    ahead=$(git -C "$repo_root" rev-list --count "$base_ref..$b" 2>/dev/null)
+    printf '  %-28s %s commit(s) the base does not have\n' "$b" "${ahead:-?}"
+  done
+  print "  → never deleted automatically: check before \`git branch -D\`"
+else
+  print "Orphan branches (remote gone, not merged): none"
+fi
+print ""
+
+# ─── 5. Orphan registry entries ──────────────────────────────────────────────
+typeset -a orphans
+orphans=()
+if [[ -s "$WTS_STATE_FILE" ]] && command -v jq >/dev/null 2>&1; then
+  while IFS= read -r n && IFS= read -r w; do
+    [[ -n "$n" ]] || continue
+    [[ -d "$w" ]] || orphans+=("$n")
+  done < <(jq -r 'to_entries[] | [.key, (.value.worktree // "")] | .[]' "$WTS_STATE_FILE" 2>/dev/null)
+fi
+
+# The entries attached to the worktrees removed in 2. are not orphans at scan
+# time — their folder still exists — but will be at the end of this run. The
+# scan alone would miss them by one round, and `wts-switch` (prefix+s) reads
+# the registry: they would stay listed as live sessions until the next gc.
+typeset -a reg_teardown
+reg_teardown=()
+for rec in "${teardown[@]}"; do
+  IFS=$'\x1f' read -r b wt sess why <<< "$rec"
+  [[ -n "$sess" ]] && reg_teardown+=("$sess")
+done
+
+if (( ${#orphans} )); then
+  print "Orphan registry entries: ${(j:, :)orphans}"
+else
+  print "Orphan registry entries: none"
+fi
+(( ${#reg_teardown} )) && print "  (+ removed along with their worktree: ${(j:, :)reg_teardown})"
+print ""
+
+# ─── Execution ───────────────────────────────────────────────────────────────
+if ! $APPLY; then
+  if (( ${#husks} + ${#teardown} + ${#free_branches} + ${#orphans} > 0 )); then
+    print "Nothing was deleted. Run again with: wts gc --apply"
+  fi
+  exit 0
+fi
+
+# Order: removing the worktrees frees their branches, which are deleted next.
+# `purge` accumulates the registry entries to remove: the orphans found above,
+# plus those whose worktree is going away right now.
+typeset -a purge
+purge=("${orphans[@]}")
+
+for rec in "${teardown[@]}"; do
+  IFS=$'\x1f' read -r b wt sess why <<< "$rec"
+  if [[ -n "$sess" ]]; then
+    if [[ "$sess" == "$cur_session" ]]; then
+      print -u2 "⚠ session '$sess' is the current session, not killed"
+    else
+      tmux kill-session -t "=$sess" 2>/dev/null && print "✓ session $sess killed"
+    fi
+  fi
+  if git -C "$repo_root" worktree remove "$wt" 2>/dev/null; then
+    print "✓ worktree $wt removed"
+    [[ -n "$sess" ]] && purge+=("$sess")
+    if git -C "$repo_root" branch -D "$b" >/dev/null 2>&1; then
+      print "✓ branch $b deleted"
+    else
+      print -u2 "⚠ branch $b not deleted"
+    fi
+  else
+    print -u2 "⚠ worktree $wt not removed (branch $b kept)"
+  fi
+done
+
+# `-D` and not `-d`: a squashed branch is not "merged" in git's sense, while
+# its content is indeed in the base — which is what was checked above.
+for rec in "${free_branches[@]}"; do
+  IFS=$'\x1f' read -r b why <<< "$rec"
+  if git -C "$repo_root" branch -D "$b" >/dev/null 2>&1; then
+    print "✓ branch $b deleted ($why)"
+  else
+    print -u2 "⚠ branch $b not deleted"
+  fi
+done
+
+for d in "${husks[@]}"; do
+  if rm -rf -- "$d"; then print "✓ deleted $d"; else print -u2 "⚠ failed to delete $d"; fi
+done
+
+purge=("${(@u)purge}")
+if (( ${#purge} )) && [[ -s "$WTS_STATE_FILE" ]] && command -v jq >/dev/null 2>&1; then
+  tmp="${WTS_STATE_FILE}.tmp.$$"
+  if jq --argjson names "$(printf '%s\n' "${purge[@]}" | jq -R . | jq -sc .)" \
+       'delpaths([$names[] | [.]])' "$WTS_STATE_FILE" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$WTS_STATE_FILE"
+    print "✓ registry: ${#purge} entry(ies) removed"
+  else
+    rm -f "$tmp"
+    print -u2 "⚠ registry not updated"
+  fi
+fi
+
+git -C "$repo_root" worktree prune 2>/dev/null

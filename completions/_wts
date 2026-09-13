@@ -1,0 +1,249 @@
+#compdef wts
+# zsh completion for wts: the subcommands, then for each one only values that
+# make sense there - sessions, layouts, options.
+#
+# Never the files of the current directory: no branch falls back to _files or
+# _default, and an empty result is shown as a message. Without this function
+# zsh applied its default completion and `wts rm <TAB>` listed the cwd.
+#
+# Loading:
+#   Homebrew      installed into $(brew --prefix)/share/zsh/site-functions,
+#                 which is already in fpath: nothing to do.
+#   make install  add the directory to fpath in ~/.zshrc, BEFORE compinit
+#                 (oh-my-zsh runs compinit for you, so before sourcing it):
+#                   fpath=(~/.local/share/zsh/site-functions $fpath)
+#                 or, after compinit:
+#                   fpath=(~/.local/share/zsh/site-functions $fpath)
+#                   autoload -Uz _wts && compdef _wts wts
+#
+# Helpers fill arrays declared `local` by the caller (zsh dynamic scoping).
+# Each source is read at most once per completion.
+
+# Message shown even without candidates. `-r`: no `format` style is assumed,
+# and without one a plain _message displays nothing.
+_wts_say() {
+  _message -r "$1"
+  return 1
+}
+
+# _describe, or a message when there is nothing to offer.
+# Usage: _wts_offer <tag> <label> <message-if-empty> <"name:description">...
+_wts_offer() {
+  local tag=$1 label=$2 empty=$3
+  shift 3
+  local -a cands=("$@")
+  (( ${#cands} )) || { _wts_say "$empty"; return 1 }
+  _describe -t "$tag" "$label" cands
+}
+
+# Registry -> `reg` (session -> branch). One jq call, one field per line: a
+# TAB separator is IFS whitespace and would swallow empty branches.
+_wts_registry() {
+  local f="${XDG_STATE_HOME:-$HOME/.local/state}/wts/sessions.json" name branch
+  [[ -s $f ]] && (( ${+commands[jq]} )) || return 0
+  while IFS= read -r name && IFS= read -r branch; do
+    [[ -n $name ]] && reg[$name]=$branch
+  done < <(jq -r 'to_entries[] | [.key, (.value.branch // "")] | .[]' "$f" 2>/dev/null)
+}
+
+# Running tmux sessions -> `live`.
+_wts_live() {
+  local s
+  for s in ${(f)"$(tmux ls -F '#{session_name}' 2>/dev/null)"}; do
+    [[ -n $s ]] && live[$s]=1
+  done
+}
+
+# Worktrees under <repo>-worktrees/ of the current repository -> `wt` (name ->
+# branch). That is the directory `wts rm` acts on. The main worktree is the
+# first entry of `worktree list` (same rule as wts-fresh), so this also works
+# from inside a worktree.
+_wts_worktrees() {
+  (( ${+commands[git]} )) || return 0
+  local line main="" wtpath="" base
+  local -A branch_of
+  for line in ${(f)"$(git worktree list --porcelain 2>/dev/null)"}; do
+    case $line in
+      'worktree '*)
+        wtpath=${line#worktree }
+        [[ -n $main ]] || main=$wtpath
+        branch_of[$wtpath]="" ;;
+      'branch '*)
+        branch_of[$wtpath]=${line#branch refs/heads/} ;;
+    esac
+  done
+  [[ -n $main ]] || return 0
+
+  base="${WTS_WORKTREES_BASE:-${main:h}/${main:t}-worktrees}"
+  for wtpath in ${(k)branch_of}; do
+    [[ ${wtpath:h} == ${base%/} ]] && wt[${wtpath:t}]=${branch_of[$wtpath]}
+  done
+}
+
+# Layouts, from `wts layouts` ("<name>\t<path>" per line). wts owns the lookup
+# order (user directory first, then built-in layouts), so the completion can
+# never disagree with what `wts <name> <layout>` will actually find.
+_wts_layouts() {
+  (( ${+commands[wts]} )) || { _wts_say "wts not found in PATH"; return 1 }
+  local line name
+  local -a layouts
+  for line in ${(f)"$(command wts layouts 2>/dev/null)"}; do
+    [[ -n $line ]] || continue
+    name=${line%%$'\t'*}
+    layouts+=("${name//:/\\:}:${line#*$'\t'}")
+  done
+  _wts_offer layouts layout "no layout found (see: wts layouts)" "${layouts[@]}"
+}
+
+# `wts rm`: registry + worktrees of the current repository. tmux sessions that
+# wts does not know (`0`...) are left out: `wts rm 0` would kill them.
+_wts_rm_targets() {
+  local -A reg live wt seen
+  local -a cands
+  local name branch state
+  _wts_registry
+  _wts_live
+  _wts_worktrees
+
+  for name in ${(ko)reg} ${(ko)wt}; do
+    (( ${+seen[$name]} )) && continue
+    seen[$name]=1
+    if (( ${+live[$name]} )); then
+      state=running
+    elif (( ${+reg[$name]} )); then
+      state=stopped
+    else
+      state="no session"
+    fi
+    branch=${reg[$name]:-${wt[$name]:-}}
+    cands+=("${name//:/\\:}:${branch:+$branch · }$state")
+  done
+  _wts_offer sessions "wts session" "no wts session or worktree to remove" "${cands[@]}"
+}
+
+# `wts restore`: registered sessions missing from tmux, minus those already typed.
+_wts_restore_targets() {
+  local -A reg live
+  local -a cands typed=(${words[3,CURRENT-1]})
+  local name
+  _wts_registry
+  _wts_live
+
+  for name in ${(ko)reg}; do
+    (( ${+live[$name]} || ${typed[(Ie)$name]} )) && continue
+    cands+=("${name//:/\\:}:${reg[$name]:+${reg[$name]} · }stopped")
+  done
+  _wts_offer sessions "session to restore" "no stopped session to restore" "${cands[@]}"
+}
+
+# `wts brief`: every registered session, minus those already typed.
+_wts_brief_targets() {
+  local -A reg live
+  local -a cands typed=(${words[3,CURRENT-1]})
+  local name state
+  _wts_registry
+  _wts_live
+
+  for name in ${(ko)reg}; do
+    (( ${typed[(Ie)$name]} )) && continue
+    state=stopped
+    (( ${+live[$name]} )) && state=running
+    cands+=("${name//:/\\:}:${reg[$name]:+${reg[$name]} · }$state")
+  done
+  _wts_offer sessions "session to summarize" "no registered session" "${cands[@]}"
+}
+
+_wts() {
+  local -a before=(${words[3,CURRENT-1]}) opts
+
+  if (( CURRENT == 2 )); then
+    _wts_offer commands "wts command" "" \
+      "new:create several sessions at once" \
+      "ls:list registered sessions" \
+      "status:session state (--json, --table, --fzf)" \
+      "brief:where each session stands (done / next, by Claude)" \
+      "restore:restart sessions missing from tmux" \
+      "rm:remove session, worktree and branch" \
+      "gc:clean up dead worktrees and branches" \
+      "layouts:list available layouts" \
+      "setup:print integration snippets (tmux)" \
+      "help:show usage" \
+      "version:show version"
+    return
+  fi
+
+  case ${words[2]} in
+    rm)
+      case $CURRENT in
+        3) _wts_rm_targets ;;
+        # `-f` is only offered after a typed `-`: as the sole candidate, a
+        # reflex Tab would insert it, and Enter would then force the removal.
+        4) if [[ $PREFIX == -* ]]; then
+             _wts_offer options option "" \
+               "-f:force (modified worktree, unmerged branch)"
+           else
+             _wts_say "-f to force the removal"
+           fi ;;
+        *) _wts_say "no more arguments" ;;
+      esac ;;
+
+    restore)
+      _wts_restore_targets ;;
+
+    brief)
+      _wts_brief_targets ;;
+
+    # Tag `flags`, not `options`, when options are the only possible values:
+    # _describe hides the `options` tag until the word starts with `-`
+    # (prefix-needed style, true by default), and `wts gc <TAB>` showed nothing.
+    gc)
+      (( ${before[(Ie)--apply]} || ${before[(Ie)--dry-run]} )) ||
+        opts+=("--apply:do it (otherwise a dry run)" "--dry-run:dry run, the default")
+      (( ${before[(Ie)--no-fetch]} )) ||
+        opts+=("--no-fetch:do not contact the remote (offline)")
+      _wts_offer flags option "no more options" "${opts[@]}" ;;
+
+    status)
+      if (( CURRENT == 3 )); then
+        _wts_offer formats format "" \
+          "--json:JSON, the default" \
+          "--table:the wts ls table" \
+          "--fzf:lines for the switcher"
+      else
+        _wts_say "no more arguments"
+      fi ;;
+
+    setup)
+      if (( CURRENT == 3 )); then
+        _wts_offer targets target "" \
+          "tmux:tmux.conf snippet (switcher, jump, create from tmux)"
+      else
+        _wts_say "no more arguments"
+      fi ;;
+
+    ls|layouts|help|version)
+      _wts_say "no arguments" ;;
+
+    new)
+      if [[ ${words[CURRENT-1]} == -p ]]; then
+        _wts_layouts
+      elif (( CURRENT == 3 )); then
+        _wts_offer flags option "" "-p:choose the layout (default: default)"
+      else
+        _wts_say "session name or \"phrase\" (free text)"
+      fi ;;
+
+    *)
+      # Normal flow: wts <name> ["<phrase>"] [layout] [context...]
+      #              wts "<phrase>" [layout] [context...]
+      # A phrase contains a blank; the layout comes right after it.
+      if (( CURRENT == 3 )) ||
+         { (( CURRENT == 4 )) && [[ ${(Q)words[3]} == *[[:space:]]* ]] }; then
+        _wts_layouts
+      else
+        _wts_say "context (free text, exposed as \$WTS_CONTEXT)"
+      fi ;;
+  esac
+}
+
+_wts "$@"

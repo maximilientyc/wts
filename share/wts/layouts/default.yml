@@ -1,0 +1,51 @@
+<% restore = ENV['WTS_RESTORE'].to_s == '1' %>
+<%
+  # default - the built-in wts layout: an editor next to a Claude Code pane,
+  # plus a shell window.
+  #
+  # Make it yours: copy this file to ~/.config/wts/layouts/<name>.yml and edit
+  # it. A layout in that directory shadows the built-in one of the same name.
+  # This layout adds no branch prefix (branch = session name); to get
+  # feature/<name> branches, give your copy a branch_prefix header - see
+  # "Layouts" in the README, or examples/layouts/feature.yml.
+  #
+  # Keep this file ASCII, comments included: without a UTF-8 locale (LANG=C)
+  # Ruby refuses to read it.
+  #
+  # Claude pane. Panes do not inherit the environment of wts (the tmux server
+  # is already running): the text is injected here, escaped for the pane's
+  # shell - tmuxinator adds its own layer of escaping for send-keys.
+  #  - force_encoding + scrub: without a UTF-8 locale, Ruby reads ENV as
+  #    binary and shellescape would escape each byte of a non-ASCII character;
+  #  - newlines are flattened (they would submit the line), a trailing `;` is
+  #    removed (tmux eats it).
+  # On restore nothing starts: the command is pre-filled on the command line
+  # of the pane's zsh (`print -z`), press Enter to run it. The leading space
+  # keeps it out of the history (histignorespace). `--continue` only when wts
+  # found a conversation for this directory (WTS_RESUME): without one it fails.
+  clean = ->(v) { v.to_s.dup.force_encoding('UTF-8').scrub.gsub(/[[:cntrl:]]/, ' ').strip }
+  task = clean.(ENV['WTS_PROMPT']).sub(/;+\z/, '').strip
+  claude_cmd =
+    if restore
+      ENV['WTS_RESUME'].to_s == '1' ? %q{" print -z 'claude --continue'"} : %q{" print -z claude"}
+    elsif task.empty?
+      'claude'
+    else
+      "claude #{task.shellescape}"
+    end
+
+  # The editor tmuxinator sees ($EDITOR of the shell that ran wts), else vi.
+  editor = ENV.fetch('EDITOR', '').strip
+  editor = 'vi' if editor.empty?
+%>
+name: <%= ENV['WTS_NAME'] %>
+root: <%= ENV['WTS_WORKDIR'] || ENV['WTS_ROOT'] %>
+startup_window: code
+
+windows:
+  - code:
+      layout: main-vertical
+      panes:
+        - <%= editor %>
+        - <%= claude_cmd %>
+  - shell:

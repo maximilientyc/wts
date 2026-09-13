@@ -1,0 +1,46 @@
+# wts: branch_prefix=feature/
+<% restore = ENV['WTS_RESTORE'].to_s == '1' %>
+<%
+  # feature - example of a richer layout: nvim and Claude Code side by side,
+  # a window for dev servers, lazygit. Branches are named feature/<name>
+  # (header on the first line of this file).
+  #
+  # Install: cp feature.yml ~/.config/wts/layouts/ then `wts auth-form feature`.
+  #
+  # Claude pane: same block as share/wts/layouts/default.yml, see its comments
+  # for the escaping and restore details.
+  clean = ->(v) { v.to_s.dup.force_encoding('UTF-8').scrub.gsub(/[[:cntrl:]]/, ' ').strip }
+  task = clean.(ENV['WTS_PROMPT']).sub(/;+\z/, '').strip
+  claude_cmd =
+    if restore
+      ENV['WTS_RESUME'].to_s == '1' ? %q{" print -z 'claude --continue'"} : %q{" print -z claude"}
+    elsif task.empty?
+      'claude'
+    else
+      "claude #{task.shellescape}"
+    end
+%>
+name: <%= ENV['WTS_NAME'] %>
+root: <%= ENV['WTS_WORKDIR'] || ENV['WTS_ROOT'] %>
+startup_window: code
+
+# main-vertical sizes its main pane with tmux's main-pane-width option: set it
+# in your tmux.conf if you want a wider editor. Avoid `set -g` from a layout,
+# it would change every window of every session.
+#
+# On restore (`wts restore`), heavy commands are skipped: panes open on a
+# shell in the right directory instead of starting N agents at once. Commands
+# that must run from the worktree root rather than WTS_SUBDIR can use
+# ENV['WTS_ROOT'], e.g. "#{ENV['WTS_ROOT']}/bin/setup".
+windows:
+  - code:
+      layout: main-vertical
+      panes:
+        - nvim
+        - <%= claude_cmd %>
+  - server:
+      layout: even-horizontal
+      panes:
+        -
+        -
+  - git: lazygit

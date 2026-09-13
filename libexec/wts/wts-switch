@@ -1,0 +1,273 @@
+#!/usr/bin/env zsh
+# wts-switch — fzf session picker, designed for `tmux display-popup -E`.
+#
+# Sessions known to the registry are listed first, sorted by urgency (stuck or
+# blocked agent > idle > working), with a live preview of the agent's pane.
+# tmux sessions unknown to the registry follow.
+#
+#   enter    switch to the session
+#   ctrl-r   reload the list by hand
+#   ctrl-d   delete the session (wts rm) and reload
+#   ctrl-f   scroll the preview down half a page
+#   ctrl-b   scroll the preview up half a page
+#
+# The list and the preview refresh on their own every $WTS_SWITCH_REFRESH
+# seconds (2 by default, 0 to turn it off). See the "Live refresh" section
+# below for why it is wired this way.
+#
+# `--next` (no UI): switch straight to the first agent that needs a human. The
+# engine already sorts in that order, so it is the first line whose state is
+# actionable.
+
+set -uo pipefail
+
+WTS_BIN="${0:A:h}"
+
+# The tmux server's PATH may not contain wts (a popup sources no shell): use
+# the wts installed next to this helper, and only fall back to the PATH.
+WTS_CMD="${0:A:h:h:h}/bin/wts"
+[[ -x "$WTS_CMD" ]] || WTS_CMD=$(command -v wts 2>/dev/null)
+
+# History depth captured for the preview: enough for ctrl-b to go far back,
+# little enough for the capture to stay instant.
+SCROLLBACK="${WTS_SWITCH_SCROLLBACK:-2000}"
+
+# Each line: <display> TAB <preview-target> TAB <session-name>
+# fzf only shows field 1; fields 2 and 3 drive the preview and the switch.
+build_list() {
+  local current known
+  current=$(tmux display-message -p '#S' 2>/dev/null)
+  known=""
+
+  if [[ -x "$WTS_BIN/wts-status" ]] && command -v jq >/dev/null 2>&1; then
+    # \x1f (not whitespace): keeps empty fields, unlike TAB.
+    while IFS=$'\x1f' read -r name agent branch delta dirty pane subject; do
+      [[ -n "$name" ]] || continue
+      known+="$name"$'\n'
+      local mark=""
+      [[ "$name" == "$current" ]] && mark=" *"
+      printf '%-22s %-10s %-30s %-14s %s%s\t%s\t%s\n' \
+        "$name" "$agent" "$branch" "$delta" "${subject:-}" "$mark" \
+        "${pane:-$name}" "$name"
+    done < <("$WTS_BIN/wts-status" --fzf 2>/dev/null)
+  fi
+
+  # tmux sessions missing from the registry (numbered sessions, other projects...).
+  local s
+  while IFS= read -r s; do
+    [[ -n "$s" ]] || continue
+    print -r -- "$known" | grep -qxF -- "$s" && continue
+    local mark=""
+    [[ "$s" == "$current" ]] && mark=" *"
+    printf '%-22s %-10s %-30s %-14s %s%s\t%s\t%s\n' \
+      "$s" "-" "-" "" "(not in registry)" "$mark" "$s" "$s"
+  done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+}
+
+# ─── Preview and scroll ──────────────────────────────────────────────────────
+# The scroll offset cannot live inside fzf: the poller below pushes
+# `refresh-preview` every 2 s, and fzf then recomputes the offset from
+# --preview-window. Without a scroll spec it is 0, so a native
+# `preview-page-up` would be undone within two seconds.
+#
+# So it lives outside fzf: the offset is on-disk state that the preview command
+# reads itself to slice its capture. Scrolling becomes part of what is shown,
+# not of how fzf shows it, so it survives `refresh-preview` untouched and it
+# covers the real tmux history.
+#
+# Trade-off: ctrl-f and ctrl-b were `forward-char` and `backward-char` in the
+# fzf query. The arrow keys remain, and queries are short here.
+
+# State: <target> then <offset in lines from the bottom>. Changing target resets
+# the offset to zero, so moving the cursor in the list brings the preview back
+# to live without binding the `focus` event.
+read_scroll() { # $1 = target ; prints the offset
+  local target="$1" stored_target stored_off
+  [[ -n "${WTS_SWITCH_SCROLL:-}" && -f "$WTS_SWITCH_SCROLL" ]] || { print 0; return }
+  { read -r stored_target; read -r stored_off } < "$WTS_SWITCH_SCROLL"
+  [[ "$stored_target" == "$target" ]] || { print 0; return }
+  print -r -- "${stored_off:-0}"
+}
+
+write_scroll() { # $1 = target, $2 = offset
+  [[ -n "${WTS_SWITCH_SCROLL:-}" ]] || return
+  print -rl -- "$1" "$2" > "$WTS_SWITCH_SCROLL"
+}
+
+preview() { # $1 = target
+  local target="$1" capture
+  capture=$(tmux capture-pane -p -e -S "-$SCROLLBACK" -t "$target" 2>/dev/null)
+  [[ -n "$capture" ]] || { print -r -- "(no preview)"; return }
+
+  # Command substitution already ate the trailing empty lines: the bottom of
+  # the capture is the last line the agent wrote, and offset 0 pins the
+  # preview to live.
+  local -a lines=("${(@f)capture}")
+  local height="${FZF_PREVIEW_LINES:-20}"
+  local off=$(read_scroll "$target")
+
+  # Only --preview knows how many lines were actually captured: it clamps the
+  # offset and writes it back, so --scroll can count blindly.
+  local max=$(( $#lines - height ))
+  (( max < 0 )) && max=0
+  (( off > max )) && off=$max
+  (( off < 0 )) && off=0
+  write_scroll "$target" "$off"
+
+  local end=$(( $#lines - off ))
+  local start=$(( end - height + 1 ))
+  (( start < 1 )) && start=1
+  print -rl -- "${lines[@]:$((start - 1)):$((end - start + 1))}"
+}
+
+scroll() { # $1 = target, $2 = up|down
+  local target="$1" dir="$2"
+  # Half a page sized on the real window height: fzf exports
+  # FZF_PREVIEW_LINES to `execute*` as well as to preview commands.
+  local step=$(( ${FZF_PREVIEW_LINES:-20} / 2 ))
+  (( step < 1 )) && step=1
+  local off=$(read_scroll "$target")
+  case "$dir" in
+    up)   (( off += step )) ;;
+    down) (( off -= step )) ;;
+  esac
+  (( off < 0 )) && off=0
+  write_scroll "$target" "$off"
+}
+
+# Exposes the function to the subshell fzf starts for `reload`.
+if [[ "${1:-}" == "--list" ]]; then
+  build_list
+  exit 0
+fi
+
+# Preview subcommands, called by fzf for the current line.
+if [[ "${1:-}" == "--preview" ]]; then
+  preview "${2:-}"
+  exit 0
+fi
+
+if [[ "${1:-}" == "--scroll" ]]; then
+  scroll "${2:-}" "${3:-}"
+  exit 0
+fi
+
+# Jump straight to the agent that is waiting (bound to prefix+a).
+if [[ "${1:-}" == "--next" ]]; then
+  if [[ ! -x "$WTS_BIN/wts-status" ]] || ! command -v jq >/dev/null 2>&1; then
+    tmux display-message "wts: state engine unavailable" 2>/dev/null
+    exit 1
+  fi
+  current=$(tmux display-message -p '#S' 2>/dev/null)
+  # Actionable = stuck, blocked, failed, or turn finished and waiting for input.
+  # The current session is skipped so that repeated calls cycle through them.
+  target=$("$WTS_BIN/wts-status" --json 2>/dev/null | jq -r --arg cur "$current" '
+    [ .[]
+      | select(.tmux_alive)
+      | select(.stale or (.agent_state | IN("blocked","failed","idle")))
+      | .name ] as $c
+    | (($c | index($cur)) // -1) as $i
+    | if ($c | length) == 0 then empty
+      else $c[(($i + 1) % ($c | length))] end')
+  if [[ -z "$target" ]]; then
+    tmux display-message "wts: no agent waiting" 2>/dev/null
+    exit 0
+  fi
+  tmux switch-client -t "$target" 2>/dev/null || tmux attach -t "$target"
+  exit 0
+fi
+
+list=$(build_list)
+[[ -n "$list" ]] || exit 0
+
+self="$WTS_BIN/wts-switch"
+
+# Exported rather than recomputed, so that the subprocesses started by
+# --preview and by the binds land on this popup's file.
+export WTS_SWITCH_SCROLL="${TMPDIR:-/tmp}/wts-switch.$$.scroll"
+
+# ctrl-d: without a resolvable wts, the bind would fail silently in the popup.
+typeset -a delete_bind
+delete_bind=()
+if [[ -n "$WTS_CMD" ]]; then
+  delete_bind=(--bind="ctrl-d:execute('$WTS_CMD' rm {3})+reload('$self' --list)")
+fi
+
+# ─── Live refresh ────────────────────────────────────────────────────────────
+# fzf has no timer event: its bindable events are start, load, resize, result,
+# change, focus, multi, one, zero, backward-eof, jump, jump-cancel,
+# click-header and click-footer. No interval. The only mechanism meant for an
+# autonomous refresh is --listen: fzf opens a socket, an external poller pushes
+# actions to it.
+#
+# `reload-sync` rather than `reload`: the former only replaces the list once
+# the command has finished, so no empty list blinking every 2 s. It also keeps
+# the cursor and the current query, which avoids --track — which would also
+# change how the cursor behaves while filtering.
+#
+# Caveat: the cursor is kept by INDEX, not by name. If the urgency sort
+# reorders the list under the user's feet, the selected line changes session.
+# That is the price of a list that is both sorted AND live.
+REFRESH="${WTS_SWITCH_REFRESH:-2}"
+sock=""
+poll_pid=""
+
+# sun_path is capped at 104 bytes on macOS. A path that is too long makes the
+# bind fail, fzf exits at once and the popup closes without a word: we would
+# rather knowingly fall back to the static list.
+if [[ "$REFRESH" == <-> ]] && (( REFRESH > 0 )) && command -v curl >/dev/null 2>&1; then
+  candidate="${TMPDIR:-/tmp}/wts-switch.$$.sock"
+  (( ${#candidate} <= 100 )) && sock="$candidate"
+fi
+
+cleanup() {
+  [[ -n "$poll_pid" ]] && kill "$poll_pid" 2>/dev/null
+  [[ -n "$sock" ]] && rm -f "$sock"
+  rm -f "$WTS_SWITCH_SCROLL"
+}
+trap cleanup EXIT INT TERM
+
+typeset -a listen_opts
+listen_opts=()
+if [[ -n "$sock" ]]; then
+  listen_opts=(--listen "$sock")
+  # The poller starts before fzf and waits for the socket to appear: fzf
+  # exposes no "server ready" signal usable from the outside.
+  #
+  # Two safety nets for stopping: the trap kills the poller, and `|| break`
+  # makes it exit on its own as soon as the socket stops answering (fzf
+  # closed). Killing the subshell does not necessarily kill the running
+  # `sleep`, hence the second one.
+  {
+    n=0
+    while [[ ! -S "$sock" ]] && (( n < 100 )); do sleep 0.1; (( n++ )); done
+    while [[ -S "$sock" ]]; do
+      sleep "$REFRESH"
+      curl -s -m 2 --unix-socket "$sock" -XPOST http://localhost/ \
+        -d "reload-sync(\"$self\" --list)+refresh-preview" >/dev/null 2>&1 || break
+    done
+  } &
+  poll_pid=$!
+fi
+
+selection=$(print -r -- "$list" | fzf \
+  "${listen_opts[@]}" \
+  --reverse \
+  --delimiter=$'\t' \
+  --with-nth=1 \
+  --prompt='session> ' \
+  --header="$(printf '%-22s %-10s %-30s %-14s %s' SESSION AGENT BRANCH DELTA SUBJECT)" \
+  --preview="'$self' --preview {2}" \
+  --preview-window='right,60%,border-left' \
+  --bind="ctrl-r:reload('$self' --list)" \
+  "${delete_bind[@]}" \
+  --bind="ctrl-f:execute-silent('$self' --scroll {2} down)+refresh-preview" \
+  --bind="ctrl-b:execute-silent('$self' --scroll {2} up)+refresh-preview" \
+) || exit 0
+
+[[ -n "$selection" ]] || exit 0
+
+target=$(print -r -- "$selection" | cut -f3)
+[[ -n "$target" ]] || exit 0
+
+tmux switch-client -t "$target" 2>/dev/null || tmux attach -t "$target"

@@ -1,0 +1,304 @@
+#!/usr/bin/env zsh
+# wts-fresh — tmux entry point for wts (`C-b :` then `wts …`).
+#
+# Same arguments as `wts`, plus two guarantees the bare command does not give:
+#
+#   1. outside a git repository, refuse — nothing is created;
+#   2. the branch is cut from a freshly fetched `origin/<default>`. If the fetch
+#      fails (offline, no remote), abort: a worktree started from a stale base
+#      is exactly what this command exists to prevent.
+#
+# Usage: wts-fresh <name> ["<phrase>"] [layout] [context...]
+#        wts-fresh "<phrase>" [layout] [context...]
+#        wts-fresh new [-p layout] <name|"phrase"...>
+#        wts-fresh ls | status | brief | restore | layouts | setup | help | version ...
+#                                                   (passed through, no fetch)
+#        wts-fresh gc | rm ...                      (passed through from the main worktree)
+#
+# No option is added to the parsing of `wts`: the base is passed through
+# WTS_BASE_BRANCH, which the wrapper already honors (see its base branch
+# detection).
+#
+# No `set -e` (same choice as wts-gc and wts-switch): fast-forwarding the local
+# base is best-effort and may fail without killing the creation. The steps the
+# guarantee depends on are tested explicitly.
+
+set -uo pipefail
+
+# Helpers live next to this script (libexec/wts/); `wts` itself lives in
+# <prefix>/bin. `:A` resolves symlinks, so this also holds for a Homebrew keg.
+WTS_HELPERS="${0:A:h}"
+WTS_PREFIX="${0:A:h:h:h}"
+
+# A tmux window closes as soon as its command exits: without this, error
+# messages and the output of passthrough commands vanish before they can be
+# read. The nominal path ends with an `exec` and never gets here.
+pause() {
+  [[ -t 0 ]] || return 0
+  print -r -- ""
+  print -r -- "── press any key to close ──"
+  read -k1 -s
+}
+
+die() {
+  print -u2 -r -- "wts: $1"
+  shift
+  local line
+  for line in "$@"; do print -u2 -r -- "     $line"; done
+  pause
+  exit 1
+}
+
+# Runs `wts` as is and returns (used by passthrough commands).
+passthrough() {
+  "$WTS_CMD" "$@"
+  local rc=$?
+  pause
+  exit $rc
+}
+
+# ─── Locating wts ────────────────────────────────────────────────────────────
+# A tmux pane inherits the environment of the server, not of the calling pane,
+# and the execvp sources no shell: PATH may be poorer than elsewhere. Better to
+# fail here than after the worktree has been created.
+
+WTS_CMD="$WTS_PREFIX/bin/wts"
+[[ -x "$WTS_CMD" ]] || WTS_CMD=$(command -v wts 2>/dev/null)
+[[ -n "$WTS_CMD" && -x "$WTS_CMD" ]] || \
+  die "wts not found (neither $WTS_PREFIX/bin/wts nor in PATH)" "PATH=$PATH"
+
+# ─── Input ───────────────────────────────────────────────────────────────────
+
+if (( $# == 0 )); then
+  die "no arguments" \
+      "usage: <name> [\"<phrase>\"] [layout] [context...]   |   \"<phrase>\" [layout]   |   new [-p layout] <name...>"
+fi
+
+# An unclosed apostrophe in the tmux prompt is not a parse error: tmux opens a
+# string that swallows the rest of the line, carriage return included.
+# `wts don't` therefore arrives here as a single argument "dont\n", which would
+# later produce an invalid branch name and an incomprehensible message. Decide
+# early, with the cause.
+for _arg in "$@"; do
+  if [[ "$_arg" == *[[:cntrl:]]* ]]; then
+    die "invalid argument (control character)" \
+        "an unclosed apostrophe swallows the rest of the line: write \"don't\"" \
+        "in double quotes, or avoid the apostrophe in the name"
+  fi
+done
+unset _arg
+
+# These subcommands read the registry or print information, not the repository:
+# subjecting them to the git check would be a regression compared to typing
+# `wts ls` in a shell.
+case "$1" in
+  ls|status|brief|restore|layouts|setup|help|-h|--help|version|-V|--version)
+    passthrough "$@" ;;
+esac
+
+# ─── Repository ──────────────────────────────────────────────────────────────
+
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  die "not in a git repository ($PWD)" \
+      "the window opens in the current pane's directory (#{pane_current_path})"
+fi
+
+# `--show-toplevel` returns the root of the CURRENT worktree: launched from a
+# wts session, that is the agent's worktree, not the repository. `wts` would
+# derive `<worktree>-worktrees/<name>` from it (its worktree base) and nest
+# worktrees in a folder that `wts gc` never scans. So always move to the main
+# worktree — by definition the first entry of `worktree list`.
+repo_root=$(git rev-parse --show-toplevel)
+main_root=$(git -C "$repo_root" worktree list --porcelain 2>/dev/null \
+            | awk '/^worktree /{ print substr($0, 10); exit }')
+[[ -n "$main_root" ]] || main_root="$repo_root"
+
+if [[ "$main_root" != "$repo_root" ]]; then
+  print -r -- "→ launched from a worktree, creating from $main_root"
+fi
+cd "$main_root" || die "cannot access $main_root"
+
+# Repository-dependent, but unrelated to how fresh the base is. Passing them
+# through here lets them benefit from the `cd` above — `wts rm` precisely has
+# to run from the main repository.
+case "$1" in
+  gc|rm) passthrough "$@" ;;
+esac
+
+if ! git remote get-url origin >/dev/null 2>&1; then
+  die "no 'origin' remote in $main_root" \
+      "this command guarantees an up-to-date base: without origin, nothing to guarantee" \
+      "run 'wts $*' from a shell to branch off the local base"
+fi
+
+# ─── Default branch of the remote ────────────────────────────────────────────
+# Order: WTS_BASE_BRANCH already set > local origin/HEAD > ls-remote --symref
+# (network, authoritative) > origin/main > origin/master. The main/master pair
+# follows the order already used by wts, wts-gc and wts-status.
+
+detect_default_branch() {
+  local ref candidate
+
+  # Already imposed (direnv, manual export): respect it, tolerating the
+  # "origin/x" form so as not to fetch a refs/heads/origin/x that does not exist.
+  if [[ -n "${WTS_BASE_BRANCH:-}" ]]; then
+    print -r -- "${WTS_BASE_BRANCH#origin/}"
+    return 0
+  fi
+
+  ref=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)
+  if [[ -n "$ref" ]]; then
+    print -r -- "${ref#origin/}"
+    return 0
+  fi
+
+  # Authority: the remote itself. Output of `ls-remote --symref`:
+  #   ref: refs/heads/master<TAB>HEAD
+  #   <sha><TAB>HEAD
+  ref=$(git ls-remote --symref origin HEAD 2>/dev/null \
+        | awk '$1 == "ref:" { sub(/^refs\/heads\//, "", $2); print $2; exit }')
+  if [[ -n "$ref" ]]; then
+    print -r -- "$ref"
+    return 0
+  fi
+
+  for candidate in main master; do
+    if git show-ref --verify --quiet "refs/remotes/origin/$candidate"; then
+      print -r -- "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+base=$(detect_default_branch) || \
+  die "cannot determine origin's default branch" \
+      "repair with: git remote set-head origin -a" \
+      "or force   : WTS_BASE_BRANCH=<branch>"
+
+# ─── Naming, in parallel with the fetch ──────────────────────────────────────
+# `wts "<phrase>"` without a name: wts-name asks Claude (a few seconds).
+# Started now, the two waits overlap instead of adding up. wts receives the
+# result through WTS_NAME_HINT and keeps control over name uniqueness: only
+# the naming is moved ahead here.
+
+name_file=""
+name_pid=""
+cleanup_name() {
+  [[ -n "$name_pid" ]] && kill "$name_pid" 2>/dev/null
+  [[ -n "$name_file" ]] && rm -f "$name_file"
+}
+trap cleanup_name EXIT
+
+if [[ "$1" == *[[:space:]]* && -x "$WTS_HELPERS/wts-name" ]]; then
+  name_file=$(mktemp "${TMPDIR:-/tmp}/wts-name.XXXXXX")
+  "$WTS_HELPERS/wts-name" "$1" > "$name_file" &
+  name_pid=$!
+  print -r -- "→ naming (during the fetch)"
+fi
+
+# ─── Fetch: this is the guarantee, it must succeed ───────────────────────────
+
+print -r -- "→ fetch origin/$base"
+if ! git fetch --quiet origin "+refs/heads/${base}:refs/remotes/origin/${base}"; then
+  die "could not fetch origin/$base — nothing was created" \
+      "this command exists to guarantee a fresh base; offline," \
+      "run 'wts $*' from a shell to accept the local base"
+fi
+
+# Convenience: if origin/HEAD was missing (old clone), set it now that the
+# answer is known — wts, wts gc and wts-status will read it directly instead of
+# falling back on their heuristics.
+if ! git symbolic-ref --quiet refs/remotes/origin/HEAD >/dev/null 2>&1; then
+  git remote set-head origin "$base" >/dev/null 2>&1 && \
+    print -r -- "→ origin/HEAD restored to $base"
+fi
+
+# ─── Fast-forwarding the local base (best-effort, never blocking) ────────────
+# The branch is cut from origin/<base>, so this step is NOT required for the
+# guarantee. But a local base that lags behind skews everything read later:
+# `git log <base>..`, the delta of `wts ls`, the `git cherry` of wts gc.
+
+ff_local_base() {
+  local base_wt local_sha remote_sha dirty
+
+  if ! git show-ref --verify --quiet "refs/heads/$base"; then
+    print -r -- "→ no local branch '$base' (nothing to fast-forward)"
+    return 0
+  fi
+
+  local_sha=$(git rev-parse --verify --quiet "refs/heads/$base")
+  remote_sha=$(git rev-parse --verify --quiet "refs/remotes/origin/$base")
+  if [[ -n "$local_sha" && "$local_sha" == "$remote_sha" ]]; then
+    print -r -- "→ $base already up to date"
+    return 0
+  fi
+
+  # Which worktree has <base> checked out? The blocks of `worktree list
+  # --porcelain` are "worktree <path> / HEAD <sha> / branch refs/heads/<name>"
+  # (a detached HEAD has no `branch` line, hence the test on $2).
+  base_wt=$(git worktree list --porcelain 2>/dev/null \
+    | awk -v want="refs/heads/$base" '
+        /^worktree / { wt = substr($0, 10) }
+        /^branch /   { if ($2 == want) { print wt; exit } }')
+
+  # Nobody has it checked out: a refspec WITHOUT "+" only accepts a
+  # fast-forward and refuses everything else. Exactly the caution we want.
+  if [[ -z "$base_wt" ]]; then
+    if git fetch --quiet origin "${base}:${base}" 2>/dev/null; then
+      print -r -- "→ $base fast-forwarded to origin/$base"
+    else
+      print -r -- "⚠ $base diverges from origin/$base, left as is"
+    fi
+    return 0
+  fi
+
+  # --untracked-files=no: an untracked file (.envrc, build artifact) must not
+  # forever block a fast-forward that git would perform safely.
+  # `merge --ff-only` refuses to overwrite anything anyway.
+  dirty=$(git -C "$base_wt" status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')
+  if (( ${dirty:-0} > 0 )); then
+    print -r -- "⚠ $base is checked out in $base_wt (${dirty} change(s)): not fast-forwarded"
+    return 0
+  fi
+
+  if git -C "$base_wt" merge --ff-only --quiet "origin/$base" 2>/dev/null; then
+    print -r -- "→ $base fast-forwarded to origin/$base ($base_wt)"
+  else
+    print -r -- "⚠ $base not fast-forwarded (diverged, or git operation in progress in $base_wt)"
+  fi
+}
+
+ff_local_base
+
+# ─── Handing over ────────────────────────────────────────────────────────────
+
+if ! command -v tmuxinator >/dev/null 2>&1; then
+  die "tmuxinator not in PATH" \
+      "PATH=$PATH" \
+      "a tmux window inherits the server's PATH: restart the server from" \
+      "a full shell, or run 'wts $*' directly"
+fi
+
+print -r -- "→ base: origin/$base"
+
+typeset -a hint_env
+hint_env=()
+if [[ -n "$name_pid" ]]; then
+  wait "$name_pid" 2>/dev/null
+  name_pid=""
+  hint=$(<"$name_file")
+  rm -f "$name_file"
+  name_file=""
+  [[ -n "$hint" ]] && hint_env=("WTS_NAME_HINT=$hint")
+fi
+
+# The window does not see the calling pane's environment and sources no shell:
+# without this, a WTS_SUBDIR set by direnv (the monorepo setup in the README)
+# would be invisible and panes would start at the worktree root.
+if [[ -f "$main_root/.envrc" ]] && command -v direnv >/dev/null 2>&1; then
+  exec direnv exec "$main_root" env WTS_BASE_BRANCH="origin/$base" "${hint_env[@]}" "$WTS_CMD" "$@"
+fi
+
+exec env WTS_BASE_BRANCH="origin/$base" "${hint_env[@]}" "$WTS_CMD" "$@"

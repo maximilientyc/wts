@@ -1,0 +1,876 @@
+#!/usr/bin/env zsh
+# wts — git worktree + tmux session launcher, built for parallel Claude Code agents
+#
+# Usage: wts <name> [layout] [context...]
+#        wts <name> "<phrase>" [layout] [context...]
+#        wts "<phrase>" [layout] [context...]
+#        wts new [-p layout] <name|"phrase"...>
+#        wts ls | wts status [--json|--table|--fzf]
+#        wts brief [name...]
+#        wts restore [name...]
+#        wts rm <name> [-f]
+#        wts gc [--apply] [--no-fetch]
+#        wts layouts
+#        wts setup tmux
+#        wts help | wts version
+#
+#   <name>     : name of the worktree AND of the tmux session
+#   <phrase>   : the task in plain words, quoted; Claude starts with it.
+#                Without <name>, Claude proposes the name (a few seconds)
+#   [layout]   : tmuxinator layout (default: default), see `wts layouts`
+#   [context]  : exposed to the layout as $WTS_CONTEXT
+#
+#   new        : create several sessions at once, then attach to the first
+#   ls         : list registered sessions and their state (agent, git delta)
+#   status     : same collection, as JSON (--json), table (--table) or fzf lines (--fzf)
+#   brief      : where each session stands, "done / next", summarized by Claude
+#   restore    : restart registered sessions missing from tmux (after a reboot)
+#                and pre-fill `claude --continue`
+#   rm         : delete the tmux session, the worktree and the branch
+#     -f       : force (dirty worktree, unmerged branch)
+#   gc         : clean up from the remote: worktrees and branches whose PR is
+#                merged (squash included) or whose remote branch is gone
+#   layouts    : list available layouts (yours shadow the built-in ones)
+#   setup tmux : print the tmux.conf snippet (switcher popup, `wts` command)
+#
+# Examples:
+#   wts auth-form
+#   wts auth-form "validate the email server-side before sending it"
+#   wts "users should be able to log out quickly"
+#   wts sentry-ABC123 sentry ABC123
+#   wts new cors rate-limit metering
+#   wts ls
+#   wts brief
+#   wts restore
+#   wts rm auth-form -f
+
+set -euo pipefail
+
+WTS_VERSION="0.1.0"
+
+# ─── Install layout ──────────────────────────────────────────────────────────
+# Homebrew, `make install` and a git checkout all share the same tree:
+#   <prefix>/bin/wts
+#   <prefix>/libexec/wts/wts-*        helpers
+#   <prefix>/share/wts/layouts/*.yml  built-in layouts
+# `:A` resolves symlinks, so the Homebrew link in /opt/homebrew/bin leads back
+# to the real prefix. Captured here and not inside functions: with zsh's
+# FUNCTION_ARGZERO, $0 is the function name there.
+WTS_SELF="${0:A}"
+WTS_PREFIX="${WTS_SELF:h:h}"
+WTS_LIBEXEC="${WTS_LIBEXEC:-$WTS_PREFIX/libexec/wts}"
+WTS_BUILTIN_LAYOUTS="$WTS_PREFIX/share/wts/layouts"
+WTS_USER_LAYOUTS="${WTS_LAYOUTS_PATH:-${XDG_CONFIG_HOME:-$HOME/.config}/wts/layouts}"
+
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+
+# ─── Session registry (for `ls` / `restore`) ─────────────────────────────────
+# State file listing the sessions created by wts, so they can be listed again
+# and restarted after a reboot (worktrees survive one, tmux does not).
+
+WTS_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wts"
+WTS_STATE_FILE="$WTS_STATE_DIR/sessions.json"
+
+registry_available() {
+  command -v jq >/dev/null 2>&1
+}
+
+registry_init() {
+  mkdir -p "$WTS_STATE_DIR"
+  [[ -s "$WTS_STATE_FILE" ]] || echo '{}' > "$WTS_STATE_FILE"
+}
+
+# registry_put <session> <layout> <repo_root> <worktree> <branch> <subdir> <context> [prompt]
+# The prompt is only known at creation: a later `wts <name>` (idempotence)
+# comes without a phrase and must not erase it, hence the old one is kept.
+registry_put() {
+  registry_available || return 0
+  registry_init
+  local tmp="${WTS_STATE_FILE}.tmp.$$"
+  if jq --arg n "$1" --arg profile "$2" --arg repo_root "$3" --arg worktree "$4" \
+        --arg branch "$5" --arg subdir "$6" --arg context "$7" --arg prompt "${8:-}" \
+        --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '.[$n] = {profile: $profile, repo_root: $repo_root, worktree: $worktree,
+                  branch: $branch, subdir: $subdir, context: $context,
+                  prompt: (if $prompt == "" then (.[$n].prompt // "") else $prompt end),
+                  created_at: (.[$n].created_at // $now)}' \
+        "$WTS_STATE_FILE" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$WTS_STATE_FILE"
+  else
+    rm -f "$tmp"
+    echo "⚠ registry not updated ($WTS_STATE_FILE)" >&2
+  fi
+}
+
+registry_del() {
+  registry_available || return 0
+  [[ -s "$WTS_STATE_FILE" ]] || return 0
+  local tmp="${WTS_STATE_FILE}.tmp.$$"
+  if jq --arg n "$1" 'del(.[$n])' "$WTS_STATE_FILE" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$WTS_STATE_FILE"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+# Drop the entries whose worktree is gone.
+registry_prune() {
+  registry_available || return 0
+  [[ -s "$WTS_STATE_FILE" ]] || return 0
+  local name worktree s
+  local -a stale
+  stale=()
+  # One field per line: a TAB separator is IFS whitespace, so consecutive
+  # delimiters would merge and swallow empty fields.
+  while IFS= read -r name && IFS= read -r worktree; do
+    [[ -n "$name" ]] || continue
+    [[ -d "$worktree" ]] || stale+=("$name")
+  done < <(jq -r 'to_entries[] | [.key, (.value.worktree // "")] | .[]' "$WTS_STATE_FILE" 2>/dev/null)
+  for s in "${stale[@]}"; do
+    registry_del "$s"
+  done
+}
+
+# Claude transcripts directory of a worktree. Claude Code slugifies the working
+# directory: every non-alphanumeric character becomes "-", not only "/" and
+# ".": `repo__worktrees` is stored under `repo--worktrees`.
+claude_project_dir() {
+  print -r -- "$CLAUDE_DIR/projects/${1//[^a-zA-Z0-9]/-}"
+}
+
+# Attach to a session. `tmux attach` refuses to nest sessions when $TMUX is
+# already set ("sessions should be nested with care"): from a pane, and so from
+# the window opened by `C-b : wts …`, `switch-client` is the right call.
+attach_or_switch() {
+  if [[ -n "${TMUX:-}" ]] && tmux switch-client -t "=$1" 2>/dev/null; then
+    exit 0
+  fi
+  exec tmux attach -t "=$1"
+}
+
+# Resolve an approximate name to a registry key.
+# Writes the chosen name on stdout, messages on stderr.
+# Why: `wts rm` matches the literal string, and a typo (`rm auth-fom`) used to
+# cost a round trip of `wts ls` and retyping.
+registry_resolve_name() {
+  local want="$1"
+  registry_available || { print -r -- "$want"; return 0 }
+  [[ -s "$WTS_STATE_FILE" ]] || { print -r -- "$want"; return 0 }
+
+  # Exact match: nothing to do.
+  if jq -e --arg n "$want" 'has($n)' "$WTS_STATE_FILE" >/dev/null 2>&1; then
+    print -r -- "$want"
+    return 0
+  fi
+
+  typeset -a keys cands
+  keys=("${(@f)$(jq -r 'keys[]' "$WTS_STATE_FILE" 2>/dev/null)}")
+  (( ${#keys} )) || { print -r -- "$want"; return 0 }
+
+  # Substring either way (covers a typo by omission: "rate-lim" is a prefix
+  # of "rate-limit").
+  local k
+  for k in "${keys[@]}"; do
+    [[ -n "$k" ]] || continue
+    if [[ "$k" == *"$want"* || "$want" == *"$k"* ]]; then
+      cands+=("$k")
+    fi
+  done
+
+  # Fallback 1: fzf fuzzy filtering (subsequence). Catches omissions.
+  if (( ${#cands} == 0 )) && command -v fzf >/dev/null 2>&1; then
+    cands=("${(@f)$(print -rl -- "${keys[@]}" | fzf --filter="$want" 2>/dev/null | head -5)}")
+    cands=("${(@)cands:#}")
+  fi
+
+  # Fallback 2: edit distance. fzf matches subsequences, so it does NOT see an
+  # extra character (auth-foorm vs auth-form).
+  if (( ${#cands} == 0 )); then
+    cands=("${(@f)$(print -rl -- "${keys[@]}" | awk -v q="$want" '
+      function lev(a, b,   la, lb, i, j, c, x, y, z, d) {
+        la = length(a); lb = length(b)
+        for (i = 0; i <= la; i++) d[i, 0] = i
+        for (j = 0; j <= lb; j++) d[0, j] = j
+        for (i = 1; i <= la; i++)
+          for (j = 1; j <= lb; j++) {
+            c = (substr(a, i, 1) == substr(b, j, 1)) ? 0 : 1
+            x = d[i-1, j] + 1; y = d[i, j-1] + 1; z = d[i-1, j-1] + c
+            d[i, j] = (x < y ? (x < z ? x : z) : (y < z ? y : z))
+          }
+        return d[la, lb]
+      }
+      BEGIN { max = int(length(q) / 4); if (max < 2) max = 2 }
+      { d = lev(tolower(q), tolower($0)); if (d <= max) print d "\t" $0 }
+    ' | sort -n | cut -f2- | head -5)}")
+    cands=("${(@)cands:#}")
+  fi
+
+  case ${#cands} in
+    0) print -r -- "$want" ;;
+    1) print -u2 "→ '$want' not found, single match: '${cands[1]}'"
+       print -r -- "${cands[1]}" ;;
+    *) if [[ -t 0 ]] && command -v fzf >/dev/null 2>&1; then
+         local pick
+         pick=$(print -rl -- "${cands[@]}" | fzf --reverse --height=40% \
+                  --prompt="'$want' ? " --header="several matches") || return 1
+         [[ -n "$pick" ]] || return 1
+         print -r -- "$pick"
+       else
+         print -u2 "wts: '$want' is ambiguous: ${(j:, :)cands}"
+         return 1
+       fi ;;
+  esac
+}
+
+# ─── Layouts ─────────────────────────────────────────────────────────────────
+# Yours first (~/.config/wts/layouts, or $WTS_LAYOUTS_PATH), then the built-in
+# ones. tmuxinator gets the file itself (--project-config), so your own
+# ~/.config/tmuxinator projects are never touched.
+
+# layout_file <name> — path of the layout, or failure.
+layout_file() {
+  local dir
+  for dir in "$WTS_USER_LAYOUTS" "$WTS_BUILTIN_LAYOUTS"; do
+    if [[ -f "$dir/$1.yml" ]]; then
+      print -r -- "$dir/$1.yml"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# layout_list — "<name>\t<path>" per available layout, sorted by name. A user
+# layout shadows the built-in one of the same name. Always succeeds: callers
+# run it under `set -e`.
+layout_list() {
+  local -A seen
+  local -a out
+  local f n
+  for f in "$WTS_USER_LAYOUTS"/*.yml(N) "$WTS_BUILTIN_LAYOUTS"/*.yml(N); do
+    n=${f:t:r}
+    (( ${+seen[$n]} )) && continue
+    seen[$n]=1
+    out+=("$n"$'\t'"$f")
+  done
+  if (( ${#out} )); then
+    print -rl -- "${(o)out[@]}"
+  fi
+  return 0
+}
+
+# branch_prefix_of <layout file> — declared by a `# wts: branch_prefix=feature/`
+# line in the layout. It is a YAML comment, so tmuxinator never sees it, and the
+# convention travels with the layout instead of living in this script, which a
+# package manager overwrites on every upgrade. $WTS_BRANCH_PREFIX wins, even
+# when set to an empty string.
+branch_prefix_of() {
+  if (( ${+WTS_BRANCH_PREFIX} )); then
+    print -r -- "$WTS_BRANCH_PREFIX"
+    return 0
+  fi
+  local line
+  while IFS= read -r line; do
+    if [[ "$line" =~ '^#[[:space:]]*wts:[[:space:]]*branch_prefix=([^[:space:]]*)' ]]; then
+      print -r -- "${match[1]}"
+      return 0
+    fi
+  done < "$1"
+  return 0
+}
+
+usage() {
+  sed -n '3,/^$/p' "$WTS_SELF" | sed 's/^# \{0,1\}//'
+}
+
+# ─── Help, version, stray options ────────────────────────────────────────────
+# Handled before anything else: without this, `wts --help` went down the normal
+# flow and created a worktree, a branch and a session named `--help`.
+
+if [[ $# -lt 1 ]]; then
+  usage >&2
+  exit 1
+fi
+
+case "$1" in
+  help|-h|--help)       usage; exit 0 ;;
+  version|-V|--version) print -r -- "wts $WTS_VERSION"; exit 0 ;;
+  -*)                   print -u2 -r -- "wts: unknown option '$1' (see: wts help)"; exit 2 ;;
+esac
+
+# ─── Subcommand: layouts ─────────────────────────────────────────────────────
+
+if [[ "$1" == "layouts" ]]; then
+  list=$(layout_list)
+  if [[ -z "$list" ]]; then
+    print -u2 -r -- "wts: no layout in $WTS_USER_LAYOUTS nor in $WTS_BUILTIN_LAYOUTS"
+    exit 1
+  fi
+  print -r -- "$list"
+  exit 0
+fi
+
+# ─── Subcommand: setup ───────────────────────────────────────────────────────
+
+if [[ "$1" == "setup" ]]; then
+  if [[ "${2:-}" != "tmux" ]]; then
+    print -u2 "usage: wts setup tmux   (then: wts setup tmux >> ~/.tmux.conf)"
+    exit 2
+  fi
+
+  # tmux.conf outlives upgrades: a Homebrew path carries the version
+  # (…/Cellar/wts/0.1.0/…) and would break on the next `brew upgrade`. The opt/
+  # link is stable, so point there instead.
+  libexec="$WTS_LIBEXEC"
+  if [[ "$libexec" =~ '^(.*)/Cellar/wts/[^/]+/(.*)$' ]]; then
+    libexec="${match[1]}/opt/wts/${match[2]}"
+  fi
+
+  cat <<EOF
+
+# ─── wts (generated by \`wts setup tmux\`, wts $WTS_VERSION) ───────────────────
+# prefix+s: session switcher (fzf popup, agents that need you first).
+# Replaces tmux's default choose-tree on prefix+s.
+bind s display-popup -E -w 85% -h 70% "$libexec/wts-switch"
+# prefix+a: jump to the next agent waiting for you.
+bind a run-shell "$libexec/wts-switch --next"
+# \`C-b :\` then \`wts <name> …\`: create a session from a freshly fetched base.
+# Absolute path on purpose: tmux execs the alias directly, without a shell, so
+# neither ~ nor \$HOME would be expanded.
+set -s command-alias[100] 'wts=new-window -n wts -c "#{pane_current_path}" $libexec/wts-fresh'
+# prefix+g: the same prompt, pre-filled.
+bind -N "wts: new session from a fresh origin base" g command-prompt -T command -I "wts "
+EOF
+  exit 0
+fi
+
+# ─── Subcommand: ls / status ─────────────────────────────────────────────────
+
+if [[ "$1" == "ls" || "$1" == "status" ]]; then
+  if ! registry_available; then
+    echo "wts: jq is required for '$1'" >&2
+    exit 1
+  fi
+  registry_init
+  registry_prune
+
+  sub="$1"; shift
+
+  if [[ ! -x "$WTS_LIBEXEC/wts-status" ]]; then
+    echo "wts: status engine not found ($WTS_LIBEXEC/wts-status)" >&2
+    exit 1
+  fi
+
+  if [[ "$sub" == "status" ]]; then
+    exec "$WTS_LIBEXEC/wts-status" "${@:---json}"
+  fi
+
+  if [[ "$(jq -r 'length' "$WTS_STATE_FILE")" == "0" ]]; then
+    echo "No registered session."
+    exit 0
+  fi
+  exec "$WTS_LIBEXEC/wts-status" --table
+fi
+
+# ─── Subcommand: brief ───────────────────────────────────────────────────────
+
+if [[ "$1" == "brief" ]]; then
+  if ! registry_available; then
+    echo "wts: jq is required for 'brief'" >&2
+    exit 1
+  fi
+  registry_init
+  registry_prune
+  shift
+
+  if [[ ! -x "$WTS_LIBEXEC/wts-brief" ]]; then
+    echo "wts: $WTS_LIBEXEC/wts-brief not found" >&2
+    exit 1
+  fi
+
+  # Same typo tolerance as `wts rm`.
+  typeset -a names
+  names=()
+  for n in "$@"; do
+    resolved=$(registry_resolve_name "$n") || exit 1
+    names+=("$resolved")
+  done
+  exec "$WTS_LIBEXEC/wts-brief" "${names[@]}"
+fi
+
+# ─── Subcommand: restore ─────────────────────────────────────────────────────
+
+if [[ "$1" == "restore" ]]; then
+  if ! registry_available; then
+    echo "wts: jq is required for 'restore'" >&2
+    exit 1
+  fi
+  registry_init
+  registry_prune
+  shift
+
+  typeset -a wanted
+  wanted=("$@")
+
+  # Layouts test WTS_RESTORE so they do not relaunch claude or any heavy
+  # command in every restored session.
+  export WTS_RESTORE=1
+
+  restored=0
+  ignored=0
+
+  while IFS= read -r name && IFS= read -r profile && IFS= read -r worktree \
+        && IFS= read -r subdir && IFS= read -r context; do
+    [[ -n "$name" ]] || continue
+
+    if (( ${#wanted} )) && [[ -z "${wanted[(r)$name]:-}" ]]; then
+      continue
+    fi
+
+    if tmux has-session -t "=$name" 2>/dev/null; then
+      echo "→ $name: already running"
+      (( ignored++ )) || true
+      continue
+    fi
+
+    if [[ ! -d "$worktree" ]]; then
+      echo "⚠ $name: worktree $worktree not found, skipped" >&2
+      (( ignored++ )) || true
+      continue
+    fi
+
+    if ! layout=$(layout_file "$profile"); then
+      echo "⚠ $name: layout '$profile' not found, skipped" >&2
+      (( ignored++ )) || true
+      continue
+    fi
+
+    workdir="$worktree"
+    if [[ -n "$subdir" && -d "$worktree/$subdir" ]]; then
+      workdir="$worktree/$subdir"
+    fi
+
+    export WTS_NAME="$name"
+    export WTS_ROOT="$worktree"
+    export WTS_WORKDIR="$workdir"
+    export WTS_CONTEXT="$context"
+    export WTS_PROMPT=""
+
+    # The layout pre-fills `claude --continue` when there is a conversation to
+    # resume for this directory, plain `claude` otherwise (--continue would
+    # fail). Reset on every iteration: the export would leak into the next one.
+    export WTS_RESUME=""
+    if [[ -n "$(print -rl -- "$(claude_project_dir "$workdir")"/*.jsonl(N))" ]]; then
+      WTS_RESUME=1
+    fi
+
+    if tmuxinator start --project-config "$layout" --name "$name" --no-attach >/dev/null 2>&1; then
+      echo "→ $name restored ($profile, $workdir)"
+      (( restored++ )) || true
+    else
+      echo "⚠ $name: tmuxinator failed to start" >&2
+      (( ignored++ )) || true
+    fi
+  done < <(jq -r 'to_entries | sort_by(.key)[] | [.key, (.value.profile // ""), (.value.worktree // ""), (.value.subdir // ""), (.value.context // "")] | .[]' "$WTS_STATE_FILE")
+
+  echo "→ $restored session(s) restored, $ignored skipped"
+  if (( restored > 0 )); then
+    echo "   attach: tmux attach -t <name>   (or prefix+s)"
+  fi
+  exit 0
+fi
+
+# ─── Subcommand: rm ──────────────────────────────────────────────────────────
+
+if [[ "$1" == "rm" ]]; then
+  if [[ $# -lt 2 ]]; then
+    echo "Usage: wts rm <name> [-f]" >&2
+    exit 1
+  fi
+
+  NAME="$2"
+  FORCE=false
+  # `--force` is the spelling people guess first: accept both.
+  case "${3:-}" in
+    -f|--force) FORCE=true ;;
+    "") ;;
+    *) echo "wts: unknown option '${3}' (use -f)" >&2; exit 1 ;;
+  esac
+
+  # Session/worktree name: slashes sanitized (e.g. team/foo → team-foo)
+  SESSION="${NAME//\//-}"
+
+  # Typo tolerance, through the registry.
+  if resolved=$(registry_resolve_name "$SESSION"); then
+    SESSION="$resolved"
+  else
+    exit 1
+  fi
+
+  if ! git rev-parse --git-dir >/dev/null 2>&1; then
+    echo "wts: not a git repository" >&2
+    exit 1
+  fi
+
+  repo_root=$(git rev-parse --show-toplevel)
+  repo_name=$(basename "$repo_root")
+  worktree_base="${WTS_WORKTREES_BASE:-$(dirname "$repo_root")/${repo_name}-worktrees}"
+  worktree_path="${worktree_base}/${SESSION}"
+
+  # 1. Kill the tmux session
+  if tmux has-session -t "=$SESSION" 2>/dev/null; then
+    tmux kill-session -t "=$SESSION"
+    echo "→ tmux session '$SESSION' killed"
+  else
+    echo "→ no tmux session '$SESSION'"
+  fi
+
+  # 2. Remove the worktree (read its branch first)
+  if [[ -d "$worktree_path" ]]; then
+    BRANCH=$(git -C "$worktree_path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+
+    if [[ "$FORCE" == true ]]; then
+      git -C "$repo_root" worktree remove --force "$worktree_path"
+    else
+      git -C "$repo_root" worktree remove "$worktree_path"
+    fi
+    echo "→ worktree $worktree_path removed"
+  else
+    echo "→ no worktree $worktree_path"
+    BRANCH=""
+  fi
+
+  # 3. Delete the branch
+  if [[ -n "$BRANCH" && "$BRANCH" != "HEAD" ]]; then
+    if [[ "$FORCE" == true ]]; then
+      git -C "$repo_root" branch -D "$BRANCH" 2>/dev/null && \
+        echo "→ branch $BRANCH deleted" || \
+        echo "→ branch $BRANCH not found"
+    else
+      git -C "$repo_root" branch -d "$BRANCH" 2>/dev/null && \
+        echo "→ branch $BRANCH deleted" || \
+        echo "⚠ branch $BRANCH not merged (use -f to force)"
+    fi
+  fi
+
+  # 4. Point at the Claude conversations tied to this worktree. They are NOT
+  # deleted, but the worktree they reference is gone: say where to find them
+  # (claude --resume).
+  if [[ -n "${worktree_path:-}" ]]; then
+    proj=$(claude_project_dir "$worktree_path")
+    if [[ -d "$proj" ]]; then
+      n=$(print -rl -- "$proj"/*.jsonl(N) | grep -c . || true)
+      if (( n > 0 )); then
+        echo "→ $n conversation(s) kept in $proj"
+      fi
+    fi
+  fi
+
+  # 5. Remove from the registry
+  registry_del "$SESSION"
+
+  exit 0
+fi
+
+# ─── Subcommand: gc ──────────────────────────────────────────────────────────
+
+if [[ "$1" == "gc" ]]; then
+  shift
+  if [[ ! -x "$WTS_LIBEXEC/wts-gc" ]]; then
+    echo "wts: $WTS_LIBEXEC/wts-gc not found" >&2
+    exit 1
+  fi
+  exec "$WTS_LIBEXEC/wts-gc" "$@"
+fi
+
+# ─── Subcommand: new ─────────────────────────────────────────────────────────
+# Batch creation. Why: `wts a & wts b & wts c` does NOT work, because the
+# normal flow ends with `exec tmuxinator start`: the first call replaces the
+# process and the next ones are orphaned. Here each session is started with
+# --no-attach (through WTS_NO_ATTACH), then the first one is attached.
+
+if [[ "$1" == "new" ]]; then
+  shift
+  NEW_PROFILE="default"
+  if [[ "${1:-}" == "-p" ]]; then
+    [[ -n "${2:-}" ]] || { echo "wts: -p expects a layout" >&2; exit 1 }
+    NEW_PROFILE="$2"; shift 2
+  fi
+
+  if (( $# < 1 )); then
+    echo "Usage: wts new [-p layout] <name|\"phrase\"...>" >&2
+    exit 1
+  fi
+
+  typeset -a started failed
+  started=(); failed=()
+
+  # Each session's final name comes back through a file: with a phrase, it is
+  # only known once the child has proposed it (and made it unique). No
+  # inherited descriptor: tmuxinator or the tmux server would keep it open.
+  # Sequential creations: in parallel, two similar phrases could get the same
+  # name, each passing the uniqueness check before the other.
+  unset WTS_NAME_HINT
+  mkdir -p "$WTS_STATE_DIR"
+  session_out="$WTS_STATE_DIR/.new.$$"
+
+  for n in "$@"; do
+    echo "── $n ($NEW_PROFILE)"
+    rm -f "$session_out"
+    if WTS_NO_ATTACH=1 WTS_SESSION_OUT="$session_out" "$WTS_SELF" "$n" "$NEW_PROFILE"; then
+      if [[ -s "$session_out" ]]; then
+        started+=("$(<"$session_out")")
+      else
+        started+=("${n//\//-}")
+      fi
+    else
+      failed+=("$n")
+    fi
+  done
+  rm -f "$session_out"
+
+  echo "→ ${#started} session(s) started$( (( ${#failed} )) && echo ", ${#failed} failed: ${(j:, :)failed}")"
+
+  if (( ${#started} )); then
+    echo "   attaching: ${started[1]}"
+    attach_or_switch "${started[1]}"
+  fi
+  exit 1
+fi
+
+# ─── Normal flow ─────────────────────────────────────────────────────────────
+
+# A phrase (an argument containing whitespace, in position 1 or 2) describes
+# the task: it is removed from the positionals and handed to Claude
+# ($WTS_PROMPT). No session, branch or layout name contains whitespace, so the
+# detection cannot capture a legitimate argument. The context (position 3 and
+# beyond) keeps its meaning: `wts sentry-X sentry "timeout on /api"`.
+#   wts <name> "<phrase>" [layout] [context...]   name given: as before
+#   wts "<phrase>" [layout] [context...]          name proposed by wts-name
+PROMPT=""
+NAME=""
+if [[ "$1" == *[[:space:]]* ]]; then
+  PROMPT="$1"; shift
+elif [[ "${2:-}" == *[[:space:]]* ]]; then
+  NAME="$1"; PROMPT="$2"; shift 2
+else
+  NAME="$1"; shift
+fi
+PROFILE="${1:-default}"
+(( $# > 0 )) && shift
+CONTEXT="$*"
+
+# Newlines and tabs flattened: the phrase is typed in one go into the pane and
+# stored in the registry.
+PROMPT="${PROMPT//[[:cntrl:]]/ }"
+if [[ -z "$NAME" && -z "${PROMPT//[[:space:]]/}" ]]; then
+  echo "wts: empty phrase" >&2
+  exit 1
+fi
+
+# ─── Layout ──────────────────────────────────────────────────────────────────
+# Fail before creating the worktree if the layout does not exist.
+
+if ! LAYOUT_FILE=$(layout_file "$PROFILE"); then
+  echo "wts: layout '$PROFILE' not found" >&2
+  typeset -a _layouts
+  _layouts=(${${(f)"$(layout_list)"}%%$'\t'*})
+  if (( ${#_layouts} )); then
+    echo "     available: ${(j:, :)_layouts}" >&2
+  else
+    echo "     available: none ($WTS_USER_LAYOUTS, $WTS_BUILTIN_LAYOUTS)" >&2
+  fi
+  # `wts fix the login`: without quotes the phrase is split and "the" is taken
+  # for a layout.
+  if [[ -z "$PROMPT" && -n "$CONTEXT" ]]; then
+    echo "     a phrase? quote it: wts \"$NAME $PROFILE $CONTEXT\"" >&2
+  fi
+  exit 1
+fi
+
+BRANCH_PREFIX=$(branch_prefix_of "$LAYOUT_FILE")
+
+branch_for() {
+  print -r -- "${BRANCH_PREFIX}$1"
+}
+
+# ─── Repo & worktree ─────────────────────────────────────────────────────────
+
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  echo "wts: not a git repository" >&2
+  exit 1
+fi
+
+repo_root=$(git rev-parse --show-toplevel)
+repo_name=$(basename "$repo_root")
+worktree_base="${WTS_WORKTREES_BASE:-$(dirname "$repo_root")/${repo_name}-worktrees}"
+
+# ─── Base branch ─────────────────────────────────────────────────────────────
+# Priority: $WTS_BASE_BRANCH > origin/HEAD > main > master > current HEAD
+
+detect_base_branch() {
+  local head_ref
+  head_ref=$(git -C "$repo_root" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+  if [[ -n "$head_ref" ]]; then
+    # origin/main → main
+    echo "${head_ref#origin/}"
+    return
+  fi
+
+  local candidate
+  for candidate in main master; do
+    if git -C "$repo_root" show-ref --verify --quiet "refs/heads/$candidate"; then
+      echo "$candidate"
+      return
+    fi
+  done
+
+  git -C "$repo_root" rev-parse --abbrev-ref HEAD 2>/dev/null || true
+}
+
+BASE_BRANCH="${WTS_BASE_BRANCH:-$(detect_base_branch)}"
+
+if [[ -z "$BASE_BRANCH" ]]; then
+  echo "wts: cannot determine the base branch (set WTS_BASE_BRANCH)" >&2
+  exit 1
+fi
+
+if ! git -C "$repo_root" rev-parse --verify --quiet "$BASE_BRANCH" >/dev/null; then
+  echo "wts: base branch '$BASE_BRANCH' not found (set WTS_BASE_BRANCH)" >&2
+  exit 1
+fi
+
+# ─── Session name ────────────────────────────────────────────────────────────
+# Phrase without a name: wts-name proposes a slug. Placed after the cheap checks
+# (layout, repo, base): the model is never called for a creation bound to fail.
+# wts-fresh computes it during its fetch and passes it through WTS_NAME_HINT.
+
+if [[ -z "$NAME" ]]; then
+  slug="${WTS_NAME_HINT:-}"
+  if [[ ! "$slug" =~ '^[a-z0-9][a-z0-9-]*$' ]]; then
+    echo "→ naming…"
+    slug=$("$WTS_LIBEXEC/wts-name" "$PROMPT")
+  fi
+
+  # A guessed name must NEVER land on an existing branch: the resolution below
+  # would silently check it out (cases 1 and 2) and the agent would start from
+  # another session's work. Suffix -2, -3… until the name is free everywhere.
+  # Local remote refs are not enough (wts-fresh only fetches the base): a single
+  # ls-remote with a trailing pattern covers every suffix at once.
+  remote_heads=$(perl -e 'alarm shift; exec @ARGV' 5 \
+    git -C "$repo_root" ls-remote --heads origin "$(branch_for "$slug")*" 2>/dev/null \
+    | awk '{ sub(/^refs\/heads\//, "", $2); print $2 }' || true)
+
+  name_taken() {
+    local b
+    b=$(branch_for "$1")
+    [[ -e "$worktree_base/$1" ]] && return 0
+    registry_available && [[ -s "$WTS_STATE_FILE" ]] && \
+      jq -e --arg n "$1" 'has($n)' "$WTS_STATE_FILE" >/dev/null 2>&1 && return 0
+    tmux has-session -t "=$1" 2>/dev/null && return 0
+    git -C "$repo_root" show-ref --verify --quiet "refs/heads/$b" && return 0
+    git -C "$repo_root" show-ref --verify --quiet "refs/remotes/origin/$b" && return 0
+    print -r -- "$remote_heads" | grep -qxF -- "$b" && return 0
+    return 1
+  }
+
+  for candidate in "$slug" "$slug"-{2..9}; do
+    if ! name_taken "$candidate"; then
+      NAME="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$NAME" ]]; then
+    echo "wts: no free name from '$slug' to '$slug-9'" >&2
+    echo "     name it yourself: wts <name> \"<phrase>\"" >&2
+    exit 1
+  fi
+  echo "→ name: $NAME"
+fi
+
+BRANCH=$(branch_for "$NAME")
+
+# Session/worktree name: slashes sanitized (branches like team/foo → team-foo)
+SESSION="${NAME//\//-}"
+worktree_path="${worktree_base}/${SESSION}"
+
+mkdir -p "$worktree_base"
+
+if [[ ! -d "$worktree_path" ]]; then
+  echo "→ creating worktree $worktree_path (branch $BRANCH)"
+  if git -C "$repo_root" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    # Existing local branch → checkout
+    git -C "$repo_root" worktree add "$worktree_path" "$BRANCH"
+  elif git -C "$repo_root" ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+    # Existing branch on origin (review) → fetch + tracking checkout
+    echo "  → branch found on origin, checking out with tracking"
+    git -C "$repo_root" fetch --quiet origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}"
+    git -C "$repo_root" worktree add --track -b "$BRANCH" "$worktree_path" "origin/$BRANCH"
+  else
+    # New branch from the base.
+    # --no-track: when the base is a remote ref (WTS_BASE_BRANCH=origin/main,
+    # which wts-fresh sets), `worktree add -b` would make origin/main the new
+    # branch's upstream: `git status` would announce "behind origin/main",
+    # `git pull` would merge the base, and `wts gc` would never see `[gone]`.
+    # No effect when the base is a local branch: git tracks nothing then
+    # (branch.autoSetupMerge=true).
+    git -C "$repo_root" worktree add --no-track -b "$BRANCH" "$worktree_path" "$BASE_BRANCH"
+  fi
+else
+  echo "→ existing worktree: $worktree_path"
+fi
+
+# ─── Working subdirectory (optional) ─────────────────────────────────────────
+# When $WTS_SUBDIR is set (e.g. by direnv in a monorepo), panes start in that
+# subdirectory of the worktree instead of its root.
+
+WORKDIR="$worktree_path"
+if [[ -n "${WTS_SUBDIR:-}" ]]; then
+  if [[ -d "$worktree_path/$WTS_SUBDIR" ]]; then
+    WORKDIR="$worktree_path/$WTS_SUBDIR"
+  else
+    echo "⚠ WTS_SUBDIR='$WTS_SUBDIR' not found in the worktree, starting at the root" >&2
+  fi
+fi
+
+# ─── tmuxinator ──────────────────────────────────────────────────────────────
+
+# Variables exposed to the YAML layout through ERB (ENV['WTS_*'])
+export WTS_NAME="$SESSION"
+export WTS_ROOT="$worktree_path"
+export WTS_WORKDIR="$WORKDIR"
+export WTS_CONTEXT="$CONTEXT"
+export WTS_PROMPT="$PROMPT"
+
+# ─── Registry ────────────────────────────────────────────────────────────────
+# Recorded before the exec: exec replaces the current process.
+
+registry_put "$SESSION" "$PROFILE" "$repo_root" "$worktree_path" "$BRANCH" \
+  "${WTS_SUBDIR:-}" "$CONTEXT" "$PROMPT"
+
+# `wts new` reads the chosen name back here (it may have been proposed, then
+# suffixed).
+if [[ -n "${WTS_SESSION_OUT:-}" ]]; then
+  print -r -- "$SESSION" > "$WTS_SESSION_OUT"
+fi
+
+# WTS_NO_ATTACH: used by `wts new` to chain several creations.
+# Without it, the `exec` below would make any chaining impossible.
+if [[ -n "${WTS_NO_ATTACH:-}" ]]; then
+  if tmux has-session -t "=$SESSION" 2>/dev/null; then
+    echo "→ tmux session '$SESSION' already running"
+  elif tmuxinator start --project-config "$LAYOUT_FILE" --name "$SESSION" --no-attach >/dev/null 2>&1; then
+    echo "→ session '$SESSION' started"
+  else
+    echo "⚠ $SESSION: tmuxinator failed to start" >&2
+    exit 1
+  fi
+  exit 0
+fi
+
+# Idempotence: if the session already exists, attach to it
+if tmux has-session -t "=$SESSION" 2>/dev/null; then
+  echo "→ tmux session '$SESSION' already running, attaching"
+  attach_or_switch "$SESSION"
+else
+  exec tmuxinator start --project-config "$LAYOUT_FILE" --name "$SESSION"
+fi

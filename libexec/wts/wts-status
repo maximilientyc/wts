@@ -1,0 +1,289 @@
+#!/usr/bin/env zsh
+# wts-status — state engine: registry + git + tmux + claude agents -> JSON
+#
+# Usage: wts-status [--json | --table | --fzf]
+#
+#   --json  (default) JSON array, one object per registered worktree
+#   --table colored column rendering for `wts ls`
+#   --fzf   sorted lines (stuck first) for wts-switch, fields separated by
+#           \x1f: TAB is an IFS whitespace and would collapse empty fields (an
+#           agent without a tmux pane would shift every column).
+#
+# Principle: a single collection pass (one claude call, one tmux call), then
+# rendering. No format may fail because a tool is missing: the affected
+# columns become null/"-" and the rest is displayed.
+
+# No `set -e`: git/tmux/claude legitimately fail (worktree gone, tmux server
+# down, claude not in PATH) and we want to degrade, not die.
+set -uo pipefail
+
+WTS_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wts"
+WTS_STATE_FILE="$WTS_STATE_DIR/sessions.json"
+PANEHASH_DIR="$WTS_STATE_DIR/panehash"
+CLAUDE_SESSIONS_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions"
+
+# An agent reports `working` but its pane has not changed for this long: it is
+# marked `stale`. Without this watchdog, a Ctrl-C leaves a session shown as
+# `working` forever and the table becomes a lie.
+STALE_AFTER=${WTS_STALE_AFTER:-10}
+
+FORMAT=json
+case "${1:-}" in
+  --json|"") FORMAT=json ;;
+  --table)   FORMAT=table ;;
+  --fzf)     FORMAT=fzf ;;
+  *) print -u2 "wts-status: unknown format '$1' (--json|--table|--fzf)"; exit 2 ;;
+esac
+
+if ! command -v jq >/dev/null 2>&1; then
+  print -u2 "wts-status: jq is required"
+  exit 1
+fi
+
+[[ -s "$WTS_STATE_FILE" ]] || { print '[]'; exit 0; }
+
+# ─── Global collection (one call per tool) ───────────────────────────────────
+
+# `claude agents --json` has a heterogeneous shape: `background` sessions carry
+# .state (blocked/working/done/failed), `interactive` ones carry .status
+# (busy/idle). Both are normalized below.
+agents_json=$(claude agents --json 2>/dev/null)
+if ! print -r -- "$agents_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+  agents_json='[]'
+fi
+
+# <claude dir>/sessions/<pid>.json carries a `tmux` field = "session:@window.%pane".
+# Undocumented: used to target the exact pane, never as a source of state.
+# `(N)`: without Claude Code the directory is empty or missing, and a bare glob
+# would print zsh's "no matches found" on stderr.
+typeset -a session_files
+session_files=("$CLAUDE_SESSIONS_DIR"/*.json(N))
+sessions_map=""
+if (( ${#session_files} )); then
+  sessions_map=$(cat "${session_files[@]}" 2>/dev/null \
+    | jq -s 'map(select(type == "object" and .sessionId != null))
+             | map({key: .sessionId, value: {tmux: .tmux, name: .name}})
+             | from_entries' 2>/dev/null)
+fi
+[[ -n "$sessions_map" ]] || sessions_map='{}'
+
+tmux_alive=$(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+
+mkdir -p "$PANEHASH_DIR" 2>/dev/null
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+typeset -A base_cache merged_cache
+
+# Base branch of a repository (same priority order as `wts`).
+detect_base() {
+  local root="$1" head_ref candidate
+  if [[ -n "${base_cache[$root]:-}" ]]; then
+    print -r -- "${base_cache[$root]}"
+    return
+  fi
+  local base="${WTS_BASE_BRANCH:-}"
+  if [[ -z "$base" ]]; then
+    head_ref=$(git -C "$root" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)
+    if [[ -n "$head_ref" ]]; then
+      base="${head_ref#origin/}"
+    else
+      for candidate in main master; do
+        if git -C "$root" show-ref --verify --quiet "refs/heads/$candidate"; then
+          base="$candidate"; break
+        fi
+      done
+    fi
+  fi
+  base_cache[$root]="$base"
+  print -r -- "$base"
+}
+
+# Branches merged into the base, cached per repository.
+merged_branches() {
+  local root="$1" base="$2"
+  local key="$root::$base"
+  if [[ -z "${merged_cache[$key]:-}" ]]; then
+    merged_cache[$key]=$'\n'$(git -C "$root" branch --merged "$base" \
+      --format '%(refname:short)' 2>/dev/null)$'\n'
+  fi
+  print -r -- "${merged_cache[$key]}"
+}
+
+# ─── Main pass ───────────────────────────────────────────────────────────────
+
+typeset -a objects
+objects=()
+
+while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
+      && IFS= read -r worktree && IFS= read -r branch && IFS= read -r subdir \
+      && IFS= read -r context && IFS= read -r created_at; do
+  [[ -n "$name" ]] || continue
+
+  # --- tmux -----------------------------------------------------------------
+  local_alive=false
+  if print -r -- "$tmux_alive" | grep -qxF -- "$name" 2>/dev/null; then
+    local_alive=true
+  fi
+
+  # --- git ------------------------------------------------------------------
+  exists=false; dirty=0; ahead=0; behind=0; added=0; removed=0; merged=false
+  base=""
+  if [[ -d "$worktree" ]]; then
+    exists=true
+    dirty=$(git -C "$worktree" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    base=$(detect_base "$repo_root")
+    if [[ -n "$base" ]] && git -C "$worktree" rev-parse --verify --quiet "$base" >/dev/null 2>&1; then
+      counts=$(git -C "$worktree" rev-list --left-right --count "$base...HEAD" 2>/dev/null)
+      if [[ -n "$counts" ]]; then
+        behind=${counts%%[[:space:]]*}
+        ahead=${counts##*[[:space:]]}
+      fi
+      shortstat=$(git -C "$worktree" diff --shortstat "$base...HEAD" 2>/dev/null)
+      [[ "$shortstat" =~ '([0-9]+) insertion' ]] && added="${match[1]}"
+      [[ "$shortstat" =~ '([0-9]+) deletion' ]] && removed="${match[1]}"
+      if print -r -- "$(merged_branches "$repo_root" "$base")" \
+         | grep -qxF -- "$branch" 2>/dev/null; then
+        merged=true
+      fi
+    fi
+  fi
+
+  # --- Claude agent ---------------------------------------------------------
+  # Join on cwd INSIDE the worktree (not equal): WTS_SUBDIR starts the panes in
+  # a subdirectory of the worktree.
+  agent=$(print -r -- "$agents_json" | jq -c --arg wt "$worktree" \
+    'map(select(.cwd == $wt or (.cwd | startswith($wt + "/")))) | first // null' 2>/dev/null)
+  [[ -n "$agent" ]] || agent=null
+
+  agent_state=null; agent_waiting=null; agent_name=null
+  agent_session=null; agent_pane=null; stale=false
+
+  if [[ "$agent" != "null" ]]; then
+    raw=$(print -r -- "$agent" | jq -r '(.state // .status // "") | ascii_downcase')
+    agent_waiting=$(print -r -- "$agent" | jq -c '.waitingFor // null')
+    agent_name=$(print -r -- "$agent" | jq -c '.name // null')
+    agent_session=$(print -r -- "$agent" | jq -c '.sessionId // null')
+
+    # `state` (background) and `status` (interactive) mapped to one vocabulary.
+    case "$raw" in
+      blocked)        agent_state='"blocked"' ;;
+      busy|working)   agent_state='"working"' ;;
+      idle)           agent_state='"idle"' ;;
+      done)           agent_state='"done"' ;;
+      failed)         agent_state='"failed"' ;;
+      stopped)        agent_state='"stopped"' ;;
+      "")             agent_state=null ;;
+      *)              agent_state=$(jq -nc --arg s "$raw" '$s') ;;
+    esac
+
+    sid=$(print -r -- "$agent" | jq -r '.sessionId // empty')
+    if [[ -n "$sid" ]]; then
+      pane_ref=$(print -r -- "$sessions_map" | jq -r --arg s "$sid" '.[$s].tmux // empty')
+      if [[ -n "$pane_ref" ]]; then
+        agent_pane=$(jq -nc --arg p "$pane_ref" '$p')
+        pane_id="%${pane_ref##*.%}"
+
+        # Staleness watchdog: pane hash compared with the previous tick.
+        if [[ "$agent_state" == '"working"' ]]; then
+          hashfile="$PANEHASH_DIR/${sid}"
+          cur=$(tmux capture-pane -p -t "$pane_id" 2>/dev/null | shasum | cut -d' ' -f1)
+          now=$(date +%s)
+          if [[ -n "$cur" && -s "$hashfile" ]]; then
+            prev_hash=$(sed -n 1p "$hashfile"); prev_ts=$(sed -n 2p "$hashfile")
+            if [[ "$cur" == "$prev_hash" ]]; then
+              (( now - ${prev_ts:-$now} >= STALE_AFTER )) && stale=true
+            else
+              print -r -- "$cur\n$now" > "$hashfile"
+            fi
+          elif [[ -n "$cur" ]]; then
+            print -r -- "$cur\n$now" > "$hashfile"
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  objects+=("$(jq -nc \
+    --arg name "$name" --arg profile "$profile" --arg repo_root "$repo_root" \
+    --arg worktree "$worktree" --arg branch "$branch" --arg subdir "$subdir" \
+    --arg context "$context" --arg created_at "$created_at" --arg base "$base" \
+    --argjson tmux_alive "$local_alive" --argjson exists "$exists" \
+    --argjson dirty "${dirty:-0}" --argjson ahead "${ahead:-0}" \
+    --argjson behind "${behind:-0}" --argjson added "${added:-0}" \
+    --argjson removed "${removed:-0}" --argjson merged "$merged" \
+    --argjson agent_state "$agent_state" --argjson agent_waiting_for "$agent_waiting" \
+    --argjson agent_name "$agent_name" --argjson agent_session "$agent_session" \
+    --argjson agent_pane "$agent_pane" --argjson stale "$stale" \
+    '{name:$name, profile:$profile, branch:$branch, base:$base,
+      repo_root:$repo_root, worktree:$worktree, subdir:$subdir,
+      context:$context, created_at:$created_at,
+      exists:$exists, tmux_alive:$tmux_alive,
+      dirty:$dirty, ahead:$ahead, behind:$behind,
+      added:$added, removed:$removed, merged:$merged,
+      agent_state:$agent_state, agent_waiting_for:$agent_waiting_for,
+      agent_name:$agent_name, agent_session:$agent_session,
+      agent_pane:$agent_pane, stale:$stale}')")
+
+done < <(jq -r 'to_entries | sort_by(.key)[]
+  | [.key, (.value.profile // "-"), (.value.repo_root // ""),
+     (.value.worktree // ""), (.value.branch // "-"), (.value.subdir // ""),
+     (.value.context // ""), (.value.created_at // "")] | .[]' "$WTS_STATE_FILE")
+
+# Empty registry: only --json has a representation ("[]"); the presentation
+# formats must emit nothing, otherwise they pollute the caller's list.
+if (( ${#objects} == 0 )); then
+  [[ "$FORMAT" == "json" ]] && print '[]'
+  exit 0
+fi
+
+# Sort: whatever needs a human first.
+SORT_KEY='def rank:
+  if .stale then 0
+  elif .agent_state == "blocked" then 1
+  elif .agent_state == "failed" then 2
+  elif .agent_state == "idle" then 3
+  elif .agent_state == "working" then 4
+  else 5 end;
+sort_by(rank, .name)'
+
+all=$(printf '%s\n' "${objects[@]}" | jq -s "$SORT_KEY")
+
+# Starting phrase (`wts "<phrase>"`): merged here from the registry, not in the
+# main pass, whose "one field per line" stream would be shifted by a multiline
+# phrase.
+if merged=$(print -r -- "$all" | jq --slurpfile reg "$WTS_STATE_FILE" \
+      'map(. + {prompt: ($reg[0][.name].prompt // "")})' 2>/dev/null); then
+  all="$merged"
+fi
+
+# SUBJECT: the name Claude gave the conversation, otherwise the starting phrase
+# (restored session, agent not relaunched yet), otherwise the context. `//` is
+# not enough: jq lets an empty string through.
+SUBJECT='def subject: [.agent_name, .prompt, .context]
+  | map(select(type == "string" and . != "")) | (.[0] // "")
+  | gsub("[\\t\\n\\r]"; " ")
+  | if length > 50 then .[0:49] + "…" else . end;'
+
+case "$FORMAT" in
+  json)  print -r -- "$all" ;;
+  fzf)   print -r -- "$all" | jq -r "$SUBJECT"'.[]
+           | [ .name,
+               (if .stale then "stuck?" else (.agent_state // "-") end),
+               .branch,
+               ("+\(.added)/-\(.removed)" + (if .ahead > 0 then " ^\(.ahead)" else "" end)),
+               (if .dirty > 0 then "dirty" else "clean" end),
+               (.agent_pane // ""),
+               subject ]
+           | join("")' ;;
+  table) print -r -- "$all" | jq -r "$SUBJECT"'
+           (["SESSION","AGENT","BRANCH","DELTA","DIRTY","TMUX","SUBJECT"] | @tsv),
+           (.[] | [ .name,
+                    (if .stale then "stuck?" else (.agent_state // "-") end),
+                    .branch,
+                    ("+\(.added)/-\(.removed)" + (if .ahead > 0 then " ^\(.ahead)" else "" end)),
+                    (if .dirty > 0 then "yes" else "no" end),
+                    (if .tmux_alive then "running" else "stopped" end),
+                    (subject | if . == "" then "-" else . end) ] | @tsv)' \
+         | column -t -s $'\t' ;;
+esac

@@ -1,0 +1,113 @@
+#!/usr/bin/env zsh
+# wts-name — suggest a session/worktree name from a phrase.
+#
+# Usage: wts-name "<phrase>"
+#
+# Writes a kebab-case slug ([a-z0-9-], 40 characters max) to stdout and exits 0
+# as soon as a phrase is given: the caller has no failure to handle, at worst it
+# gets a name derived locally from the phrase (reported on stderr).
+# Uniqueness is NOT checked here: `wts` guarantees it, since only it knows the
+# repository, the layout's branch prefix and the registry.
+#
+# The name comes from Claude (Haiku, headless). The call is isolated from
+# anything that could slow it down or have side effects:
+#   --safe-mode, disableAllHooks  no hooks (notifications), no CLAUDE.md, no
+#                                 plugins — and ~4 s instead of ~10
+#   --strict-mcp-config           no MCP server to start
+#   --no-session-persistence      no transcript, nothing for `claude --continue`
+#   --tools ""                    no tools: a text answer, nothing else
+#   cwd = wts state directory     never a worktree, otherwise wts-status could
+#                                 attach the call to a session
+# The phrase goes through stdin: `--tools` is variadic and would swallow a
+# positional argument, and a phrase starting with `-` would be read as an option.
+# The timeout is enforced by `perl alarm` (always present on macOS): a background
+# `sleep` watchdog would keep the caller's `$(…)` open.
+#
+# Variables: WTS_MODEL (haiku), WTS_NAME_TIMEOUT (15 s),
+#            WTS_NO_LLM=1 (local fallback right away: offline, tests)
+
+set -uo pipefail
+
+phrase="${*:-}"
+if [[ -z "${phrase//[[:space:]]/}" ]]; then
+  print -u2 'usage: wts-name "<phrase>"'
+  exit 2
+fi
+
+WTS_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wts"
+
+SYSTEM_PROMPT="You name git branches from a task description. \
+Answer with the name only: in English, kebab-case, 2 to 4 words, no prefix \
+(neither feature/ nor fix/), no punctuation, no explanation."
+
+# kebab <text> — accents stripped, lowercase, [a-z0-9] words joined by dashes,
+# no length limit. Not iconv: the macOS one drops letters around accents
+# ("côté" -> "c^o'e?"). Perl and Unicode::Normalize are always present: NFD
+# decomposition, then removal of the combining marks.
+kebab() {
+  print -r -- "$1" | perl -CS -MUnicode::Normalize -0777 -ne '
+    $_ = lc NFD($_);
+    s/\pM//g;
+    s/\x{153}/oe/g; s/\x{e6}/ae/g; s/\x{df}/ss/g;
+    s/[^a-z0-9]+/-/g;
+    s/^-+|-+$//g;
+    print'
+}
+
+# cap40 <slug> — 40 characters at most, cut on a dash when possible.
+cap40() {
+  local s="$1"
+  if (( ${#s} > 40 )); then
+    # 41 characters: a dash in 41st position is a clean cut at 40.
+    s=${s[1,41]}
+    if [[ "$s" == *-* ]]; then s=${s%-*}; else s=${s[1,40]}; fi
+  fi
+  print -r -- "${s%-}"
+}
+
+# Fallback without a model: the first four meaningful words of the phrase.
+# Stopwords are removed BEFORE the 40-character cut, otherwise a long phrase
+# would only keep its preamble ("we need a way to…").
+# French and English stopwords: phrases are typed in either language.
+local_name() {
+  local w
+  local -a words keep stop
+  stop=(a au aux c ce ces cet cette d dans de des doit du elle en est et etre
+        faire faut il ils j je l la le les leur m ma me mes mon n ne nous on ou
+        par pas peut plus pour qu que qui s sa se ses son sur t ta te tres tu un
+        une veut veux voudrais vous y
+        add allow an and are as at be by can for from get has have i in is it
+        make my need of on or our should so that the this to want we when will
+        with would)
+  words=(${(s:-:)$(kebab "$1")})
+  for w in "${words[@]}"; do
+    (( ${stop[(Ie)$w]} )) && continue
+    keep+=("$w")
+    (( ${#keep} == 4 )) && break
+  done
+  cap40 "${(j:-:)keep}"
+}
+
+slug=""
+if [[ -z "${WTS_NO_LLM:-}" ]] && command -v claude >/dev/null 2>&1; then
+  mkdir -p "$WTS_STATE_DIR" 2>/dev/null
+  raw=$(print -r -- "$phrase" | (
+          cd "$WTS_STATE_DIR" 2>/dev/null || cd /
+          perl -e 'alarm shift; exec @ARGV' "${WTS_NAME_TIMEOUT:-15}" \
+            claude -p --model "${WTS_MODEL:-haiku}" --safe-mode --strict-mcp-config \
+              --no-session-persistence --settings '{"disableAllHooks":true}' \
+              --tools "" --system-prompt "$SYSTEM_PROMPT"
+        ) 2>/dev/null)
+  slug=$(cap40 "$(kebab "${raw%%$'\n'*}")")
+  (( ${#slug} >= 3 )) || slug=""
+fi
+
+if [[ -z "$slug" ]]; then
+  slug=$(local_name "$phrase")
+  [[ -n "$slug" ]] || slug="task-$(date +%m%d-%H%M)"
+  if [[ -z "${WTS_NO_LLM:-}" ]]; then
+    print -u2 -r -- "⚠ local name (Claude unavailable or no answer): $slug"
+  fi
+fi
+
+print -r -- "$slug"

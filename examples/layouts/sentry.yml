@@ -1,0 +1,52 @@
+# wts: branch_prefix=fix/
+<% restore = ENV['WTS_RESTORE'].to_s == '1' %>
+<%
+  # sentry - example of a layout that turns the context into a task. The
+  # context is the Sentry issue id:
+  #
+  #   wts fix-ABC123 sentry ABC123      branch fix/fix-ABC123, Claude investigates
+  #   wts "export times out" sentry     the phrase wins over the context
+  #
+  # Claude pane: same block as share/wts/layouts/default.yml (see its comments),
+  # with a task built from WTS_CONTEXT when no phrase was given.
+  clean = ->(v) { v.to_s.dup.force_encoding('UTF-8').scrub.gsub(/[[:cntrl:]]/, ' ').strip }
+  prompt = clean.(ENV['WTS_PROMPT']).sub(/;+\z/, '').strip
+  context = clean.(ENV['WTS_CONTEXT'])
+  task =
+    if !prompt.empty? then prompt
+    elsif !context.empty? then "Investigate Sentry issue #{context}: find the root cause, propose a fix and a regression test"
+    else ''
+    end
+  claude_cmd =
+    if restore
+      ENV['WTS_RESUME'].to_s == '1' ? %q{" print -z 'claude --continue'"} : %q{" print -z claude"}
+    elsif task.empty?
+      'claude'
+    else
+      "claude #{task.shellescape}"
+    end
+%>
+name: <%= ENV['WTS_NAME'] %>
+root: <%= ENV['WTS_WORKDIR'] || ENV['WTS_ROOT'] %>
+startup_window: code
+
+# On restore (`wts restore`), heavy commands are skipped.
+windows:
+  - code:
+      layout: even-horizontal
+      panes:
+        - nvim .
+        - <%= claude_cmd %>
+  # Rails-flavored example: install dependencies once, not on every restore.
+  # Replace with your stack's command (npm ci, uv sync...) or leave it empty.
+  - test:
+      layout: even-horizontal
+      panes:
+        - <%= restore ? '' : 'bundle install' %>
+        -
+  - server:
+      layout: even-horizontal
+      panes:
+        -
+        -
+  - git:
