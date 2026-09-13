@@ -9,7 +9,7 @@ jobs:
   smoke:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Dependencies
         run: brew install fzf jq tmux tmuxinator
