@@ -36,9 +36,11 @@ one person's workflow. It is shared in case that workflow is also yours.
 
 ## Install
 
-**Homebrew** (dependencies and zsh completion included):
+**Homebrew** (dependencies and zsh completion included). Recent Homebrew versions
+only load formulae from taps you trust, so trust the tap first:
 
 ```sh
+brew trust maximilientyc/tap
 brew install maximilientyc/tap/wts
 ```
 
