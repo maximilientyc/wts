@@ -35,10 +35,12 @@ git config --global user.name smoke
 git config --global user.email smoke@example.com
 git config --global init.defaultBranch main
 
-# Stand-in for Claude Code: no agent to report, and a pane that just waits.
+# Stand-in for Claude Code: reports the agents written to $WTS_SMOKE_AGENTS (none
+# by default), and a pane that just waits.
+export WTS_SMOKE_AGENTS="$SANDBOX/agents.json"
 cat > "$SANDBOX/bin/claude" <<'EOF'
 #!/bin/sh
-[ "$1" = agents ] && { echo '[]'; exit 0; }
+[ "$1" = agents ] && { cat "$WTS_SMOKE_AGENTS" 2>/dev/null || echo '[]'; exit 0; }
 exec sleep 3600
 EOF
 chmod +x "$SANDBOX/bin/claude"
@@ -121,6 +123,12 @@ refute "missing layout creates nothing" test -e "$WT/other"
 check "ls shows the session" eval '"$WTS" ls | grep -q "^auth-form "'
 check "status --json" eval '"$WTS" status --json | jq -e "length == 2 and all(.[]; .exists and .tmux_alive)"'
 check "status --fzf has 7 fields" eval '"$WTS" status --fzf | awk -F "\037" "NF != 7 { exit 1 }"'
+
+# An interactive agent waiting for an answer needs a human: blocked, sorted first.
+jq -n --arg cwd "$WT/export-users-csv" \
+  '[{kind: "interactive", status: "waiting", cwd: $cwd, sessionId: "smoke"}]' > "$WTS_SMOKE_AGENTS"
+check "waiting agent shown as blocked, first" \
+  eval '"$WTS" status --json | jq -e ".[0].name == \"export-users-csv\" and .[0].agent_state == \"blocked\""'
 
 # ─── Restore ─────────────────────────────────────────────────────────────────
 

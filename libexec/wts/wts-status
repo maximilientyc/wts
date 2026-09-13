@@ -166,8 +166,10 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
     agent_session=$(print -r -- "$agent" | jq -c '.sessionId // null')
 
     # `state` (background) and `status` (interactive) mapped to one vocabulary.
+    # Interactive sessions report `status: waiting` while a question or a permission
+    # prompt waits for an answer: it needs a human, exactly like `state: blocked`.
     case "$raw" in
-      blocked)        agent_state='"blocked"' ;;
+      blocked|waiting) agent_state='"blocked"' ;;
       busy|working)   agent_state='"working"' ;;
       idle)           agent_state='"idle"' ;;
       done)           agent_state='"done"' ;;

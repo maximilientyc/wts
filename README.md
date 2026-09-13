@@ -173,7 +173,7 @@ the worktree, so `WTS_SUBDIR` keeps working.
 
 | Shown      | Source                             | Meaning                               |
 |------------|------------------------------------|---------------------------------------|
-| `blocked`  | `state: blocked`                   | waiting for a permission or an answer |
+| `blocked`  | `state: blocked` / `status: waiting` | waiting for a permission or an answer |
 | `working`  | `status: busy` / `state: working`  | turn in progress                      |
 | `idle`     | `status: idle`                     | turn finished, prompt available       |
 | `done`     | `state: done`                      | background session finished           |

@@ -51,6 +51,9 @@ straight from the checkout. Scripts locate each other from their own path
 - Outside a tmux client, `tmux display-message -p '#S'` returns the most recently
   used session, not "none": only trust it when `$TMUX` is set.
 - Unix socket paths are capped at 104 bytes on macOS (fzf `--listen`, tmux).
+- tmuxinator waits for Enter after warning about a tmux release newer than its
+  hard-coded list: always pass `--suppress-tmux-version-warning`, and `</dev/null`
+  when its output is hidden.
 
 ## Test
 

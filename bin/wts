@@ -46,7 +46,7 @@
 
 set -euo pipefail
 
-WTS_VERSION="0.1.0"
+WTS_VERSION="0.1.1"
 
 # ─── Install layout ──────────────────────────────────────────────────────────
 # Homebrew, `make install` and a git checkout all share the same tree:
@@ -226,6 +226,13 @@ registry_resolve_name() {
 # Yours first (~/.config/wts/layouts, or $WTS_LAYOUTS_PATH), then the built-in
 # ones. tmuxinator gets the file itself (--project-config), so your own
 # ~/.config/tmuxinator projects are never touched.
+#
+# Every start passes --suppress-tmux-version-warning: tmuxinator checks tmux
+# against a hard-coded list of releases, and on anything newer prints a warning
+# and waits for Enter on stdin. Behind `>/dev/null` (restore, `wts new`) that
+# is an invisible hang, and each tmux release would break wts until tmuxinator
+# catches up. Detached starts also get `</dev/null`, so nothing ever waits on
+# the terminal.
 
 # layout_file <name> — path of the layout, or failure.
 layout_file() {
@@ -463,7 +470,8 @@ if [[ "$1" == "restore" ]]; then
       WTS_RESUME=1
     fi
 
-    if tmuxinator start --project-config "$layout" --name "$name" --no-attach >/dev/null 2>&1; then
+    if tmuxinator start --project-config "$layout" --name "$name" --no-attach \
+         --suppress-tmux-version-warning </dev/null >/dev/null 2>&1; then
       echo "→ $name restored ($profile, $workdir)"
       (( restored++ )) || true
     else
@@ -858,7 +866,8 @@ fi
 if [[ -n "${WTS_NO_ATTACH:-}" ]]; then
   if tmux has-session -t "=$SESSION" 2>/dev/null; then
     echo "→ tmux session '$SESSION' already running"
-  elif tmuxinator start --project-config "$LAYOUT_FILE" --name "$SESSION" --no-attach >/dev/null 2>&1; then
+  elif tmuxinator start --project-config "$LAYOUT_FILE" --name "$SESSION" --no-attach \
+         --suppress-tmux-version-warning </dev/null >/dev/null 2>&1; then
     echo "→ session '$SESSION' started"
   else
     echo "⚠ $SESSION: tmuxinator failed to start" >&2
@@ -872,5 +881,5 @@ if tmux has-session -t "=$SESSION" 2>/dev/null; then
   echo "→ tmux session '$SESSION' already running, attaching"
   attach_or_switch "$SESSION"
 else
-  exec tmuxinator start --project-config "$LAYOUT_FILE" --name "$SESSION"
+  exec tmuxinator start --project-config "$LAYOUT_FILE" --name "$SESSION" --suppress-tmux-version-warning
 fi
