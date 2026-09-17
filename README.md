@@ -226,6 +226,12 @@ branch, git delta and a live preview of the agent's pane. `enter` switches, `ctr
 removes the selected session (`wts rm`), `ctrl-f` / `ctrl-b` scroll the preview by
 half a page, `ctrl-r` reloads. tmux sessions unknown to wts are listed after.
 
+The popup is **drawn at once**, on a list built from the registry and tmux alone —
+no git, no agent call. fzf swaps in the collected list when it is ready (`load`,
+then `reload-sync`), so the wait happens with the sessions already on screen
+instead of in front of an empty frame. Until the swap, the agent and delta columns
+show `-`: an agent state one refresh old is worse than no state at all.
+
 The list and the preview **refresh every 2 s** (`WTS_SWITCH_REFRESH`, `0` for a
 static list). fzf has no timer event, so the refresh goes through `--listen`: a
 background poller pushes `reload-sync(...)+refresh-preview` to fzf's unix socket.
@@ -475,6 +481,12 @@ Without `WTS_BASE_BRANCH`, `wts` uses, in order: `origin/HEAD`, a local `main`, 
 local `master`, the current branch. This detection does not fetch —
 [`prefix+: wts`](#creating-from-tmux) is what guarantees a fresh base. On an old
 clone without `origin/HEAD`, fix it with `git remote set-head origin -a`.
+
+Everything that *compares* against the base — the delta and `^ahead` in `wts ls`,
+the switcher and `wts status --json`, and `wts gc` and `wts brief` — uses
+`origin/<base>` when that ref exists, since that is what branches are cut from. Your
+local copy of the base is usually behind, and against it a branch with no commits of
+its own is credited with everything the base was missing.
 
 ### Monorepo: `WTS_SUBDIR`
 

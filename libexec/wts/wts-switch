@@ -32,36 +32,86 @@ WTS_CMD="${0:A:h:h:h}/bin/wts"
 # little enough for the capture to stay instant.
 SCROLLBACK="${WTS_SWITCH_SCROLLBACK:-2000}"
 
+# Read directly by the skeleton, which must not pay for wts-status.
+WTS_STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/wts/sessions.json"
+
+# The session to mark with " *". Global rather than a render_line argument: both
+# producers set it once, and `set -u` would trip on it if it were only local.
+typeset -g current=""
+
 # Each line: <display> TAB <preview-target> TAB <session-name>
 # fzf only shows field 1; fields 2 and 3 drive the preview and the switch.
+#
+# One printf for every producer: the skeleton below and the collected list must
+# line up column for column, and with --header, or the swap would redraw every
+# row shifted.
+render_line() { # <name> <agent> <branch> <delta> <subject> <preview-target>
+  local mark=""
+  [[ "$1" == "$current" ]] && mark=" *"
+  printf '%-22s %-10s %-30s %-14s %s%s\t%s\t%s\n' \
+    "$1" "$2" "$3" "$4" "${5:-}" "$mark" "$6" "$1"
+}
+
+# tmux sessions missing from the registry (numbered sessions, other projects...).
+unregistered() { # <names already listed, one per line>
+  local s
+  while IFS= read -r s; do
+    [[ -n "$s" ]] || continue
+    print -r -- "$1" | grep -qxF -- "$s" && continue
+    render_line "$s" "-" "-" "" "(not in registry)" "$s"
+  done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+}
+
 build_list() {
-  local current known
+  local known=""
   current=$(tmux display-message -p '#S' 2>/dev/null)
-  known=""
 
   if [[ -x "$WTS_BIN/wts-status" ]] && command -v jq >/dev/null 2>&1; then
     # \x1f (not whitespace): keeps empty fields, unlike TAB.
     while IFS=$'\x1f' read -r name agent branch delta dirty pane subject; do
       [[ -n "$name" ]] || continue
       known+="$name"$'\n'
-      local mark=""
-      [[ "$name" == "$current" ]] && mark=" *"
-      printf '%-22s %-10s %-30s %-14s %s%s\t%s\t%s\n' \
-        "$name" "$agent" "$branch" "$delta" "${subject:-}" "$mark" \
-        "${pane:-$name}" "$name"
+      render_line "$name" "$agent" "$branch" "$delta" "${subject:-}" "${pane:-$name}"
     done < <("$WTS_BIN/wts-status" --fzf 2>/dev/null)
   fi
 
-  # tmux sessions missing from the registry (numbered sessions, other projects...).
-  local s
-  while IFS= read -r s; do
-    [[ -n "$s" ]] || continue
-    print -r -- "$known" | grep -qxF -- "$s" && continue
-    local mark=""
-    [[ "$s" == "$current" ]] && mark=" *"
-    printf '%-22s %-10s %-30s %-14s %s%s\t%s\t%s\n' \
-      "$s" "-" "-" "" "(not in registry)" "$mark" "$s" "$s"
-  done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+  unregistered "$known"
+}
+
+# The skeleton: registry and tmux only, no git and no claude call, so it costs
+# about 10 ms instead of the collector's 1.6 s on a 95k-file repository. It is
+# what fzf gets on stdin, so the popup is drawn before anything is collected and
+# `start:reload-sync` swaps in the real list. Until this existed, build_list ran
+# to completion first and the popup was an empty frame for 2 s (5 s cold) — the
+# whole of what prefix+s felt like.
+#
+# The volatile columns show "-" rather than a remembered value: an agent state
+# one refresh old is a lie the user would act on. The preview already works from
+# a skeleton row, because a session name is a valid capture-pane target — the
+# same fallback build_list uses when an agent has no pane.
+build_skeleton() {
+  local known="" name branch subject
+  current=$(tmux display-message -p '#S' 2>/dev/null)
+
+  if [[ -s "$WTS_STATE_FILE" ]] && command -v jq >/dev/null 2>&1; then
+    # Same SUBJECT rule as wts-status, minus the agent's conversation title,
+    # which is unknowable without calling claude: at the swap the text only ever
+    # gains a title, it never changes width.
+    while IFS=$'\x1f' read -r name branch subject; do
+      [[ -n "$name" ]] || continue
+      known+="$name"$'\n'
+      render_line "$name" "-" "${branch:--}" "-" "$subject" "$name"
+    done < <(jq -r 'to_entries | sort_by(.key)[]
+      | [ .key,
+          (.value.branch // "-"),
+          ([.value.prompt, .value.context]
+            | map(select(type == "string" and . != "")) | (.[0] // "")
+            | gsub("[\\t\\n\\r]"; " ")
+            | if length > 50 then .[0:49] + "…" else . end) ]
+      | join("")' "$WTS_STATE_FILE" 2>/dev/null)
+  fi
+
+  unregistered "$known"
 }
 
 # ─── Preview and scroll ──────────────────────────────────────────────────────
@@ -141,6 +191,13 @@ if [[ "${1:-}" == "--list" ]]; then
   exit 0
 fi
 
+# Not used by fzf — the skeleton is passed on stdin — but the smoke test needs to
+# compare the two lists, and it is the quickest way to eyeball the alignment.
+if [[ "${1:-}" == "--list-fast" ]]; then
+  build_skeleton
+  exit 0
+fi
+
 # Preview subcommands, called by fzf for the current line.
 if [[ "${1:-}" == "--preview" ]]; then
   preview "${2:-}"
@@ -177,10 +234,44 @@ if [[ "${1:-}" == "--next" ]]; then
   exit 0
 fi
 
-list=$(build_list)
-[[ -n "$list" ]] || exit 0
-
 self="$WTS_BIN/wts-switch"
+
+# Start from the skeleton and let fzf pull the collected list itself, so the popup
+# is interactive at once instead of after a full collection pass.
+#
+# `load`, not `start`: `reload` replaces the reader, and on `start` that reader is
+# still stdin, so the skeleton is thrown away unread and the popup is an empty
+# frame until the collector returns — the very bug being fixed. `load` fires once
+# stdin has been consumed and the rows are on screen. Measured on a pty, time
+# until the skeleton is visible: `start` never, `start` + `--sync` never (`--sync`
+# withholds the first frame until the bind completes, which is worse still),
+# `load` immediately.
+#
+# `unbind(load)` first in the chain, because the reload fires `load` again when it
+# finishes: without it the collector would re-run forever. Verified it runs once.
+#
+# `reload-sync` rather than `reload`, for the same reason the poller below uses
+# it: the list is replaced only once the command has finished, so the skeleton
+# stays on screen instead of blinking to empty.
+#
+# The version is probed because an unknown --bind action is fatal: fzf would exit
+# immediately and the popup would close without a word. On an older fzf we
+# collect up front, exactly as before. 0.36 is where `reload-sync` appeared;
+# `load` (0.22) and `unbind` (0.24) are older.
+typeset -a fast_opts
+fast_opts=()
+fzf_version=$(fzf --version 2>/dev/null | cut -d' ' -f1)
+autoload -Uz is-at-least
+if [[ -n "$fzf_version" ]] && is-at-least 0.36 "$fzf_version"; then
+  list=$(build_skeleton)
+  fast_opts=(--bind="load:unbind(load)+reload-sync('$self' --list)")
+else
+  list=$(build_list)
+fi
+
+# The collected list is a subset of registry + tmux sessions, so an empty
+# skeleton means there would be nothing to show either way.
+[[ -n "$list" ]] || exit 0
 
 # Exported rather than recomputed, so that the subprocesses started by
 # --preview and by the binds land on this popup's file.
@@ -252,6 +343,7 @@ fi
 
 selection=$(print -r -- "$list" | fzf \
   "${listen_opts[@]}" \
+  "${fast_opts[@]}" \
   --reverse \
   --delimiter=$'\t' \
   --with-nth=1 \

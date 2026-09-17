@@ -9,6 +9,7 @@ set -euo pipefail
 
 ROOT="${0:A:h:h}"
 WTS="$ROOT/bin/wts"
+SWITCH="$ROOT/libexec/wts/wts-switch"
 
 # /tmp rather than $TMPDIR: the tmux socket lives under TMUX_TMPDIR, and macOS
 # caps unix socket paths at 104 bytes, which a long $TMPDIR can exceed.
@@ -129,6 +130,28 @@ jq -n --arg cwd "$WT/export-users-csv" \
   '[{kind: "interactive", status: "waiting", cwd: $cwd, sessionId: "smoke"}]' > "$WTS_SMOKE_AGENTS"
 check "waiting agent shown as blocked, first" \
   eval '"$WTS" status --json | jq -e ".[0].name == \"export-users-csv\" and .[0].agent_state == \"blocked\""'
+
+# The skeleton fzf opens on must be interchangeable with the collected list:
+# 3 TAB fields, and the same sessions, or the swap would drop or shift rows.
+check "switcher list has 3 fields" \
+  eval '"$SWITCH" --list | awk -F "\t" "NF != 3 { exit 1 }"'
+check "skeleton has 3 fields" \
+  eval '"$SWITCH" --list-fast | awk -F "\t" "NF != 3 { exit 1 }"'
+check "skeleton lists the same sessions" \
+  eval 'diff <("$SWITCH" --list-fast | cut -f3 | sort) <("$SWITCH" --list | cut -f3 | sort)'
+# Both go through render_line, so the SESSION column has to pad identically: if it
+# ever stops doing so, every later column redraws shifted at the swap.
+check "skeleton aligns with the collected list" \
+  eval 'diff <("$SWITCH" --list-fast | cut -f1 | cut -c1-23 | sort) \
+             <("$SWITCH" --list | cut -f1 | cut -c1-23 | sort)'
+
+# fzf exits 2 on an unknown --bind action, and in a popup that means the frame
+# closes without a word. --filter validates binds headlessly, so the actions the
+# swap depends on are checked against the fzf actually installed.
+check "the switcher swaps the skeleton on load, not on start" \
+  grep -qF 'load:unbind(load)+reload-sync' "$SWITCH"
+check "fzf accepts that bind" \
+  eval 'printf "x\n" | fzf --bind="load:unbind(load)+reload-sync(true)" --filter=x'
 
 # ─── Restore ─────────────────────────────────────────────────────────────────
 

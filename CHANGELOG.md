@@ -2,6 +2,7 @@
 
 ## 0.1.2 — 2026-09-17
 
+- The switcher popup (`prefix+s`) opens **immediately**. It is drawn on a registry-only list — sessions, branches and subjects, no git and no agent call — and fzf swaps in the collected list as soon as it is ready. `prefix+s` used to show an empty frame for the whole collection pass: 1.7 s warm and about 5 s cold on a 95k-file repository. The agent and delta columns show `-` until the swap rather than a remembered value, so a stale agent state is never presented as current.
 - `wts ls` and `wts status --json` measure the git counters (`added`, `removed`, `ahead`, `behind`, `merged`) against `origin/<base>` when it exists, as `wts gc` and `wts brief` already did. A branch cut from a freshly fetched base no longer reports the base's own history as its delta: a session with no commits of its own showed `+91727/-28066 ^333` and `merged: false` when the local base trailed the remote by three days. `base` keeps reporting the short branch name. On a large repository this also makes `wts ls` and the switcher **33% faster** (2.37 s → 1.60 s), because `git diff` walks the branch instead of everything the local base was missing.
 
 ## 0.1.1 — 2026-09-13
