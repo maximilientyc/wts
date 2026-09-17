@@ -5,7 +5,7 @@
 #
 # Default: DRY RUN. Nothing is deleted without --apply.
 #
-# Five categories, all restricted to the current repository:
+# Six categories, all restricted to the current repository:
 #   1. husk folders        — `git worktree remove` does NOT delete git-ignored
 #                            files, so a folder without `.git` is left behind
 #                            in <repo>-worktrees/.
@@ -14,6 +14,8 @@
 #   4. orphan branches     — remote gone, content MISSING from the base.
 #   5. orphan registry     — entries whose worktree has disappeared. Those of
 #                            the worktrees removed in 2. go along with them.
+#   6. stale index.lock    — left by a git process killed mid-operation; blocks
+#                            every write in that worktree until removed.
 #
 # The remote is the source of truth. Fetch --prune first (unless --no-fetch),
 # then compare against `origin/<base>` whenever it exists, not against the local
@@ -35,7 +37,11 @@
 #     removed;
 #   - the current tmux session is never killed;
 #   - orphan branches (cat. 4) are NEVER deleted automatically: a deleted remote
-#     branch does not prove its work landed anywhere.
+#     branch does not prove its work landed anywhere;
+#   - an index.lock is only reported once it is empty, several minutes old and
+#     held by nobody: deleting a live one corrupts its owner's index.
+#
+# Variables: WTS_LOCK_STALE_AFTER (300 s before an index.lock counts as stale).
 
 set -uo pipefail
 
@@ -277,7 +283,11 @@ if [[ -n "$base" ]]; then
       elif [[ "$wt" == "$repo_root" ]]; then
         : # the working branch of the main repository: never touched
       else
-        dirty=$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+        # --no-optional-locks, and not GIT_OPTIONAL_LOCKS=0 for the whole
+        # script: gc also removes worktrees and deletes branches, and those
+        # locks are not optional. Without it this status took the worktree's
+        # index.lock and raced the agent living there (see wts-status).
+        dirty=$(git -C "$wt" --no-optional-locks status --porcelain 2>/dev/null | wc -l | tr -d ' ')
         if (( ${dirty:-0} > 0 )); then
           held+=("$b"$'\x1f'"$wt"$'\x1f'"${dirty} modified file(s)")
         elif [[ -n "${busy_wt[$wt]:-}" ]]; then
@@ -368,9 +378,90 @@ fi
 (( ${#reg_teardown} )) && print "  (+ removed along with their worktree: ${(j:, :)reg_teardown})"
 print ""
 
+# ─── 6. Stale index locks ────────────────────────────────────────────────────
+# `git status` and `git add` create <gitdir>/index.lock and hold it for the whole
+# operation. A process killed inside that window — an aborted agent, a status
+# collector whose caller went away, lazygit in a torn-down pane — leaves the file
+# behind, and from then on EVERY write in that worktree fails with "Unable to
+# create index.lock: File exists". Nothing reports it, so the worktree looks fine
+# until the next `git add`, and the fix (deleting a file inside .git) is not one
+# to guess at.
+#
+# Three conditions, all required, because deleting a lock somebody holds
+# corrupts their index:
+#   - empty: git writes the new index INTO the lock before renaming it over
+#     `index`, so a non-empty lock may be a write in progress;
+#   - older than WTS_LOCK_STALE_AFTER (5 min): no legitimate status or add holds
+#     the lock that long;
+#   - no open file descriptor: git keeps the lock open for the whole operation,
+#     so lsof is the authoritative liveness test. Without lsof the first two
+#     conditions stand alone and the report says so, rather than staying silent.
+LOCK_STALE_AFTER=${WTS_LOCK_STALE_AFTER:-300}
+
+# zstat rather than stat: the `stat` in PATH may be GNU coreutils', whose options
+# have nothing in common with the macOS one.
+zmodload -F zsh/stat b:zstat 2>/dev/null
+
+# Age as one field, for a report that stays readable at a glance.
+lock_age() {
+  local s=$1
+  (( s < 3600 ))  && { print -r -- "$((s / 60))m"; return }
+  (( s < 86400 )) && { print -r -- "$((s / 3600))h"; return }
+  print -r -- "$((s / 86400))d"
+}
+
+typeset -a stale_locks
+stale_locks=()
+lock_note=""
+# --git-common-dir, not "$repo_root/.git": the latter is a file in a linked
+# worktree, and gc may well be run from one.
+common_dir=$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+if [[ -z "$common_dir" ]]; then
+  # git < 2.31 has no --path-format, and the plain form answers relative to the
+  # repository — which would resolve against this script's cwd instead.
+  common_dir=$(git -C "$repo_root" rev-parse --git-common-dir 2>/dev/null)
+  [[ -n "$common_dir" && "$common_dir" != /* ]] && common_dir="$repo_root/$common_dir"
+fi
+# `b:zstat` loads a builtin, so it lands in $builtins, not in $functions.
+if [[ -n "$common_dir" ]] && (( ${+builtins[zstat]} )); then
+  command -v lsof >/dev/null 2>&1 \
+    || lock_note="lsof not found: a lock still held by a live git process cannot be ruled out"
+  now=$(date +%s)
+  # (N) on the glob only: no worktree at all is the normal case for a plain
+  # repository, and a bare glob would print zsh's "no matches found". The first
+  # word is not a pattern, so it survives as-is and the -e test filters it.
+  for lock in "$common_dir"/index.lock "$common_dir"/worktrees/*/index.lock(N); do
+    [[ -f "$lock" ]] || continue
+    [[ -s "$lock" ]] && continue
+    mtime=$(zstat +mtime "$lock" 2>/dev/null) || continue
+    (( now - mtime >= LOCK_STALE_AFTER )) || continue
+    [[ -n "$(lsof -t -- "$lock" 2>/dev/null)" ]] && continue
+    # The main working tree's lock lives directly in the common dir; a linked
+    # worktree's is one level down, under its own name.
+    if [[ "$lock" == "$common_dir"/index.lock ]]; then
+      owner="$repo_name (main)"
+    else
+      owner="${lock:h:t}"
+    fi
+    stale_locks+=("$owner"$'\x1f'"$lock"$'\x1f'"$(lock_age $(( now - mtime )))")
+  done
+fi
+
+if (( ${#stale_locks} )); then
+  print "Stale index.lock (every git write in that worktree fails until removed):"
+  for rec in "${stale_locks[@]}"; do
+    IFS=$'\x1f' read -r owner lock age <<< "$rec"
+    printf '  %-28s %s ago\n' "$owner" "$age"
+  done
+else
+  print "Stale index.lock: none"
+fi
+[[ -n "$lock_note" ]] && print "  ($lock_note)"
+print ""
+
 # ─── Execution ───────────────────────────────────────────────────────────────
 if ! $APPLY; then
-  if (( ${#husks} + ${#teardown} + ${#free_branches} + ${#orphans} > 0 )); then
+  if (( ${#husks} + ${#teardown} + ${#free_branches} + ${#orphans} + ${#stale_locks} > 0 )); then
     print "Nothing was deleted. Run again with: wts gc --apply"
   fi
   exit 0
@@ -417,6 +508,21 @@ done
 
 for d in "${husks[@]}"; do
   if rm -rf -- "$d"; then print "✓ deleted $d"; else print -u2 "⚠ failed to delete $d"; fi
+done
+
+# Re-checked here and not trusted from the scan above: the fetch and the
+# teardowns took time, and a lock that became live in between must survive.
+for rec in "${stale_locks[@]}"; do
+  IFS=$'\x1f' read -r owner lock age <<< "$rec"
+  if [[ -s "$lock" ]] || [[ -n "$(lsof -t -- "$lock" 2>/dev/null)" ]]; then
+    print -u2 "⚠ index.lock of $owner now held by a live git process, kept"
+  elif [[ ! -f "$lock" ]]; then
+    print "✓ index.lock of $owner already gone"
+  elif rm -f -- "$lock"; then
+    print "✓ stale index.lock removed ($owner)"
+  else
+    print -u2 "⚠ index.lock of $owner not removed"
+  fi
 done
 
 purge=("${(@u)purge}")

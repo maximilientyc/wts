@@ -153,6 +153,52 @@ check "the switcher swaps the skeleton on load, not on start" \
 check "fzf accepts that bind" \
   eval 'printf "x\n" | fzf --bind="load:unbind(load)+reload-sync(true)" --filter=x'
 
+# ─── No collector may take a worktree's index.lock ───────────────────────────
+# `git status` creates <gitdir>/index.lock before it scans and only releases it
+# after writing the refreshed index back. The collector statuses every registered
+# worktree, on every `wts ls` and every switcher refresh (2 s by default), so it
+# raced the agent's own `git add` in that worktree — and a pass killed mid-scan
+# left a zero-byte lock that broke every write there until someone deleted it by
+# hand, inside .git.
+#
+# A shim, not an assertion on the filesystem: git removes the lock when it
+# finishes, so by the time the test could look, a lock correctly taken and no
+# lock at all are indistinguishable. What has to be pinned is that these calls
+# are never *allowed* to write.
+export WTS_SMOKE_LOCKY="$SANDBOX/locky.log"
+export WTS_SMOKE_REAL_GIT=$(command -v git)
+mkdir -p "$SANDBOX/shim"
+cat > "$SANDBOX/shim/git" <<'EOF'
+#!/bin/sh
+# --no-optional-locks and GIT_OPTIONAL_LOCKS come before the subcommand, so
+# scanning in order and stopping there sees everything that matters.
+for a in "$@"; do
+  case "$a" in
+    --no-optional-locks) nolocks=1 ;;
+    status|diff)         sub="$a"; break ;;
+  esac
+done
+if [ -n "$sub" ] && [ -z "$nolocks" ] && [ "$GIT_OPTIONAL_LOCKS" != 0 ]; then
+  echo "$*" >> "$WTS_SMOKE_LOCKY"
+fi
+exec "$WTS_SMOKE_REAL_GIT" "$@"
+EOF
+chmod +x "$SANDBOX/shim/git"
+
+: > "$WTS_SMOKE_LOCKY"
+for probe in 'ls' 'status --json' 'brief' 'gc --no-fetch'; do
+  PATH="$SANDBOX/shim:$PATH" "$WTS" ${=probe} >/dev/null 2>&1 || true
+done
+PATH="$SANDBOX/shim:$PATH" "$SWITCH" --list >/dev/null 2>&1 || true
+
+if [[ -s "$WTS_SMOKE_LOCKY" ]]; then
+  print -r -- "     these calls may take index.lock:"
+  sed 's/^/       git /' "$WTS_SMOKE_LOCKY"
+  fail "no collector git call may take index.lock"
+else
+  ok "no collector git call may take index.lock"
+fi
+
 # ─── Restore ─────────────────────────────────────────────────────────────────
 
 tmux kill-session -t "=auth-form"
@@ -174,6 +220,39 @@ refute "gc drops the registry entry" in_registry auth-form
 check "gc spares a branch without commits" has_session export-users-csv
 check "gc spares its worktree" test -d "$WT/export-users-csv"
 check "gc spares sibling folders" test -f "$SANDBOX/code/demo-notes/todo.txt"
+
+# ─── gc: stale index.lock ────────────────────────────────────────────────────
+# A git process killed mid-operation leaves <gitdir>/index.lock behind and every
+# later write in that worktree fails, silently until the next `git add`.
+# WTS_LOCK_STALE_AFTER=0 so the test does not sit out the 5-minute default.
+
+survivor="$WT/export-users-csv"
+lockdir=$(git -C "$survivor" rev-parse --path-format=absolute --git-dir)
+: > "$lockdir/index.lock"
+refute "the stale lock blocks git add" git -C "$survivor" add -A
+# Matched on the captured output, not through `| grep -q`: grep exits on the
+# first match, gc dies of SIGPIPE and `set -o pipefail` fails the whole check.
+check "gc reports the stale lock" eval '
+  out=$(WTS_LOCK_STALE_AFTER=0 "$WTS" gc --no-fetch)
+  [[ "$out" == *"Stale index.lock ("*"export-users-csv"* ]]'
+check "the dry run keeps it" test -f "$lockdir/index.lock"
+
+WTS_LOCK_STALE_AFTER=0 "$WTS" gc --no-fetch --apply >/dev/null
+refute "gc --apply removes it" test -f "$lockdir/index.lock"
+check "git add works again" git -C "$survivor" add -A
+
+# A lock with content is a write in progress: git fills it before renaming it
+# over `index`, so removing it would truncate somebody's index.
+print -n busy > "$lockdir/index.lock"
+WTS_LOCK_STALE_AFTER=0 "$WTS" gc --no-fetch --apply >/dev/null
+check "a non-empty lock is left alone" test -s "$lockdir/index.lock"
+rm -f "$lockdir/index.lock"
+
+check "a fresh lock is left alone" eval '
+  : > "$lockdir/index.lock"
+  "$WTS" gc --no-fetch --apply >/dev/null
+  test -f "$lockdir/index.lock"'
+rm -f "$lockdir/index.lock"
 
 # ─── rm ──────────────────────────────────────────────────────────────────────
 

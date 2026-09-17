@@ -17,6 +17,21 @@
 # down, claude not in PATH) and we want to degrade, not die.
 set -uo pipefail
 
+# `git status` takes <gitdir>/index.lock BEFORE it scans and holds it until it
+# has written the refreshed index back. This collector statuses every registered
+# worktree, on every `wts ls`, every switcher refresh (every 2 s) and every
+# prefix+a — so an agent's `git add` in one of those worktrees died with "Unable
+# to create index.lock: File exists", and a pass killed mid-scan (the switcher's
+# poller replaces the one in flight) left a zero-byte lock behind for good,
+# breaking every write in that worktree until someone deleted it by hand.
+#
+# With optional locks off the refresh stays in memory: no lock file is ever
+# created, so there is nothing to contend for and nothing to leave behind. The
+# only thing given up is persisting the stat cache — a write this collector had
+# no business making in someone else's worktree — and fsmonitor still answers,
+# so a status on a 95k-file repository stays at ~0.1 s.
+export GIT_OPTIONAL_LOCKS=0
+
 WTS_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wts"
 WTS_STATE_FILE="$WTS_STATE_DIR/sessions.json"
 PANEHASH_DIR="$WTS_STATE_DIR/panehash"

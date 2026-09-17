@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.3 — 2026-09-17
+
+- **`git add` in a worktree no longer fails with `Unable to create '.git/worktrees/<session>/index.lock': File exists`.** `git status` takes that lock before it scans and holds it until it has written the refreshed index back, and the collector statuses every registered worktree — on every `wts ls`, every switcher refresh (every 2 s while the popup is open) and every `prefix+a`. So it raced the agent's own `git add`, and a pass killed mid-scan left a zero-byte lock behind that broke **every** write in that worktree until someone deleted it by hand, inside `.git`. On the repository that motivated this, 7 worktrees out of 7 held one, the oldest a day old. `wts ls`, `wts status`, the switcher, `wts brief` and `wts gc` now run their status and diff with optional locks off: the refresh stays in memory, no lock file is ever created, and `git status` on a 95k-file repository still costs ~0.1 s because fsmonitor keeps answering. `wts` was also taking the **main** repository's index lock before `wts` (`prefix+g`) fast-forwards the local base, which could turn a fast-forward that git would have performed into the misleading "not fast-forwarded (diverged, or git operation in progress)".
+- `wts gc` reports and, with `--apply`, removes stale `index.lock` files — including those left by something other than wts (an interrupted agent, a git UI in a torn-down pane). A lock is only ever touched once it is empty, older than `WTS_LOCK_STALE_AFTER` (5 min) and held by no live process: deleting a lock somebody owns would corrupt their index.
+
 ## 0.1.2 — 2026-09-17
 
 - The switcher popup (`prefix+s`) opens **immediately**. It is drawn on a registry-only list — sessions, branches and subjects, no git and no agent call — and fzf swaps in the collected list as soon as it is ready. `prefix+s` used to show an empty frame for the whole collection pass: 1.7 s warm and about 5 s cold on a 95k-file repository. The agent and delta columns show `-` until the swap rather than a remembered value, so a stale agent state is never presented as current.

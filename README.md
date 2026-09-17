@@ -318,7 +318,7 @@ wts gc --no-fetch   # without contacting the remote (offline)
 
 **The remote is the source of truth.** `wts gc` starts with
 `git fetch --all --prune`, then compares against `origin/<base>` rather than a local
-base that may lag behind. Five categories, limited to the current repository:
+base that may lag behind. Six categories, limited to the current repository:
 
 1. **Husk folders** in `<repo>-worktrees/` — `git worktree remove` leaves git-ignored
    files behind, so a folder without `.git` remains after each `wts rm`.
@@ -327,6 +327,10 @@ base that may lag behind. Five categories, limited to the current repository:
 4. **Orphan branches** — the remote branch is gone but the content is **not** in the
    base. Never deleted automatically: listed with their commit count, your call.
 5. **Orphan registry entries** whose worktree disappeared.
+6. **Stale `index.lock`** — a git process killed mid-operation leaves one behind, and
+   from then on every write in that worktree fails with `Unable to create
+   '.git/worktrees/<session>/index.lock': File exists`. Nothing reports it, so the
+   worktree looks fine until the next `git add`.
 
 **Why not `git branch --merged`.** It only recognizes merges by ancestry. A pull
 request merged by **squash** or **rebase** rewrites the SHAs, so the branch is never
@@ -344,6 +348,9 @@ branch is read from `%(upstream:track)` == `[gone]`, which only `--prune` reveal
 - A worktree with uncommitted changes, or whose agent is busy (`working`, `blocked`,
   `stuck?`), is left in place and listed as such.
 - The current tmux session is never killed.
+- An `index.lock` is only removed once it is empty, older than `WTS_LOCK_STALE_AFTER`
+  (5 min) and held by no live process: deleting a lock somebody owns would corrupt
+  their index.
 
 ## Persistence and restore
 
@@ -471,6 +478,7 @@ locale (`LANG=C`), Ruby refuses to read them ("invalid byte sequence in US-ASCII
 | `WTS_STALE_AFTER`       | `10`                          | seconds before a frozen `working` agent shows `stuck?` |
 | `WTS_SWITCH_REFRESH`    | `2`                           | switcher refresh interval, `0` for a static list       |
 | `WTS_SWITCH_SCROLLBACK` | `2000`                        | lines of tmux history reachable in the preview         |
+| `WTS_LOCK_STALE_AFTER`  | `300`                         | seconds before `wts gc` calls an `index.lock` stale    |
 | `CLAUDE_CONFIG_DIR`     | `~/.claude`                   | where Claude Code keeps sessions and transcripts       |
 
 `XDG_STATE_HOME` and `XDG_CONFIG_HOME` are honored.

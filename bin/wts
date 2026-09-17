@@ -29,7 +29,8 @@
 #   rm         : delete the tmux session, the worktree and the branch
 #     -f       : force (dirty worktree, unmerged branch)
 #   gc         : clean up from the remote: worktrees and branches whose PR is
-#                merged (squash included) or whose remote branch is gone
+#                merged (squash included) or whose remote branch is gone,
+#                plus any stale index.lock blocking writes in a worktree
 #   layouts    : list available layouts (yours shadow the built-in ones)
 #   setup tmux : print the tmux.conf snippet (switcher popup, `wts` command)
 #
@@ -46,7 +47,7 @@
 
 set -euo pipefail
 
-WTS_VERSION="0.1.2"
+WTS_VERSION="0.1.3"
 
 # ─── Install layout ──────────────────────────────────────────────────────────
 # Homebrew, `make install` and a git checkout all share the same tree:

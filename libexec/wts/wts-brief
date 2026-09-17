@@ -26,6 +26,11 @@
 # transcript) and one unreadable session must not deprive the others.
 set -uo pipefail
 
+# Same reason as wts-status: `status --porcelain` and `diff HEAD` refresh the
+# index and write it back under <gitdir>/index.lock, which collided with the
+# agent's own `git add` in that worktree. Every git call here is a read.
+export GIT_OPTIONAL_LOCKS=0
+
 WTS_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wts"
 WTS_BIN="${0:A:h}"
 CACHE_DIR="$WTS_STATE_DIR/brief"

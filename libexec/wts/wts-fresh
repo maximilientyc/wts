@@ -257,7 +257,13 @@ ff_local_base() {
   # --untracked-files=no: an untracked file (.envrc, build artifact) must not
   # forever block a fast-forward that git would perform safely.
   # `merge --ff-only` refuses to overwrite anything anyway.
-  dirty=$(git -C "$base_wt" status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')
+  #
+  # --no-optional-locks: $base_wt is usually the main working tree, and the
+  # `merge --ff-only` below is the one command here that hard-fails on a held
+  # index.lock. Letting this status write the index back meant the check could
+  # take the very lock the merge then needed, and the failure surfaced as the
+  # misleading "diverged, or git operation in progress" below.
+  dirty=$(git -C "$base_wt" --no-optional-locks status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')
   if (( ${dirty:-0} > 0 )); then
     print -r -- "⚠ $base is checked out in $base_wt (${dirty} change(s)): not fast-forwarded"
     return 0
