@@ -73,7 +73,7 @@ mkdir -p "$PANEHASH_DIR" 2>/dev/null
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
-typeset -A base_cache merged_cache
+typeset -A base_cache base_ref_cache merged_cache
 
 # Base branch of a repository (same priority order as `wts`).
 detect_base() {
@@ -97,6 +97,34 @@ detect_base() {
   fi
   base_cache[$root]="$base"
   print -r -- "$base"
+}
+
+# What git is actually asked about: origin/<base> when it exists, otherwise the
+# local base. Same rule, and same reason, as wts-gc and wts-brief: the local copy
+# of the base lags behind — 333 commits and 3 days, on the repository that
+# motivated this — so `diff <base>...HEAD` credited a branch with no commits of
+# its own with 2782 files and 92k insertions, `rev-list --left-right` reported a
+# ^333 that belonged to the remote, and `branch --merged` missed everything
+# merged since the last local pull. It is also 10x faster: git walks the branch's
+# delta instead of three days of history.
+#
+# Only the comparison changes; `base` keeps reporting the short name, because
+# wts-brief reads it and derives "origin/$base" itself.
+#
+# show-ref on refs/remotes/origin/$base also covers WTS_BASE_BRANCH=origin/main,
+# which wts-fresh exports: refs/remotes/origin/origin/main does not exist, so the
+# ref is left alone instead of being prefixed twice.
+base_ref_for() {
+  local root="$1" base="$2"
+  local key="$root::$base"
+  if [[ -z "${base_ref_cache[$key]:-}" ]]; then
+    base_ref_cache[$key]="$base"
+    if [[ -n "$base" ]] \
+       && git -C "$root" show-ref --verify --quiet "refs/remotes/origin/$base"; then
+      base_ref_cache[$key]="origin/$base"
+    fi
+  fi
+  print -r -- "${base_ref_cache[$key]}"
 }
 
 # Branches merged into the base, cached per repository.
@@ -128,21 +156,22 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
 
   # --- git ------------------------------------------------------------------
   exists=false; dirty=0; ahead=0; behind=0; added=0; removed=0; merged=false
-  base=""
+  base=""; base_ref=""
   if [[ -d "$worktree" ]]; then
     exists=true
     dirty=$(git -C "$worktree" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
     base=$(detect_base "$repo_root")
-    if [[ -n "$base" ]] && git -C "$worktree" rev-parse --verify --quiet "$base" >/dev/null 2>&1; then
-      counts=$(git -C "$worktree" rev-list --left-right --count "$base...HEAD" 2>/dev/null)
+    base_ref=$(base_ref_for "$repo_root" "$base")
+    if [[ -n "$base_ref" ]] && git -C "$worktree" rev-parse --verify --quiet "$base_ref" >/dev/null 2>&1; then
+      counts=$(git -C "$worktree" rev-list --left-right --count "$base_ref...HEAD" 2>/dev/null)
       if [[ -n "$counts" ]]; then
         behind=${counts%%[[:space:]]*}
         ahead=${counts##*[[:space:]]}
       fi
-      shortstat=$(git -C "$worktree" diff --shortstat "$base...HEAD" 2>/dev/null)
+      shortstat=$(git -C "$worktree" diff --shortstat "$base_ref...HEAD" 2>/dev/null)
       [[ "$shortstat" =~ '([0-9]+) insertion' ]] && added="${match[1]}"
       [[ "$shortstat" =~ '([0-9]+) deletion' ]] && removed="${match[1]}"
-      if print -r -- "$(merged_branches "$repo_root" "$base")" \
+      if print -r -- "$(merged_branches "$repo_root" "$base_ref")" \
          | grep -qxF -- "$branch" 2>/dev/null; then
         merged=true
       fi

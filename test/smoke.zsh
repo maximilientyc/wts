@@ -160,4 +160,42 @@ refute "rm removes the worktree" test -d "$WT/export-users-csv"
 refute "rm deletes the branch" git show-ref --verify --quiet refs/heads/feature/export-users-csv
 refute "rm drops the registry entry" in_registry export-users-csv
 
+# ─── Stale local base ────────────────────────────────────────────────────────
+# Last, and only now: giving the repo a remote changes what `wts gc` compares
+# against, so it must not happen while the checks above are running.
+#
+# wts-fresh cuts branches from origin/<base>, so the delta has to be measured
+# against origin/<base> too. Measured against a local base left behind, a branch
+# with no commits of its own was credited with everything the local base was
+# missing (+91727/-28066 and ^333, on the repository that motivated this).
+
+ORIGIN="$SANDBOX/code/origin.git"
+git init -q --bare "$ORIGIN"
+git -C "$REPO" remote add origin "$ORIGIN"
+git -C "$REPO" push -q origin main
+lagging=$(git -C "$REPO" rev-parse main)
+print upstream > "$REPO/UPSTREAM"
+git -C "$REPO" add UPSTREAM
+git -C "$REPO" commit -qm upstream
+git -C "$REPO" push -q origin main
+git -C "$REPO" remote set-head origin -a    # so detect_base finds origin/HEAD
+git -C "$REPO" reset -q --hard "$lagging"   # local main now trails origin/main
+
+# WTS_BASE_BRANCH only for this call, exactly as wts-fresh passes it: the
+# collector below must rediscover the base on its own.
+WTS_NO_ATTACH=1 WTS_BASE_BRANCH=origin/main "$WTS" fresh-cut smoke >/dev/null
+check "session cut from origin/<base>" in_registry fresh-cut
+
+# The branch is origin/main itself, so every counter is zero and it is merged.
+# Against the local base it used to report ahead=1 and added=1.
+check "delta measured against origin/<base>" \
+  eval '"$WTS" status --json | jq -e ".[] | select(.name == \"fresh-cut\")
+        | .ahead == 0 and .behind == 0 and .added == 0 and .removed == 0"'
+check "merged seen through origin/<base>" \
+  eval '"$WTS" status --json | jq -e ".[] | select(.name == \"fresh-cut\") | .merged"'
+# Pins the contract: wts-brief reads .base and derives "origin/$base" itself, so
+# it must stay the short name.
+check "base still reports the short name" \
+  eval '"$WTS" status --json | jq -e ".[] | select(.name == \"fresh-cut\") | .base == \"main\""'
+
 print -r -- "── $passed checks passed"
