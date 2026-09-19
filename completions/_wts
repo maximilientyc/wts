@@ -188,6 +188,7 @@ _wts() {
       "rm:remove session, worktree and branch" \
       "gc:clean up dead worktrees and branches" \
       "layouts:list available layouts" \
+      "keys:switcher keys and tmux bindings" \
       "setup:print integration snippets (tmux)" \
       "help:show usage" \
       "version:show version"
@@ -250,7 +251,7 @@ _wts() {
         _wts_say "no more arguments"
       fi ;;
 
-    ls|layouts|help|version)
+    ls|layouts|keys|help|version)
       _wts_say "no arguments" ;;
 
     new)

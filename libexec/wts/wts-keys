@@ -1,0 +1,186 @@
+#!/usr/bin/env zsh
+# wts-keys — the one table of wts keys, read by the switcher's footer and by
+# `wts keys`.
+#
+#   --footer [collapsed|expanded|reply]   what the switcher prints under its list
+#   (no argument)                         the aide-memoire `wts keys` prints
+#
+# One table, two consumers: a footer that disagreed with `wts keys` would be
+# worse than no footer at all.
+#
+# The footer is as wide as the LIST, not as the popup: fzf draws it under the
+# list, beside the preview window. So the width comes from $WTS_SWITCH_COLS,
+# which the switcher already computes and exports for the table layout, and the
+# collapsed line drops its rarest keys rather than letting fzf cut it mid-word.
+
+set -uo pipefail
+
+SEP=$'\x1f'
+
+# <key> <terse, for the collapsed line> <what it does>
+# Ordered by how often a key is wanted: the collapsed line drops from the end.
+# Descriptions stay under 36 characters, which is what a column of the expanded
+# footer has on a half-popup list.
+typeset -ga KEYS
+KEYS=(
+  "enter${SEP}switch${SEP}switch to the highlighted session"
+  "tab${SEP}reply${SEP}reply to the agent, enter sends"
+  "^x${SEP}stop${SEP}stop the session, keep the worktree"
+  "^d${SEP}rm${SEP}remove session, worktree and branch"
+  "^f/^b${SEP}scroll${SEP}scroll the preview half a page"
+  "^r${SEP}reload${SEP}reload the list now"
+  "esc${SEP}close${SEP}close, or leave reply mode"
+  "?${SEP}keys${SEP}show or hide these keys"
+)
+
+# The tmux bindings `wts setup tmux` installs. They cannot be pressed from
+# inside the popup, which is exactly why they are the ones that get forgotten.
+#
+# The prefix is read from the server rather than assumed: `show-options` on a
+# machine with no server answers on stderr and exits non-zero, it does not
+# start one, so this stays free outside tmux.
+typeset -ga TMUX_KEYS
+tmux_keys() {
+  local p
+  p=$(tmux show-options -gv prefix 2>/dev/null)
+  [[ -n "$p" && "$p" != "none" ]] || p="C-b"
+  TMUX_KEYS=(
+    "$p s${SEP}switcher${SEP}open this switcher"
+    "$p a${SEP}next${SEP}jump to the next agent waiting"
+    "$p g${SEP}new${SEP}new session, prompt pre-filled"
+    "$p :${SEP}wts …${SEP}then 'wts <name> …', from a fresh base"
+  )
+}
+
+# Cut to <width> characters, the last one an ellipsis, into REPLY.
+fit() { # <text> <width>
+  REPLY="$1"
+  (( $2 < 1 )) && { REPLY=""; return }
+  (( ${#REPLY} > $2 )) && REPLY="${REPLY[1,$2-1]}…"
+}
+
+# What the footer text may use. fzf indents it past its own pointer/marker
+# gutter, which is not part of the width the switcher computed.
+footer_width() {
+  local w="${WTS_SWITCH_COLS:-${COLUMNS:-0}}"
+  # A non-interactive zsh reports COLUMNS=0, which means "unknown", not "no
+  # room": taken at face value it left the footer with nothing but "? keys".
+  [[ "$w" == <-> ]] && (( w > 0 )) || w=80
+  (( w -= 2 ))
+  (( w < 20 )) && w=20
+  print -r -- $w
+}
+
+# One line: as many "key terse" pairs as fit. "? keys" is the way to the full
+# list, so it is the one item that never drops.
+collapsed() {
+  local w raw
+  local -a f items
+  w=$(footer_width)
+  for raw in "${KEYS[@]}"; do
+    f=("${(@ps:\x1f:)raw}")
+    items+=("$f[1] $f[2]")
+  done
+  local last="$items[-1]" line
+  items=("${(@)items[1,-2]}")
+  while :; do
+    if (( ${#items} )); then
+      line="${(j: · :)items} · $last"
+    else
+      line="$last"
+    fi
+    (( ${#line} <= w || ${#items} == 0 )) && break
+    items=("${(@)items[1,-2]}")
+  done
+  print -r -- "$line"
+}
+
+# The full list, two columns when the list is wide enough for them. The tmux
+# bindings close it: they are the reason the expanded view exists at all.
+expanded() {
+  local w raw text_w
+  local -a f cells
+  w=$(footer_width)
+
+  # 84 is two 42-column cells: a key column of 5, a space, and 36 of text.
+  # Narrower than that, one column gets the whole width instead of half of it.
+  local -i two=0
+  (( w >= 84 )) && two=1
+  if (( two )); then text_w=36; else text_w=$(( w - 6 )); fi
+
+  for raw in "${KEYS[@]}"; do
+    f=("${(@ps:\x1f:)raw}")
+    fit "$f[3]" $text_w
+    cells+=("$(printf '%-5s %s' "$f[1]" "$REPLY")")
+  done
+
+  local -a lines
+  local i
+  if (( two )); then
+    for (( i = 1; i <= ${#cells}; i += 2 )); do
+      lines+=("$(printf '%-42s%s' "$cells[i]" "${cells[i+1]:-}")")
+    done
+  else
+    lines+=("${cells[@]}")
+  fi
+
+  tmux_keys
+  local -a tmux_items
+  for raw in "${TMUX_KEYS[@]}"; do
+    f=("${(@ps:\x1f:)raw}")
+    tmux_items+=("$f[1] $f[2]")
+  done
+  local tline="tmux: ${(j: · :)tmux_items}"
+  while (( ${#tline} > w && ${#tmux_items} > 1 )); do
+    tmux_items=("${(@)tmux_items[1,-2]}")
+    tline="tmux: ${(j: · :)tmux_items}"
+  done
+  fit "$tline" $w
+  lines+=("$REPLY")
+
+  print -rl -- "${lines[@]}"
+}
+
+# Reply mode: enter no longer switches and ^d / ^x are unbound, so the list's
+# line would be a lie. Also the only footer shown while `?` itself is unbound.
+reply_line() {
+  local w line="enter send · tab/esc back to the list · ^f/^b scroll"
+  w=$(footer_width)
+  (( ${#line} > w )) && line="enter send · esc back"
+  print -r -- "$line"
+}
+
+# `wts keys`: the same table, laid out for a terminal rather than for a popup.
+text() {
+  local raw
+  local -a f
+  print -r -- "Switcher popup"
+  for raw in "${KEYS[@]}"; do
+    f=("${(@ps:\x1f:)raw}")
+    printf '  %-7s %s\n' "$f[1]" "$f[3]"
+  done
+  print -r -- "  ctrl-x is 'wts stop', ctrl-d is 'wts rm'."
+  print -r -- ""
+  print -r -- "tmux (from 'wts setup tmux')"
+  tmux_keys
+  for raw in "${TMUX_KEYS[@]}"; do
+    f=("${(@ps:\x1f:)raw}")
+    printf '  %-7s %s\n' "$f[1]" "$f[3]"
+  done
+}
+
+if [[ "${1:-}" == "--footer" ]]; then
+  case "${2:-collapsed}" in
+    expanded) expanded ;;
+    reply)    reply_line ;;
+    *)        collapsed ;;
+  esac
+  exit 0
+fi
+
+if [[ -n "${1:-}" && "$1" != "--text" ]]; then
+  print -u2 -r -- "usage: wts-keys [--text | --footer [collapsed|expanded|reply]]"
+  exit 2
+fi
+
+text

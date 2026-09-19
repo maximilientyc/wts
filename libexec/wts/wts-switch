@@ -13,6 +13,10 @@
 #   ctrl-x   kill the tmux session only (wts stop), after a y/N prompt
 #   ctrl-f   scroll the preview down half a page
 #   ctrl-b   scroll the preview up half a page
+#   ?        show or hide the full key list in the footer (fzf >= 0.65)
+#
+# That list is not only written here: wts-keys prints it under the list, so the
+# keys are read from the popup itself. See the "Footer" section.
 #
 # The list and the preview refresh on their own every $WTS_SWITCH_REFRESH
 # seconds (2 by default, 0 to turn it off). See the "Live refresh" section
@@ -210,6 +214,55 @@ write_scroll() { # $1 = target, $2 = offset
   print -rl -- "$1" "$2" > "$WTS_SWITCH_SCROLL"
 }
 
+# ─── Footer ──────────────────────────────────────────────────────────────────
+# The keys are printed under the list, because nobody opens the README to
+# remember `ctrl-x`: one line by default, the whole table (tmux bindings
+# included) on `?`. Both come from wts-keys, the one place they are written, so
+# the footer and `wts keys` cannot drift apart.
+#
+# fzf grew --footer in 0.65, and an unknown action makes fzf exit at once —
+# in a popup, a frame that closes without a word. So everything here is gated
+# on WTS_SWITCH_FOOTER, exported only when the installed fzf has the footer:
+# the verbs below run in their own process, where the version is not known.
+#
+# Expanded or collapsed is on-disk state, like the scroll offset and the reply
+# target: fzf has no variable of its own to hold it, and the poller's
+# `reload-sync` every 2 s must not reset it.
+
+footer_active() { [[ "${WTS_SWITCH_FOOTER:-}" == 1 ]] }
+
+help_expanded() { [[ -n "${WTS_SWITCH_HELP:-}" && -f "$WTS_SWITCH_HELP" ]] }
+
+footer_text() {
+  local mode=collapsed
+  if reply_active; then
+    mode=reply
+  elif help_expanded; then
+    mode=expanded
+  fi
+  "$WTS_BIN/wts-keys" --footer "$mode" 2>/dev/null
+}
+
+# The action that repaints the footer, or nothing at all on an fzf without one.
+# `|` as the delimiter, as for change-prompt: a `)` in the text would close the
+# action early, and the text never contains a `|`.
+footer_action() {
+  footer_active || return 0
+  print -rn -- "change-footer|$(footer_text)|"
+}
+
+# `?` toggles the full list. While the list is being filtered the query wins:
+# `?` is a printable character, and the AGENT column has `stuck?` in it.
+keys() { # $1 = verb, $2 = query
+  [[ "$1" == "toggle" ]] || return 0
+  if [[ -n "${2:-}" ]]; then
+    print -r -- "put(?)"
+    return
+  fi
+  if help_expanded; then rm -f "$WTS_SWITCH_HELP"; else : > "$WTS_SWITCH_HELP"; fi
+  footer_action
+}
+
 # ─── Reply mode ──────────────────────────────────────────────────────────────
 # The preview is a capture, not a terminal: there is no cursor to put in it. So
 # answering an agent from the popup works the other way round: `tab` turns the
@@ -269,17 +322,36 @@ send_reply() { # $1 = target, $2 = text
 # Placeholders in the output would be expanded by fzf, so none appear here.
 reply() { # $1 = verb, then verb arguments
   local verb="$1"; shift
+  # Chains are joined from an array and the footer action is added with
+  # `${footer:+...}`: an fzf without a footer is handed no `change-footer`
+  # rather than an action it would exit on.
+  local footer=""
+  local -a chain
   case "$verb" in
     toggle) # <target> <name>
       if reply_active; then reply leave; return; fi
       [[ -n "${2:-}" ]] || return
       print -rl -- "$2" "${1:-$2}" > "$WTS_SWITCH_REPLY"
+      # Read after the state file is written: the footer is the reply line.
+      footer=$(footer_action)
+      # `?` goes with ctrl-d and ctrl-x: unbound, it is typed into the reply
+      # instead of opening the key list, which is what a reply needs it for.
+      local switched="ctrl-d,ctrl-x"
+      footer_active && switched="$switched,?"
       # `|` as the argument delimiter: `)` is legal in a tmux session name.
-      print -r -- "disable-search+clear-query+unbind(ctrl-d,ctrl-x)+refresh-preview+change-prompt|reply to ${2//|/}> |"
+      chain=(disable-search clear-query "unbind($switched)" refresh-preview
+             ${footer:+"$footer"} "change-prompt|reply to ${2//|/}> |")
+      print -rn -- "${(j:+:)chain}"
       ;;
     leave)
       rm -f "$WTS_SWITCH_REPLY"
-      print -r -- "enable-search+clear-query+rebind(ctrl-d,ctrl-x)+change-prompt(session> )+refresh-preview"
+      local switched="ctrl-d,ctrl-x"
+      footer_active && switched="$switched,?"
+      # After the reply file is gone, so the footer is the list's again.
+      footer=$(footer_action)
+      chain=(enable-search clear-query "rebind($switched)" "change-prompt(session> )"
+             refresh-preview ${footer:+"$footer"})
+      print -rn -- "${(j:+:)chain}"
       ;;
     esc)
       if reply_active; then reply leave; else print -r -- "abort"; fi
@@ -452,6 +524,12 @@ if [[ "${1:-}" == "--reply" ]]; then
   exit 0
 fi
 
+# The `?` toggle, called by fzf through `transform`; see "Footer" above.
+if [[ "${1:-}" == "--keys" ]]; then
+  keys "${2:-}" "${3:-}"
+  exit 0
+fi
+
 if [[ "${1:-}" == "--fit" ]]; then
   fit_preview "${2:-}" "${3:-}"
   exit 0
@@ -572,6 +650,23 @@ export WTS_SWITCH_SCROLL="${TMPDIR:-/tmp}/wts-switch.$$.scroll"
 export WTS_SWITCH_REPLY="${TMPDIR:-/tmp}/wts-switch.$$.reply"
 rm -f "$WTS_SWITCH_REPLY"
 
+# The footer needs --footer (fzf 0.65) and `transform` (0.45, so `?` can leave
+# the query alone while the list is filtered). Older versions keep the popup
+# exactly as it was, and `wts keys` still prints the same list in a terminal.
+# WTS_SWITCH_FOOTER is what the bind subprocesses read, WTS_SWITCH_HELP is
+# where expanded-or-not is kept; both are exported for them.
+typeset -a footer_opts
+footer_opts=()
+if [[ -x "$WTS_BIN/wts-keys" && -n "$fzf_version" ]] && is-at-least 0.65 "$fzf_version"; then
+  export WTS_SWITCH_FOOTER=1
+  export WTS_SWITCH_HELP="${TMPDIR:-/tmp}/wts-switch.$$.help"
+  rm -f "$WTS_SWITCH_HELP"
+  footer_opts=(
+    --footer="$(footer_text)"
+    --bind="?:transform('$self' --keys toggle {q})"
+  )
+fi
+
 # ctrl-d and ctrl-x: without a resolvable wts, the binds would fail silently in
 # the popup. fzf quotes {1} and {3} itself; {1} is the display line, from which
 # --kill reads the agent state shown to the user.
@@ -613,7 +708,7 @@ fi
 cleanup() {
   [[ -n "$poll_pid" ]] && kill "$poll_pid" 2>/dev/null
   [[ -n "$sock" ]] && rm -f "$sock"
-  rm -f "$WTS_SWITCH_SCROLL" "$WTS_SWITCH_REPLY"
+  rm -f "$WTS_SWITCH_SCROLL" "$WTS_SWITCH_REPLY" ${WTS_SWITCH_HELP:+"$WTS_SWITCH_HELP"}
 }
 trap cleanup EXIT INT TERM
 
@@ -645,6 +740,7 @@ selection=$(print -r -- "$list" | fzf \
   "${fast_opts[@]}" \
   "${fit_opts[@]}" \
   "${reply_opts[@]}" \
+  "${footer_opts[@]}" \
   --reverse \
   --delimiter=$'\t' \
   --with-nth=1 \

@@ -12,6 +12,7 @@
 #        wts rm <name> [-f]
 #        wts gc [--apply] [--no-fetch]
 #        wts layouts
+#        wts keys
 #        wts setup tmux
 #        wts help | wts version
 #
@@ -35,6 +36,7 @@
 #                merged (squash included) or whose remote branch is gone,
 #                plus any stale index.lock blocking writes in a worktree
 #   layouts    : list available layouts (yours shadow the built-in ones)
+#   keys       : switcher keys and tmux bindings (the popup shows them too)
 #   setup tmux : print the tmux.conf snippet (switcher popup, `wts` command)
 #
 # Examples:
@@ -319,6 +321,18 @@ if [[ "$1" == "layouts" ]]; then
   fi
   print -r -- "$list"
   exit 0
+fi
+
+# ─── Subcommand: keys ────────────────────────────────────────────────────────
+# The same list the switcher prints under its own list, from the same helper:
+# `wts keys` is for the times the popup is not open — or not open yet.
+
+if [[ "$1" == "keys" ]]; then
+  if [[ ! -x "$WTS_LIBEXEC/wts-keys" ]]; then
+    print -u2 -r -- "wts: key list not found ($WTS_LIBEXEC/wts-keys)"
+    exit 1
+  fi
+  exec "$WTS_LIBEXEC/wts-keys"
 fi
 
 # ─── Subcommand: setup ───────────────────────────────────────────────────────

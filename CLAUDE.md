@@ -12,6 +12,7 @@ libexec/wts/wts-switch     fzf popup (prefix+s) and --next (prefix+a)
 libexec/wts/wts-gc         squash-aware cleanup, dry run by default
 libexec/wts/wts-fresh      tmux `command-alias` entry: fetch origin/<default>, then wts
 libexec/wts/wts-name       slug from a phrase (Claude Haiku, local fallback)
+libexec/wts/wts-keys       the key table: switcher footer and `wts keys`
 libexec/wts/wts-brief      done/next per session (Claude Haiku, cached)
 share/wts/layouts/         built-in layouts (default.yml)
 examples/layouts/          richer layouts, not installed as built-ins

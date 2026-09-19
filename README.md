@@ -103,6 +103,7 @@ wts stop <name>
 wts rm <name> [-f]
 wts gc [--apply] [--no-fetch]
 wts layouts
+wts keys
 wts setup tmux
 wts help | wts version
 ```
@@ -224,13 +225,24 @@ is never called by `wts ls` or the switcher.
 ## Session switcher
 
 `prefix+s` opens an fzf popup: sessions sorted by urgency, with agent state,
-branch, git delta and a live preview of the agent's pane. `enter` switches, `ctrl-x`
+branch, git delta and a live preview of the agent's pane. **The keys are written
+under the list**, so there is nothing to remember: one line by default, and `?`
+unfolds the whole table — the tmux bindings included, since those are the ones
+you cannot press from inside the popup. `enter` switches, `ctrl-x`
 kills the selected tmux session (`wts stop`, after a y/N prompt: the worktree, the
 branch and the registry entry stay, the popup stays open and the row reads
 `stopped`), `ctrl-d` removes it entirely (`wts rm`), `ctrl-f` / `ctrl-b` scroll the
 preview by half a page, `ctrl-r` reloads. The current session is never killed from
 the popup, which it would close. tmux sessions unknown to wts are listed after, and
 `ctrl-x` works on them too.
+
+The footer is sized to the list: a narrow popup keeps the keys you press most
+and drops the rest, `?` still shows them all. While you are filtering the list,
+`?` is typed into the query instead (the AGENT column has `stuck?` in it), and in
+reply mode the footer shows what `enter` and `esc` do there. `wts keys` prints
+the same table in a terminal, from the same source, for when the popup is not
+open. The footer needs fzf 0.65 or later; older versions keep the plain switcher
+and `wts keys`.
 
 The list is a table **sized to the popup**: the session and branch columns take
 the width of their longest value, capped so that every column stays visible, and

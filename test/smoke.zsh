@@ -236,6 +236,70 @@ check "tab toggles back out too" \
   eval '"$SWITCH" --reply toggle auth-form auth-form >/dev/null && "$SWITCH" --reply toggle auth-form auth-form | grep -q "^enable-search" && [[ ! -e "$WTS_SWITCH_REPLY" ]]'
 unset WTS_SWITCH_REPLY
 
+# ─── Keys: the footer and `wts keys` ─────────────────────────────────────────
+# Both read wts-keys, so the popup and the terminal can never disagree. The
+# footer is as wide as the LIST, not the popup, and fzf cuts what overflows:
+# every rendering is checked against the width it was given.
+KEYS="$ROOT/libexec/wts/wts-keys"
+# The switcher always exports the list's width before fzf starts, so the bind
+# subprocesses inherit it; without it wts-keys would size on COLUMNS.
+export WTS_SWITCH_COLS=89
+# Captured rather than piped into `grep -q`: grep exits on the match, wts-keys
+# is still printing, and the SIGPIPE that follows fails the pipeline (pipefail).
+check "wts keys lists a switcher key" \
+  eval 'out=$("$WTS" keys); [[ "$out" == *"^x"*"keep the worktree"* ]]'
+check "wts keys lists the tmux bindings" \
+  eval '[[ "$("$WTS" keys)" == *"jump to the next agent"* ]]'
+check "the collapsed line always keeps its way back to the list" \
+  eval '[[ "$(WTS_SWITCH_COLS=24 "$KEYS" --footer collapsed)" == *"? keys" ]]'
+check "a wide list gets the rarest keys too" \
+  eval '[[ "$(WTS_SWITCH_COLS=100 "$KEYS" --footer collapsed)" == *"^r reload"* ]]'
+check "no footer line is wider than the list" \
+  eval 'for w in 24 40 60 89 200; do
+          for mode in collapsed expanded reply; do
+            while IFS= read -r line; do
+              (( ${#line} <= w - 2 )) || exit 1
+            done < <(WTS_SWITCH_COLS=$w "$KEYS" --footer $mode)
+          done
+        done'
+check "the expanded list ends with the tmux bindings" \
+  eval '[[ "$(WTS_SWITCH_COLS=89 "$KEYS" --footer expanded | tail -1)" == "tmux: "* ]]'
+check "the reply footer drops the keys reply mode disables" \
+  eval 'line=$(WTS_SWITCH_COLS=89 "$KEYS" --footer reply)
+        [[ "$line" == "enter send"* && "$line" != *"^d rm"* ]]'
+
+# --footer is fzf 0.65 and an unknown action closes the popup without a word,
+# so the actions are checked against the installed fzf, and nothing that
+# mentions the footer may be emitted when WTS_SWITCH_FOOTER is not set.
+check "fzf accepts the footer and its bind" \
+  eval 'printf "x\n" | fzf --footer=k --bind="?:transform(true)" --filter=x'
+export WTS_SWITCH_HELP="$SANDBOX/help"
+export WTS_SWITCH_REPLY="$SANDBOX/reply"
+export WTS_SWITCH_FOOTER=1
+check "? is typed into a filter rather than swallowed by the help" \
+  eval '[[ "$("$SWITCH" --keys toggle auth)" == "put(?)" && ! -e "$WTS_SWITCH_HELP" ]]'
+chain=$("$SWITCH" --keys toggle "")
+check "? expands the footer" \
+  eval '[[ -e "$WTS_SWITCH_HELP" ]] && print -r -- "$chain" | grep -q "^change-footer|"'
+check "fzf parses the expanded footer chain" fzf_parses "$chain"
+check "? collapses it again" \
+  eval '"$SWITCH" --keys toggle "" >/dev/null && [[ ! -e "$WTS_SWITCH_HELP" ]]'
+chain=$("$SWITCH" --reply toggle auth-form auth-form)
+check "reply mode unbinds ? and repaints the footer" \
+  eval 'print -r -- "$chain" | grep -qF "unbind(ctrl-d,ctrl-x,?)" &&
+        print -r -- "$chain" | grep -qF "change-footer|enter send"'
+check "fzf parses the reply chain with its footer" fzf_parses "$chain"
+chain=$("$SWITCH" --reply esc)
+check "leaving reply mode rebinds ? and puts the list's keys back" \
+  eval 'print -r -- "$chain" | grep -qF "rebind(ctrl-d,ctrl-x,?)" &&
+        print -r -- "$chain" | grep -qF "change-footer|enter switch"'
+check "fzf parses the leave chain with its footer" fzf_parses "$chain"
+unset WTS_SWITCH_FOOTER
+refute "an fzf without --footer is never handed a change-footer" \
+  eval '"$SWITCH" --reply toggle auth-form auth-form | grep -q change-footer'
+"$SWITCH" --reply esc >/dev/null
+unset WTS_SWITCH_REPLY WTS_SWITCH_HELP WTS_SWITCH_COLS
+
 # ─── No collector may take a worktree's index.lock ───────────────────────────
 # `git status` creates <gitdir>/index.lock before it scans and only releases it
 # after writing the refreshed index back. The collector statuses every registered
