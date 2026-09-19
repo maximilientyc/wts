@@ -13,7 +13,7 @@
 #        wts gc [--apply] [--no-fetch]
 #        wts layouts
 #        wts keys
-#        wts setup tmux
+#        wts setup tmux | git
 #        wts help | wts version
 #
 #   <name>     : name of the worktree AND of the tmux session
@@ -38,6 +38,7 @@
 #   layouts    : list available layouts (yours shadow the built-in ones)
 #   keys       : switcher keys and tmux bindings (the popup shows them too)
 #   setup tmux : print the tmux.conf snippet (switcher popup, `wts` command)
+#   setup git  : print the two git settings that keep `wts ls` fast on a large repository
 #
 # Examples:
 #   wts auth-form
@@ -338,8 +339,27 @@ fi
 # ─── Subcommand: setup ───────────────────────────────────────────────────────
 
 if [[ "$1" == "setup" ]]; then
+  # `wts setup git`: the two repository settings that keep `git status` fast
+  # on a large tree. The collector runs it on every registered worktree at
+  # every `wts ls` and switcher tick: 0.5 s per 150k-file worktree without
+  # them, 0.04 s with (docs/big-repo-analysis.md). Printed, not applied: they
+  # are repository-wide, and fsmonitor starts a daemon per worktree.
+  if [[ "${2:-}" == "git" ]]; then
+    cat <<'EOF'
+# ─── wts setup git ───────────────────────────────────────────────────────────
+# Run these in the repository (they apply to all its worktrees). fsmonitor is
+# git's built-in file watcher (git 2.37+ on macOS): `git status` then asks the
+# daemon what changed instead of walking the tree, and the untracked cache
+# makes the untracked-file scan incremental. `wts ls` and the switcher go from
+# seconds to a fraction of a second on a large repository.
+git config core.fsmonitor true
+git config core.untrackedCache true
+# To undo: git config --unset core.fsmonitor; git fsmonitor--daemon stop
+EOF
+    exit 0
+  fi
   if [[ "${2:-}" != "tmux" ]]; then
-    print -u2 "usage: wts setup tmux   (then: wts setup tmux >> ~/.tmux.conf)"
+    print -u2 "usage: wts setup tmux | git   (then: wts setup tmux >> ~/.tmux.conf)"
     exit 2
   fi
 
@@ -604,6 +624,8 @@ if [[ "$1" == "rm" ]]; then
   if [[ -d "$worktree_path" ]]; then
     BRANCH=$(git -C "$worktree_path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 
+    # Deleting a 150k-file worktree takes git ten seconds, silently.
+    echo "→ removing worktree $worktree_path…"
     if [[ "$FORCE" == true ]]; then
       git -C "$repo_root" worktree remove --force "$worktree_path"
     else
@@ -876,7 +898,13 @@ if [[ ! -d "$worktree_path" ]]; then
   if git -C "$repo_root" show-ref --verify --quiet "refs/heads/$BRANCH"; then
     # Existing local branch → checkout
     git -C "$repo_root" worktree add "$worktree_path" "$BRANCH"
-  elif git -C "$repo_root" ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+  elif { echo "  → checking origin for $BRANCH…";
+         # A round trip on every new branch, once with nothing on screen and
+         # no timeout: on a slow link this hung. Same 5-second cap as the
+         # uniqueness sweep above; a timeout means "not found", i.e. a new
+         # branch, which is what a failed check meant already.
+         perl -e 'alarm shift; exec @ARGV' 5 \
+           git -C "$repo_root" ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; }; then
     # Existing branch on origin (review) → fetch + tracking checkout
     echo "  → branch found on origin, checking out with tracking"
     git -C "$repo_root" fetch --quiet origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}"

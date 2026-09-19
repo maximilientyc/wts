@@ -641,7 +641,7 @@ if want 6; then
 # of PATH from inside the pane: tmux rebuilds PATH for a new pane, so
 # `-e PATH=…` does not survive.
 popup_timeline() {
-  local refresh="$1" t0 t_skel="" t_full="" screen i ticks gits jqs
+  local refresh="$1" t0 t_skel="" t_full="" t_git="" screen i ticks gits jqs
   cat > "$SANDBOX/switch-shimmed" <<EOF
 #!/bin/sh
 export PATH="$SANDBOX/shim:\$PATH" WTS_BENCH_PROCLOG="$WTS_BENCH_PROCLOG" WTS_SWITCH_REFRESH="$refresh"
@@ -654,14 +654,17 @@ EOF
   for i in {1..600}; do
     screen=$(tmux -S "$SOCK" capture-pane -p -t "=bench-ui:" 2>/dev/null)
     if [[ -z "$t_skel" ]] && print -r -- "$screen" | grep -q "bench-1 "; then t_skel=$(printf "%.2f" $(( EPOCHREALTIME - t0 ))); fi
-    if print -r -- "$screen" | grep -qE 'blocked|working|idle'; then t_full=$(printf "%.2f" $(( EPOCHREALTIME - t0 ))); break; fi
+    if [[ -z "$t_full" ]] && print -r -- "$screen" | grep -qE 'blocked|working|idle'; then t_full=$(printf "%.2f" $(( EPOCHREALTIME - t0 ))); fi
+    # The git columns: a delta like +12/-3 means a full pass landed.
+    if print -r -- "$screen" | grep -qE '\+[0-9]+/-[0-9]+'; then t_git=$(printf "%.2f" $(( EPOCHREALTIME - t0 ))); break; fi
     sleep 0.1
   done
   ticks=$(grep -c "^claude agents" "$WTS_BENCH_PROCLOG"); gits=$(grep -c '^git ' "$WTS_BENCH_PROCLOG"); jqs=$(grep -c '^jq ' "$WTS_BENCH_PROCLOG")
   say "WTS_SWITCH_REFRESH=$refresh:"
   say "- first list on screen (skeleton): ${t_skel:-n/a} s"
   if [[ -n "$t_full" ]]; then
-    say "- agent column filled (first complete collector pass): $t_full s"
+    say "- agent column filled (first pass with agent states): $t_full s"
+    say "- git columns filled (first complete collector pass): ${t_git:-not within 60 s} s"
   else
     say "- agent column never filled in 60 s: $ticks collector passes started, none finished (each new tick replaces the one in flight). Screen after 60 s:"
     say '```'; print -r -- "$screen" | head -8 | tee -a "$RESULTS"; say '```'
@@ -675,10 +678,9 @@ EOF
 
 if [[ -z "$QUICK" ]]; then
 section "6. The switcher, as seen by the user"
-note "\`prefix+s\` with the default 2-second refresh, then with a refresh longer than a tick. The popup polls \`reload-sync\` every WTS_SWITCH_REFRESH seconds (\`wts-switch:726-736\`), and fzf drops the reload in flight when the next one arrives."
+note "\`prefix+s\` with the default 2-second refresh: the skeleton, then the agent states, then the git columns once a full collector pass has landed. (WTS_BENCH_REFRESH=<s> tries another interval.)"
 say ""
-popup_timeline 2
-popup_timeline 60
+popup_timeline "${WTS_BENCH_REFRESH:-2}"
 fi
 
 fi

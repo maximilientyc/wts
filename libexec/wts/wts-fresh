@@ -201,7 +201,10 @@ fi
 # ─── Fetch: this is the guarantee, it must succeed ───────────────────────────
 
 print -r -- "→ fetch origin/$base"
-if ! git fetch --quiet origin "+refs/heads/${base}:refs/remotes/origin/${base}"; then
+# Not --quiet: this window shows nothing else while the fetch runs, and on a
+# large repository over a slow link that is the longest wait of the whole
+# command. git's own progress meter is the feedback.
+if ! git fetch origin "+refs/heads/${base}:refs/remotes/origin/${base}"; then
   die "could not fetch origin/$base — nothing was created" \
       "this command exists to guarantee a fresh base; offline," \
       "run 'wts $*' from a shell to accept the local base"

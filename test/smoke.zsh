@@ -315,6 +315,7 @@ unset WTS_SWITCH_REPLY WTS_SWITCH_HELP WTS_SWITCH_COLS
 export WTS_SMOKE_LOCKY="$SANDBOX/locky.log"
 export WTS_SMOKE_REAL_GIT=$(command -v git)
 mkdir -p "$SANDBOX/shim"
+export WTS_SMOKE_BRANCHLOG="$SANDBOX/branch.log"
 cat > "$SANDBOX/shim/git" <<'EOF'
 #!/bin/sh
 # --no-optional-locks and GIT_OPTIONAL_LOCKS come before the subcommand, so
@@ -322,6 +323,7 @@ cat > "$SANDBOX/shim/git" <<'EOF'
 for a in "$@"; do
   case "$a" in
     --no-optional-locks) nolocks=1 ;;
+    branch)              echo "$*" >> "$WTS_SMOKE_BRANCHLOG" ;;
     status|diff)         sub="$a"; break ;;
   esac
 done
@@ -345,6 +347,27 @@ if [[ -s "$WTS_SMOKE_LOCKY" ]]; then
 else
   ok "no collector git call may take index.lock"
 fi
+
+# The per-repository memo of `branch --merged` used to be lost in a subshell,
+# so the call ran once per session: with two sessions in one repository, one
+# pass must run it exactly once.
+: > "$WTS_SMOKE_BRANCHLOG"
+PATH="$SANDBOX/shim:$PATH" "$WTS" status --json >/dev/null 2>&1 || true
+check "one pass runs branch --merged once per repository" \
+  eval '[[ "$(grep -c -- "--merged" "$WTS_SMOKE_BRANCHLOG")" == 1 ]]'
+
+# --no-git: agent and tmux columns only, git columns "-", same field count.
+check "status --fzf --no-git keeps 7 fields" \
+  eval '"$ROOT/libexec/wts/wts-status" --fzf --no-git | awk -F "\037" "NF != 7 { exit 1 }"'
+check "status --fzf --no-git shows - for delta and dirty" \
+  eval '"$ROOT/libexec/wts/wts-status" --fzf --no-git | awk -F "\037" "\$4 != \"-\" || \$5 != \"-\" { exit 1 }"'
+check "status --json --no-git lists every session with zeroed git columns" \
+  eval '"$ROOT/libexec/wts/wts-status" --json --no-git | jq -e "length == 2 and all(.[]; .dirty == 0 and .added == 0 and .exists)"'
+check "status --json <name> collects that session only" \
+  eval '"$ROOT/libexec/wts/wts-status" --json auth-form | jq -e "length == 1 and .[0].name == \"auth-form\""'
+check "switch --list --no-git renders" eval '"$SWITCH" --list --no-git | grep -q "auth-form"'
+check "setup git prints the fsmonitor settings" \
+  eval '"$WTS" setup git | grep -q "core.fsmonitor true"'
 
 # ─── Stop and restore ────────────────────────────────────────────────────────
 # `wts stop` leaves exactly the state `wts restore` replays: tmux session gone,

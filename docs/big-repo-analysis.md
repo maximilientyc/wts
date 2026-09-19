@@ -4,9 +4,10 @@ Analysis of wts 0.2.1 on repositories far bigger than the ones it was written
 against: hundreds of thousands of files, thousands of refs, a base branch that
 moves by thousands of commits, many worktrees, a fat `node_modules`, big Claude
 transcripts. Measured with `test/bench-big.zsh` (this branch), which generates
-such a repository and times every command in a sandbox. No wts code was changed
-for this document; every recommendation comes with the A/B measurement that
-justifies it.
+such a repository and times every command in a sandbox. The measurements and
+the analysis are of 0.2.1 as released; every recommendation comes with the A/B
+measurement that justifies it, and the last section shows the same bench after
+the fixes this branch applies.
 
 ## Executive summary
 
@@ -464,6 +465,37 @@ brings back the `index.lock` collisions of 0.1.3).
   `WTS_SPARSE=<cone dirs>` that does `worktree add --no-checkout`,
   `sparse-checkout set`, `checkout` would make creation proportional to the
   cone. Effort: medium; only worth it if the user's monorepo is one.
+
+## After the fixes
+
+The recommendations 1, 2, 4, 5, 6, 7 and 8 above, plus `wts setup git` and
+the `lsof` flags, are applied on this branch. Same bench, same large tier,
+before and after:
+
+| large tier, 8 sessions | before | after |
+|---|---:|---:|
+| `wts ls` (median) | 12.9 s | 10.0 s |
+| one collector tick | 12.2 s | 9.4 s |
+| processes per `wts ls` | 141 (56 git, 80 jq) | 80 (35 git, 40 jq) |
+| `prefix+a` | 12.2 s | 0.25 s |
+| `prefix+s`: agent states on screen | never | 1.0 s |
+| `prefix+s`: git columns on screen | never | 12.4 s (one pass after the 2 s tick) |
+| `wts brief <one session>` | 13.2 s | 1.7 s |
+| `wts brief` (8 sessions) | 22.7 s | 18.5 s |
+| `wts gc --no-fetch`, 3000 branches | 921 s | 337 s |
+| `wts gc --no-fetch`, medium tier, 1000 branches, same sandbox, old vs new | 85 s | 19 s (11 s with a commit-graph); identical verdicts |
+| `wts rm`, `wts <name>` | 9–12 s, 11 s | unchanged: git's own removal and checkout, now announced |
+
+What remains in the tick is `git status` walking eight 150k-file trees that
+no longer fit the vnode cache (7.8 s of the 9.4 s): that is the repository
+setting `wts setup git` prints, not a wts change. With it, the same tick
+measured 2.6 s before the fixes and would be under 2 s after them.
+
+What remains in `gc` is one `rev-list` per branch (which commits are its own)
+and, for the branches merged by ancestry, the `rev-list --count` and `reflog`
+of the new-branch test: 1559 git processes for 1000 branches, 0.02 s each on
+this history without a commit-graph, half that with one (`git commit-graph
+write --reachable`, which git's own gc maintains on a real clone).
 
 ## Not measured here
 

@@ -104,7 +104,7 @@ wts rm <name> [-f]
 wts gc [--apply] [--no-fetch]
 wts layouts
 wts keys
-wts setup tmux
+wts setup tmux | git
 wts help | wts version
 ```
 
@@ -262,19 +262,22 @@ wts does not know the agent's pane yet and the reply goes to the session's activ
 pane. Needs fzf 0.45 or later; older versions keep the plain switcher.
 
 The popup is **drawn at once**, on a list built from the registry and tmux alone —
-no git, no agent call. fzf swaps in the collected list when it is ready (`load`,
-then `reload-sync`), so the wait happens with the sessions already on screen
-instead of in front of an empty frame. Until the swap, the agent and delta columns
-show `-`: an agent state one refresh old is worse than no state at all.
+no git, no agent call. fzf then swaps in the agent states (`load`, then
+`reload-sync` of a pass that asks Claude and tmux but not git: tens of
+milliseconds), and the first refresh brings the git columns. Until then the
+columns show `-`: an agent state one refresh old is worse than no state at all.
 
 The list and the preview **refresh every 2 s** (`WTS_SWITCH_REFRESH`, `0` for a
 static list). fzf has no timer event, so the refresh goes through `--listen`: a
 background poller pushes `reload-sync(...)+refresh-preview` to fzf's unix socket.
 `reload-sync` avoids a blinking empty list and keeps the cursor and query. The
-poller dies with the popup. Without `curl`, or when the socket path exceeds the
-104 bytes of `sun_path`, the switcher silently falls back to a static list. The
-cursor is kept by index: if a session changes urgency, the highlighted line can
-change session under you.
+poller never replaces a pass still running, and waits at least as long as the
+last pass took before starting the next one: on a large repository where a pass
+takes seconds, the list fills after one pass and the preview keeps refreshing in
+between. The poller dies with the popup. Without `curl`, or when the socket path
+exceeds the 104 bytes of `sun_path`, the switcher silently falls back to a static
+list. The cursor is kept by index: if a session changes urgency, the highlighted
+line can change session under you.
 
 The **scroll offset lives outside fzf**, in a small file the preview command reads:
 every `refresh-preview` resets fzf's own preview offset, so native scrolling would
@@ -379,9 +382,11 @@ base that may lag behind. Six categories, limited to the current repository:
 **Why not `git branch --merged`.** It only recognizes merges by ancestry. A pull
 request merged by **squash** or **rebase** rewrites the SHAs, so the branch is never
 an ancestor of the base and piles up forever. `wts gc` also compares **patch-ids**
-(`git cherry`): a branch with no commit marked `+` is entirely present in the base,
-whatever the merge method, and is deleted with `git branch -D`. A deleted remote
-branch is read from `%(upstream:track)` == `[gone]`, which only `--prune` reveals.
+(the test behind `git cherry`, with the base hashed once for all branches rather
+than once per branch): a branch whose every commit has an equivalent in the base is
+entirely present in it, whatever the merge method, and is deleted with
+`git branch -D`. A deleted remote branch is read from `%(upstream:track)` ==
+`[gone]`, which only `--prune` reveals.
 
 **Safety rules:**
 
@@ -556,6 +561,24 @@ export WTS_SUBDIR=apps/api
 
 Or once: `WTS_SUBDIR=apps/api wts my-feature`. If the directory does not exist in
 the worktree, `wts` warns and starts at the root.
+
+### Large repositories
+
+Every `wts ls`, `prefix+a` and switcher refresh runs `git status` on each
+registered worktree. On a 150k-file repository that is half a second per
+worktree, and with several worktrees the tree walks no longer fit the OS file
+cache. Two git settings make it a few hundredths of a second: fsmonitor (git's
+built-in file watcher, git 2.37+ on macOS) and the untracked cache. `wts setup git`
+prints them; they apply to the repository and all its worktrees:
+
+```sh
+git config core.fsmonitor true
+git config core.untrackedCache true
+```
+
+`wts ls` says so once on stderr when a pass takes more than three seconds and
+the repository has not enabled them. Measurements and the reasoning are in
+`docs/big-repo-analysis.md`.
 
 ## Idempotence
 

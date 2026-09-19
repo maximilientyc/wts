@@ -76,14 +76,6 @@ ask_claude() {
   ) 2>/dev/null
 }
 
-# transcript_last <file> <type> <field> — last value of a record (ai-title,
-# pr-link, last-prompt). grep over the whole file: these lines can be far from
-# the end of a long conversation.
-transcript_last() {
-  grep -F "\"type\":\"$2\"" "$1" 2>/dev/null | tail -n 1 \
-    | jq -r --arg f "$3" '.[$f] // empty' 2>/dev/null
-}
-
 # oneline <text> — on one line, whitespace squeezed.
 oneline() {
   print -r -- "$1" | tr -s '\n\t\r ' ' ' | sed -E 's/^ //; s/ $//'
@@ -134,9 +126,14 @@ collect() {
 
   local title="" pr="" last_prompt="" texts=""
   if [[ -n "$tr" ]]; then
-    title=$(transcript_last "$tr" ai-title aiTitle)
-    pr=$(transcript_last "$tr" pr-link prUrl)
-    last_prompt=$(transcript_last "$tr" last-prompt lastPrompt)
+    # One read of the transcript for the three records, not three: a 10 MB
+    # transcript is 0.1 s per pass, and this ran before the cache was even
+    # consulted.
+    local recs
+    recs=$(grep -F -e '"type":"ai-title"' -e '"type":"pr-link"' -e '"type":"last-prompt"' "$tr" 2>/dev/null)
+    title=$(print -r -- "$recs" | grep -F '"type":"ai-title"' | tail -n 1 | jq -r '.aiTitle // empty' 2>/dev/null)
+    pr=$(print -r -- "$recs" | grep -F '"type":"pr-link"' | tail -n 1 | jq -r '.prUrl // empty' 2>/dev/null)
+    last_prompt=$(print -r -- "$recs" | grep -F '"type":"last-prompt"' | tail -n 1 | jq -r '.lastPrompt // empty' 2>/dev/null)
     texts=$(tail -n 300 "$tr" | jq -Rrn '
       [inputs | fromjson? | select(.type == "assistant" and (.isSidechain | not))
        | .message.content[]? | select(.type == "text") | .text]
@@ -166,7 +163,8 @@ collect() {
   fi
   (( ${#nots} )) && log=$(git -C "$worktree" log --oneline -n 15 HEAD --not "${nots[@]}" 2>/dev/null)
   porcelain=$(git -C "$worktree" status --porcelain 2>/dev/null)
-  shortstat=$(git -C "$worktree" diff HEAD --shortstat 2>/dev/null)
+  # No `diff HEAD --shortstat`: 0.2 s per session on a large tree for a count
+  # of uncommitted lines the summary never needed; the file count suffices.
 
   # --- header ---------------------------------------------------------------
   local pr_label="" delta="+$added/-$removed"
@@ -238,7 +236,10 @@ summarize() {
 
 # ─── Target sessions ─────────────────────────────────────────────────────────
 
-status_json=$("$WTS_BIN/wts-status" --json 2>/dev/null)
+# The names are passed down: the collector then statuses only those worktrees
+# instead of every registered one (13 s for `wts brief <one>` on the large
+# repository of docs/big-repo-analysis.md, for one session's facts).
+status_json=$("$WTS_BIN/wts-status" --json "$@" 2>/dev/null)
 print -r -- "$status_json" | jq -e 'type == "array"' >/dev/null 2>&1 || status_json='[]'
 
 typeset -a sessions

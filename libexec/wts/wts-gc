@@ -24,8 +24,9 @@
 # Why `git branch --merged` is not enough: it only recognizes merges by
 # ancestry. PRs merged by squash or rebase rewrite SHAs, so the branch is never
 # an ancestor of the base and `--merged` does not see it. So we also compare by
-# patch-id (`git cherry`): a branch with no commit marked `+` is entirely
-# present in the base, whatever the merge mode.
+# patch-id, the test behind `git cherry`, hashed once for all branches: a
+# branch whose every commit has an equivalent in the base is entirely present
+# in it, whatever the merge mode.
 #
 # Caution:
 #   - only <repo>-worktrees/ is scanned for husks, and a folder that has a
@@ -89,6 +90,8 @@ $APPLY && print "Mode: DELETE" || print "Mode: dry run (--apply to execute)"
 # Without --prune, a branch deleted on origin keeps its local tracking ref and
 # goes unnoticed. The prune is what makes `[gone]` appear.
 if $FETCH && [[ -n "$(git -C "$repo_root" remote 2>/dev/null)" ]]; then
+  # The longest silence of the command on a real remote: say it is happening.
+  [[ -t 2 ]] && print -u2 "→ fetch --all --prune…"
   if git -C "$repo_root" fetch --all --prune --quiet 2>/dev/null; then
     print "Remote: fetch --prune ok"
   else
@@ -159,15 +162,73 @@ if [[ -n "$base" ]]; then
   done
 fi
 
-# True if every commit of <branch> has an equivalent (patch-id) in the base.
-# `git cherry` marks `+` what is missing and `-` what is already there: no `+`
-# line => content entirely present, squash and rebase included.
+# Patch-ids, computed once for every branch.
+#
+# This used to be `git cherry <base> <branch>` per branch, which computes a
+# patch-id for every base commit since the merge-base again for each branch:
+# 0.3 s per branch, 15 minutes for 3000 local branches on the repository
+# measured in docs/big-repo-analysis.md. Two passes now hash everything once:
+# the base's recent commits, and the own commits of every branch that is not an
+# ancestor of the base (one `git log -p` fed by --stdin). Each branch then
+# costs one `rev-list` and a few lookups.
+#
+# The base range: commits since the oldest tip among those branches, minus a
+# day of slack. A squash or a rebase lands on the base after the commits it
+# replaces were made (that is when the merge happened), so nothing older can be
+# their equivalent. Each base entry keeps its commit date, so a branch's commits
+# are only matched by base commits at least as new as the branch's tip: a change
+# re-applied years after a base commit with the same diff stays unmerged, as
+# `git cherry` bounded by the merge-base would have said.
+typeset -A base_pid_date tip_date own_pid
+patch_ids_loaded=false
+load_patch_ids() {
+  local b d oldest="" pid cid
+  local -a candidates
+  $patch_ids_loaded && return
+  patch_ids_loaded=true
+  [[ -n "$base_ref" ]] || return
+  while IFS=$'\x1f' read -r b d; do
+    [[ -n "$b" ]] || continue
+    tip_date[$b]="$d"
+    [[ "$b" != "$base" && -z "${ancestry_merged[$b]:-}" ]] || continue
+    candidates+=("$b")
+    [[ -z "$oldest" ]] || (( d < oldest )) && oldest="$d"
+  done < <(git -C "$repo_root" for-each-ref \
+    --format='%(refname:short)%1f%(committerdate:unix)' refs/heads/ 2>/dev/null)
+  (( ${#candidates} )) || return
+  (( oldest -= 86400 ))
+  local -A cdate
+  while IFS=$'\x1f' read -r cid d; do
+    [[ -n "$cid" ]] && cdate[$cid]="$d"
+  done < <(git -C "$repo_root" rev-list --since="@$oldest" --format='%H%x1f%ct' "$base_ref" 2>/dev/null \
+           | grep -v '^commit ')
+  while read -r pid cid; do
+    [[ -n "$pid" ]] && base_pid_date[$pid]="${cdate[$cid]:-0}"
+  done < <(git -C "$repo_root" rev-list --since="@$oldest" "$base_ref" 2>/dev/null \
+           | git -C "$repo_root" diff-tree --stdin -p 2>/dev/null \
+           | git -C "$repo_root" patch-id --stable 2>/dev/null)
+  while read -r pid cid; do
+    [[ -n "$pid" ]] && own_pid[$cid]="$pid"
+  done < <(print -rl -- "${candidates[@]}" "^$base_ref" \
+           | git -C "$repo_root" log --stdin -p --no-merges --format='commit %H' 2>/dev/null \
+           | git -C "$repo_root" patch-id --stable 2>/dev/null)
+}
+
+# True if every commit of <branch> has an equivalent (patch-id) in the base:
+# content entirely present, squash and rebase included. A commit with an empty
+# diff has no patch-id and nothing to be missing.
 content_merged() {
-  local b="$1" out
+  local b="$1" cid pid
   [[ -n "$base_ref" ]] || return 1
-  out=$(git -C "$repo_root" cherry "$base_ref" "$b" 2>/dev/null) || return 1
-  [[ -z "${out//[[:space:]]/}" ]] && return 0
-  print -r -- "$out" | grep -q '^+' && return 1
+  [[ -n "${ancestry_merged[$b]:-}" ]] && return 0
+  load_patch_ids
+  for cid in "${(@f)$(git -C "$repo_root" rev-list --no-merges "$b" "^$base_ref" 2>/dev/null)}"; do
+    [[ -n "$cid" ]] || continue
+    pid="${own_pid[$cid]:-}"
+    [[ -n "$pid" ]] || continue
+    (( ${+base_pid_date[$pid]} )) || return 1
+    (( base_pid_date[$pid] + 86400 >= ${tip_date[$b]:-0} )) || return 1
+  done
   return 0
 }
 
@@ -265,7 +326,12 @@ typeset -a teardown held free_branches gone_branches new_branches
 teardown=(); held=(); free_branches=(); gone_branches=(); new_branches=()
 
 if [[ -n "$base" ]]; then
-  for b in "${(@f)$(git -C "$repo_root" for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null)}"; do
+  typeset -a all_branches
+  all_branches=("${(@f)$(git -C "$repo_root" for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null)}")
+  # Seconds per thousand branches now, but still the longest step: say so.
+  (( ${#all_branches} > 200 )) && [[ -t 2 ]] \
+    && print -u2 "→ classifying ${#all_branches} local branches…"
+  for b in "${all_branches[@]}"; do
     [[ -n "$b" && "$b" != "$base" ]] || continue
 
     if content_merged "$b"; then
@@ -435,7 +501,8 @@ if [[ -n "$common_dir" ]] && (( ${+builtins[zstat]} )); then
     [[ -s "$lock" ]] && continue
     mtime=$(zstat +mtime "$lock" 2>/dev/null) || continue
     (( now - mtime >= LOCK_STALE_AFTER )) || continue
-    [[ -n "$(lsof -t -- "$lock" 2>/dev/null)" ]] && continue
+    # -n -P: no host or port name lookups, 0.1 s instead of 0.3 s per lock.
+    [[ -n "$(lsof -n -P -t -- "$lock" 2>/dev/null)" ]] && continue
     # The main working tree's lock lives directly in the common dir; a linked
     # worktree's is one level down, under its own name.
     if [[ "$lock" == "$common_dir"/index.lock ]]; then
