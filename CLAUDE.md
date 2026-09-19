@@ -17,6 +17,7 @@ share/wts/layouts/         built-in layouts (default.yml)
 examples/layouts/          richer layouts, not installed as built-ins
 completions/_wts           zsh completion
 test/smoke.zsh             end-to-end test in a sandbox
+docs/demo/                record.zsh + demo.tape: the README GIF (make demo)
 ```
 
 Homebrew, `make install` and a git checkout share this tree, so `bin/wts` works
@@ -70,6 +71,11 @@ integration from a checkout without touching an installed wts:
 bin/wts setup tmux > /tmp/wts-dev.tmux && tmux source-file /tmp/wts-dev.tmux
 tmux source-file ~/.tmux.conf   # back to the installed version
 ```
+
+When a change shows in the README demo (switcher, `wts ls`, `brief`, `gc`
+output), re-record `docs/demo.gif` with `make demo`: real agents on a throwaway
+clone, a few minutes and a few agent turns. Requirements are in the header of
+`docs/demo/record.zsh`.
 
 ## Release
 
