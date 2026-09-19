@@ -85,6 +85,7 @@ cd ~/code/myapp
 wts auth-form                          # ../myapp-worktrees/auth-form, branch auth-form
 wts "rate-limit the public API per key"   # Claude proposes the name, starts on the task
 wts ls                                 # agent state, branch, git delta, tmux state
+wts stop auth-form                     # tmux session only; wts restore brings it back
 wts rm auth-form -f                    # session + worktree + branch + registry entry
 ```
 
@@ -98,6 +99,7 @@ wts ls
 wts status [--json|--table|--fzf]
 wts brief [name...]
 wts restore [name...]
+wts stop <name>
 wts rm <name> [-f]
 wts gc [--apply] [--no-fetch]
 wts layouts
@@ -114,7 +116,7 @@ wts rm auth-frm -f                     # typo-tolerant: resolves to auth-form
 ```
 
 Slashes become `-` in the worktree folder and session name (`review/login-flow` →
-`review-login-flow`); the git branch keeps its full name. `wts rm` and `wts brief`
+`review-login-flow`); the git branch keeps its full name. `wts rm`, `wts stop` and `wts brief`
 tolerate typos: substring match, then fzf fuzzy match, then edit distance; when
 several sessions match, an fzf picker opens.
 
@@ -178,7 +180,7 @@ the worktree, so `WTS_SUBDIR` keeps working.
 | `idle`     | `status: idle`                     | turn finished, prompt available       |
 | `done`     | `state: done`                      | background session finished           |
 | `failed`   | `state: failed`                    | the turn failed                       |
-| `stopped`  | `state: stopped`                   | session stopped                       |
+| `stopped`  | `state: stopped`, or no tmux session | session stopped, or `wts stop`ped: the switcher shows it for a dead tmux session |
 | `stuck?`   | stale guard                        | says `working`, but the pane is frozen |
 | `-`        | no agent found                     | worktree without a Claude session     |
 
@@ -222,9 +224,13 @@ is never called by `wts ls` or the switcher.
 ## Session switcher
 
 `prefix+s` opens an fzf popup: sessions sorted by urgency, with agent state,
-branch, git delta and a live preview of the agent's pane. `enter` switches, `ctrl-d`
-removes the selected session (`wts rm`), `ctrl-f` / `ctrl-b` scroll the preview by
-half a page, `ctrl-r` reloads. tmux sessions unknown to wts are listed after.
+branch, git delta and a live preview of the agent's pane. `enter` switches, `ctrl-x`
+kills the selected tmux session (`wts stop`, after a y/N prompt: the worktree, the
+branch and the registry entry stay, the popup stays open and the row reads
+`stopped`), `ctrl-d` removes it entirely (`wts rm`), `ctrl-f` / `ctrl-b` scroll the
+preview by half a page, `ctrl-r` reloads. The current session is never killed from
+the popup, which it would close. tmux sessions unknown to wts are listed after, and
+`ctrl-x` works on them too.
 
 The list is a table **sized to the popup**: the session and branch columns take
 the width of their longest value, capped so that every column stays visible, and
@@ -239,7 +245,7 @@ questions and permission prompts, a sentence for the rest, nothing at all for a
 bare Enter. The preview keeps refreshing, so the agent's reaction shows up in
 place; `esc` or `tab` brings the list back (`enter` switches again). The reply
 stays pinned to the session you pressed `tab` on, even if the list re-sorts under
-the cursor, and `ctrl-d` is disabled meanwhile. While the agent column shows `-`,
+the cursor, and `ctrl-d` / `ctrl-x` are disabled meanwhile. While the agent column shows `-`,
 wts does not know the agent's pane yet and the reply goes to the session's active
 pane. Needs fzf 0.45 or later; older versions keep the plain switcher.
 
@@ -404,6 +410,9 @@ arguments. It never attaches: restoring eight sessions should not steal your
 terminal. `wts ls` purges entries whose worktree is gone. This is a **declarative
 replay**, not a snapshot like tmux-resurrect: a wts session is fully described by
 its name, layout and context, so replaying the layout is more faithful.
+
+`wts stop <name>` leaves the same state on purpose, without a reboot: the tmux
+session is killed, everything else stays, and `wts restore <name>` replays it.
 
 During `wts restore`, layouts see `WTS_RESTORE=1` and skip heavy commands —
 otherwise eight sessions mean eight `claude` and eight dependency installs at once.

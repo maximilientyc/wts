@@ -136,6 +136,27 @@ _wts_restore_targets() {
   _wts_offer sessions "session to restore" "no stopped session to restore" "${cands[@]}"
 }
 
+# `wts stop`: every running tmux session, registered or not: killing one is the
+# whole point, unlike `wts rm`. Minus the current session, which stop refuses.
+_wts_stop_targets() {
+  local -A reg live
+  local -a cands
+  local name cur=""
+  _wts_registry
+  _wts_live
+  [[ -n ${TMUX:-} ]] && cur=$(tmux display-message -p '#S' 2>/dev/null)
+
+  for name in ${(ko)live}; do
+    [[ $name == "$cur" ]] && continue
+    if (( ${+reg[$name]} )); then
+      cands+=("${name//:/\\:}:${reg[$name]:+${reg[$name]} · }running")
+    else
+      cands+=("${name//:/\\:}:not in registry")
+    fi
+  done
+  _wts_offer sessions "session to stop" "no running tmux session" "${cands[@]}"
+}
+
 # `wts brief`: every registered session, minus those already typed.
 _wts_brief_targets() {
   local -A reg live
@@ -163,6 +184,7 @@ _wts() {
       "status:session state (--json, --table, --fzf)" \
       "brief:where each session stands (done / next, by Claude)" \
       "restore:restart sessions missing from tmux" \
+      "stop:kill the tmux session only, keep the worktree" \
       "rm:remove session, worktree and branch" \
       "gc:clean up dead worktrees and branches" \
       "layouts:list available layouts" \
@@ -189,6 +211,13 @@ _wts() {
 
     restore)
       _wts_restore_targets ;;
+
+    stop)
+      if (( CURRENT == 3 )); then
+        _wts_stop_targets
+      else
+        _wts_say "no more arguments"
+      fi ;;
 
     brief)
       _wts_brief_targets ;;

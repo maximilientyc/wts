@@ -181,6 +181,8 @@ check "the switcher swaps the skeleton on load, not on start" \
   grep -qF 'load:unbind(load)+reload-sync' "$SWITCH"
 check "fzf accepts that bind" \
   eval 'printf "x\n" | fzf --bind="load:unbind(load)+reload-sync(true)" --filter=x'
+check "fzf accepts the ctrl-x bind" \
+  eval 'printf "x\n" | fzf --bind="ctrl-x:execute(true)+reload(true)" --filter=x'
 
 # The preview is a raw capture at the pane's width: the window is fitted to it on
 # focus, up to the half of the popup the list is laid out against, or a narrow
@@ -228,7 +230,7 @@ check "an empty reply sends a bare Enter" \
 check "a drifted cursor does not retarget the reply" pane_shows auth-form wts-reply-pinned
 chain=$("$SWITCH" --reply esc)
 check "esc leaves reply mode" \
-  eval 'print -r -- "$chain" | grep -q "^enable-search+.*rebind(ctrl-d)" && [[ ! -e "$WTS_SWITCH_REPLY" ]]'
+  eval 'print -r -- "$chain" | grep -q "^enable-search+.*rebind(ctrl-d,ctrl-x)" && [[ ! -e "$WTS_SWITCH_REPLY" ]]'
 check "fzf parses the leave chain" fzf_parses "$chain"
 check "tab toggles back out too" \
   eval '"$SWITCH" --reply toggle auth-form auth-form >/dev/null && "$SWITCH" --reply toggle auth-form auth-form | grep -q "^enable-search" && [[ ! -e "$WTS_SWITCH_REPLY" ]]'
@@ -280,11 +282,31 @@ else
   ok "no collector git call may take index.lock"
 fi
 
-# ─── Restore ─────────────────────────────────────────────────────────────────
+# ─── Stop and restore ────────────────────────────────────────────────────────
+# `wts stop` leaves exactly the state `wts restore` replays: tmux session gone,
+# everything else kept. The current-session refusal is not exercised here: TMUX
+# is unset and no client is attached, so `#S` would only name the last session
+# used.
 
-tmux kill-session -t "=auth-form"
+"$WTS" stop auth-form >/dev/null
+refute "stop kills the session" has_session auth-form
+check "stop keeps the worktree" test -d "$WT/auth-form"
+check "stop keeps the branch" git show-ref --verify --quiet refs/heads/feature/auth-form
+check "stop keeps the registry entry" in_registry auth-form
+check "a stopped session reads stopped in the switcher" \
+  eval '"$WTS" status --fzf | awk -F "\037" "\$1 == \"auth-form\" && \$2 == \"stopped\" { ok = 1 } END { exit !ok }"'
+check "switcher list keeps 3 fields with a stopped session" \
+  eval '"$SWITCH" --list | awk -F "\t" "NF != 3 { exit 1 }"'
+refute "stop of an unknown session fails" "$WTS" stop nope
+refute "stop of a stopped session fails" "$WTS" stop auth-form
 "$WTS" restore auth-form >/dev/null
-check "restore restarts the session" has_session auth-form
+check "restore restarts a stopped session" has_session auth-form
+
+# No git call in `stop`: the switcher popup runs it from wherever tmux started.
+check "stop needs no git repository" eval '(cd / && "$WTS" stop auth-form >/dev/null)'
+refute "stop from outside the repository kills the session" has_session auth-form
+"$WTS" restore auth-form >/dev/null
+check "restore after a second stop" has_session auth-form
 
 # ─── gc ──────────────────────────────────────────────────────────────────────
 

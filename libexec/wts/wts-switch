@@ -10,6 +10,7 @@
 #   esc      leave reply mode, or close the popup
 #   ctrl-r   reload the list by hand
 #   ctrl-d   delete the session (wts rm) and reload
+#   ctrl-x   kill the tmux session only (wts stop), after a y/N prompt
 #   ctrl-f   scroll the preview down half a page
 #   ctrl-b   scroll the preview up half a page
 #
@@ -274,11 +275,11 @@ reply() { # $1 = verb, then verb arguments
       [[ -n "${2:-}" ]] || return
       print -rl -- "$2" "${1:-$2}" > "$WTS_SWITCH_REPLY"
       # `|` as the argument delimiter: `)` is legal in a tmux session name.
-      print -r -- "disable-search+clear-query+unbind(ctrl-d)+refresh-preview+change-prompt|reply to ${2//|/}> |"
+      print -r -- "disable-search+clear-query+unbind(ctrl-d,ctrl-x)+refresh-preview+change-prompt|reply to ${2//|/}> |"
       ;;
     leave)
       rm -f "$WTS_SWITCH_REPLY"
-      print -r -- "enable-search+clear-query+rebind(ctrl-d)+change-prompt(session> )+refresh-preview"
+      print -r -- "enable-search+clear-query+rebind(ctrl-d,ctrl-x)+change-prompt(session> )+refresh-preview"
       ;;
     esc)
       if reply_active; then reply leave; else print -r -- "abort"; fi
@@ -365,6 +366,61 @@ fit_preview() { # $1 = cursor target, $2 = cursor name ; prints the action, or n
   fi
 }
 
+# ─── Kill ────────────────────────────────────────────────────────────────────
+# ctrl-x: `wts stop` on the selected row, after a y/N prompt. Runs under fzf's
+# `execute`, which talks to /dev/tty directly, so the prompt reads the keyboard
+# with no redirection. fzf redraws the instant the command exits: a message
+# that is not followed by a key wait is never seen.
+# A key press, after draining what the terminal already sent: replies to the
+# queries fzf and tmux make (cursor position, keyboard protocol) land on the
+# same tty, and a bare `read -k1` took one of them for the key, so the message
+# was gone before anyone read it.
+wait_key() {
+  local junk
+  sleep 0.1
+  while read -t 0 -k1 -s junk 2>/dev/null; do :; done
+  read -k1 -s junk
+}
+
+kill_session() { # $1 = session name, $2 = display line (its 2nd word is AGENT)
+  local name="$1" line="${2:-}" cur agent=""
+  [[ -n "$name" ]] || return 0   # `execute` also fires on an empty list
+
+  # fzf hands over its alternate screen with the cursor wherever it was: clear
+  # it, so the prompt is at the top and not in the middle of a blank popup.
+  print -n '\e[2J\e[H'
+
+  # Same call as the " *" marker, so this agrees with what the user sees. Done
+  # here and not left to `wts stop`: nobody should be asked y/N for a refusal.
+  cur=$(tmux display-message -p '#S' 2>/dev/null)
+  if [[ "$name" == "$cur" ]]; then
+    print -r -- "wts: '$name' is the current session, not killed (switch away first) — any key"
+    wait_key
+    return 0
+  fi
+
+  # The AGENT column, unless the row does not carry one: an unregistered tmux
+  # session may have blanks in its name, which shifts every word.
+  local -a cols=(${=line})
+  case "${cols[2]:-}" in
+    blocked|working|idle|done|failed|stopped|stuck\?|-) agent="${cols[2]}" ;;
+  esac
+
+  if ! read -q "?Kill tmux session '$name'${agent:+ (agent: $agent)}? Worktree and registry are kept. [y/N] "; then
+    print
+    return 0
+  fi
+  print
+  if [[ -z "$WTS_CMD" ]]; then
+    print -r -- "wts: wts not found next to this helper nor in PATH — any key"
+    wait_key
+    return 0
+  fi
+  # The CLI's own output is the message; the pause makes a failure readable.
+  "$WTS_CMD" stop "$name" || { print -n "press any key"; wait_key }
+  return 0
+}
+
 # Exposes the function to the subshell fzf starts for `reload`.
 if [[ "${1:-}" == "--list" ]]; then
   build_list
@@ -398,6 +454,11 @@ fi
 
 if [[ "${1:-}" == "--fit" ]]; then
   fit_preview "${2:-}" "${3:-}"
+  exit 0
+fi
+
+if [[ "${1:-}" == "--kill" ]]; then
+  kill_session "${2:-}" "${3:-}"
   exit 0
 fi
 
@@ -511,11 +572,15 @@ export WTS_SWITCH_SCROLL="${TMPDIR:-/tmp}/wts-switch.$$.scroll"
 export WTS_SWITCH_REPLY="${TMPDIR:-/tmp}/wts-switch.$$.reply"
 rm -f "$WTS_SWITCH_REPLY"
 
-# ctrl-d: without a resolvable wts, the bind would fail silently in the popup.
-typeset -a delete_bind
+# ctrl-d and ctrl-x: without a resolvable wts, the binds would fail silently in
+# the popup. fzf quotes {1} and {3} itself; {1} is the display line, from which
+# --kill reads the agent state shown to the user.
+typeset -a delete_bind kill_bind
 delete_bind=()
+kill_bind=()
 if [[ -n "$WTS_CMD" ]]; then
   delete_bind=(--bind="ctrl-d:execute('$WTS_CMD' rm {3})+reload('$self' --list)")
+  kill_bind=(--bind="ctrl-x:execute('$self' --kill {3} {1})+reload('$self' --list)")
 fi
 
 # ─── Live refresh ────────────────────────────────────────────────────────────
@@ -590,6 +655,7 @@ selection=$(print -r -- "$list" | fzf \
   --preview-window="right,${preview_cols},border-left" \
   --bind="ctrl-r:reload('$self' --list)" \
   "${delete_bind[@]}" \
+  "${kill_bind[@]}" \
   --bind="ctrl-f:execute-silent('$self' --scroll {2} {3} down)+refresh-preview" \
   --bind="ctrl-b:execute-silent('$self' --scroll {2} {3} up)+refresh-preview" \
 ) || exit 0
