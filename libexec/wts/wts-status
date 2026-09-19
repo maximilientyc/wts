@@ -313,9 +313,14 @@ SUBJECT='def subject: [.agent_name, .prompt, .context]
 
 case "$FORMAT" in
   json)  print -r -- "$all" ;;
+  # fzf: a dead tmux session reads "stopped" whatever the agent record says. The
+  # row is about the session, and `claude agents` can still list a record whose
+  # cwd is that worktree, which would show a ghost "working". --json keeps the
+  # raw facts.
   fzf)   print -r -- "$all" | jq -r "$SUBJECT"'.[]
            | [ .name,
-               (if .stale then "stuck?" else (.agent_state // "-") end),
+               (if (.tmux_alive | not) then "stopped"
+                elif .stale then "stuck?" else (.agent_state // "-") end),
                .branch,
                ("+\(.added)/-\(.removed)" + (if .ahead > 0 then " ^\(.ahead)" else "" end)),
                (if .dirty > 0 then "dirty" else "clean" end),

@@ -8,6 +8,7 @@
 #        wts ls | wts status [--json|--table|--fzf]
 #        wts brief [name...]
 #        wts restore [name...]
+#        wts stop <name>
 #        wts rm <name> [-f]
 #        wts gc [--apply] [--no-fetch]
 #        wts layouts
@@ -26,6 +27,8 @@
 #   brief      : where each session stands, "done / next", summarized by Claude
 #   restore    : restart registered sessions missing from tmux (after a reboot)
 #                and pre-fill `claude --continue`
+#   stop       : kill the tmux session only; the worktree, the branch and the
+#                registry entry stay (wts restore restarts it)
 #   rm         : delete the tmux session, the worktree and the branch
 #     -f       : force (dirty worktree, unmerged branch)
 #   gc         : clean up from the remote: worktrees and branches whose PR is
@@ -43,6 +46,7 @@
 #   wts ls
 #   wts brief
 #   wts restore
+#   wts stop auth-form
 #   wts rm auth-form -f
 
 set -euo pipefail
@@ -484,6 +488,55 @@ if [[ "$1" == "restore" ]]; then
   echo "→ $restored session(s) restored, $ignored skipped"
   if (( restored > 0 )); then
     echo "   attach: tmux attach -t <name>   (or prefix+s)"
+  fi
+  exit 0
+fi
+
+# ─── Subcommand: stop ────────────────────────────────────────────────────────
+# Kill the tmux session and nothing else: the worktree, the branch and the
+# registry entry stay, so `wts restore <name>` brings the session back. `rm` is
+# the full teardown. No git call here, so unlike `rm` it works from any
+# directory: the switcher popup calls it from wherever tmux started it.
+
+if [[ "$1" == "stop" ]]; then
+  if [[ $# -ne 2 ]]; then
+    echo "Usage: wts stop <name>" >&2
+    exit 1
+  fi
+
+  # Session name: slashes sanitized, as at creation (team/foo → team-foo).
+  SESSION="${2//\//-}"
+
+  # A live session with exactly this name wins over typo tolerance. The
+  # switcher also lists sessions wts never registered ("3", another project),
+  # and resolving "3" through the registry would land on a registered "auth-3".
+  if ! tmux has-session -t "=$SESSION" 2>/dev/null; then
+    if resolved=$(registry_resolve_name "$SESSION"); then
+      SESSION="$resolved"
+    else
+      exit 1
+    fi
+    if ! tmux has-session -t "=$SESSION" 2>/dev/null; then
+      echo "→ no tmux session '$SESSION'" >&2
+      exit 1
+    fi
+  fi
+
+  # Never the current session: killing it detaches this client, and closes the
+  # switcher popup when that is the caller. Same rule as wts gc. Checked after
+  # resolution, so a typo that resolves to the current session is refused too.
+  # #S is only meaningful under $TMUX: outside a client it names the last used
+  # session.
+  if [[ -n "${TMUX:-}" && "$(tmux display-message -p '#S' 2>/dev/null)" == "$SESSION" ]]; then
+    echo "wts: '$SESSION' is the current session, not killed (switch away first)" >&2
+    exit 1
+  fi
+
+  tmux kill-session -t "=$SESSION"
+  echo "→ tmux session '$SESSION' killed"
+  if registry_available && [[ -s "$WTS_STATE_FILE" ]] \
+     && jq -e --arg n "$SESSION" 'has($n)' "$WTS_STATE_FILE" >/dev/null 2>&1; then
+    echo "→ worktree kept, wts restore $SESSION restarts it"
   fi
   exit 0
 fi
