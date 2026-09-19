@@ -1,6 +1,7 @@
 # The README demo. Run it through docs/demo/record.zsh (`make demo`), which
 # builds the sandbox this tape expects: a clone in ./wts, four sessions with
-# their agents blocked, working and idle, and a squash-merged branch.
+# their agents blocked, working and idle, and a squash-merged branch. Needs
+# fzf 0.45 or newer for the reply step (tab).
 #
 # Waits on the prompt use /❯$/, the line the cursor is on: your zsh prompt
 # (powerlevel10k) ends with that character when the command has returned.
@@ -42,7 +43,11 @@ Sleep 3s
 Show
 Sleep 4s
 
-# 2. The switcher: whoever needs you comes first, with a live preview.
+# 2. The switcher: whoever needs you comes first, with a live preview of its
+# pane. gc-quiet is blocked on a numbered question: tab pins it, "1" + enter
+# answers from the popup and the preview shows the agent going on. Then
+# name-fallback, whose one-line job is done, is stopped with ctrl-x: the row
+# reads "stopped", the worktree stays.
 Ctrl+B
 Type "s"
 Wait+Screen@20s /blocked/
@@ -54,6 +59,25 @@ Sleep 1500ms
 Up
 Sleep 1s
 Up
+Sleep 1s
+Tab
+Sleep 1500ms
+Type "1"
+Sleep 800ms
+Enter
+Sleep 6s
+Escape
+Sleep 1500ms
+Type "name"
+Sleep 1s
+Ctrl+X
+Wait+Screen@10s /Kill tmux session/
+Sleep 2s
+Type "y"
+Sleep 3s
+Ctrl+U
+Sleep 1s
+Type "gc"
 Sleep 1s
 Enter
 Sleep 4s

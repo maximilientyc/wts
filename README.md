@@ -22,7 +22,7 @@ each other, and for finding your way back afterwards:
 It is opinionated — zsh, tmux, tmuxinator, Claude Code — because it was built for
 one person's workflow. It is shared in case that workflow is also yours.
 
-![wts: a session started from a sentence, the switcher with agents blocked, working and idle, then wts ls, wts brief and wts gc](docs/demo.gif)
+![wts: a session started from a sentence, the switcher with agents blocked, working and idle, a blocked agent answered and an idle session stopped from the popup, then wts ls, wts brief and wts gc](docs/demo.gif)
 
 ## Requirements
 
