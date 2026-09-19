@@ -15,6 +15,9 @@
 # seconds (2 by default, 0 to turn it off). See the "Live refresh" section
 # below for why it is wired this way.
 #
+# The preview window is as wide as the agent's pane, up to the half of the
+# popup it starts with: see the "Preview width" section.
+#
 # `--next` (no UI): switch straight to the first agent that needs a human. The
 # engine already sorts in that order, so it is the first line whose state is
 # actionable.
@@ -245,6 +248,34 @@ scroll() { # $1 = target, $2 = up|down
   write_scroll "$target" "$off"
 }
 
+# ─── Preview width ───────────────────────────────────────────────────────────
+# The preview is a raw capture-pane: text at the PANE's width, whatever the
+# window's. With the editor as main pane (main-vertical at 75%), the agent's
+# pane is 56 columns on a 223-column terminal and a 60% window was 110: half
+# of it blank, while the list had 76 columns for the 130 it needs to show
+# SUBJECT in full. So the window is fitted to the pane of the highlighted row,
+# on the `focus` event: as wide as the pane, never wider than the half of the
+# popup it starts with. The list is laid out for the other half (WTS_SWITCH_COLS
+# below), so a window that grew past it would cut every row: a pane wider than
+# half the popup is truncated on the right instead.
+#
+# An absolute --preview-window size counts content columns and the border comes
+# on top (`right,57,border-left` gives FZF_PREVIEW_COLUMNS=57, measured on fzf
+# 0.74), so pane_width maps one to one. fzf does not re-run the preview command
+# on that resize, and it does not have to: the output only depends on
+# FZF_PREVIEW_LINES, which a window on the right never changes.
+fit_preview() { # $1 = target ; prints the fzf action, or nothing
+  local target="$1" width cols="${FZF_COLUMNS:-}"
+  width=$(tmux display-message -p -t "$target" '#{pane_width}' 2>/dev/null)
+  # A gone pane, or a fzf without FZF_COLUMNS: leave the window as it is.
+  [[ "$width" == <-> && "$cols" == <-> ]] || return 0
+  if (( width < cols / 2 )); then
+    print -r -- "change-preview-window(right,$width,border-left)"
+  else
+    print -r -- "change-preview-window(right,$(( cols / 2 )),border-left)"
+  fi
+}
+
 # Exposes the function to the subshell fzf starts for `reload`.
 if [[ "${1:-}" == "--list" ]]; then
   build_list
@@ -267,6 +298,11 @@ fi
 
 if [[ "${1:-}" == "--scroll" ]]; then
   scroll "${2:-}" "${3:-}"
+  exit 0
+fi
+
+if [[ "${1:-}" == "--fit" ]]; then
+  fit_preview "${2:-}"
   exit 0
 fi
 
@@ -348,6 +384,15 @@ else
   list=$(build_list)
 fi
 
+# The fit bind needs `transform` (0.45) and FZF_COLUMNS (0.46). On an older fzf
+# the window stays at half the popup, for the reason above: an unknown action
+# would close the popup without a word.
+typeset -a fit_opts
+fit_opts=()
+if [[ -n "$fzf_version" ]] && is-at-least 0.46 "$fzf_version"; then
+  fit_opts=(--bind="focus:transform('$self' --fit {2})")
+fi
+
 # The collected list is a subset of registry + tmux sessions, so an empty
 # skeleton means there would be nothing to show either way.
 [[ -n "$list" ]] || exit 0
@@ -423,6 +468,7 @@ fi
 selection=$(print -r -- "$list" | fzf \
   "${listen_opts[@]}" \
   "${fast_opts[@]}" \
+  "${fit_opts[@]}" \
   --reverse \
   --delimiter=$'\t' \
   --with-nth=1 \
