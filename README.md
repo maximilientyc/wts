@@ -226,6 +226,12 @@ branch, git delta and a live preview of the agent's pane. `enter` switches, `ctr
 removes the selected session (`wts rm`), `ctrl-f` / `ctrl-b` scroll the preview by
 half a page, `ctrl-r` reloads. tmux sessions unknown to wts are listed after.
 
+The list is a table **sized to the popup**: the session and branch columns take
+the width of their longest value, capped so that every column stays visible, and
+a cell too long for its column is cut with `…` rather than pushing its row out
+of line. `*` after a name marks the session you came from. The preview takes the
+right half.
+
 The popup is **drawn at once**, on a list built from the registry and tmux alone —
 no git, no agent call. fzf swaps in the collected list when it is ready (`load`,
 then `reload-sync`), so the wait happens with the sessions already on screen

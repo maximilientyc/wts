@@ -139,11 +139,31 @@ check "skeleton has 3 fields" \
   eval '"$SWITCH" --list-fast | awk -F "\t" "NF != 3 { exit 1 }"'
 check "skeleton lists the same sessions" \
   eval 'diff <("$SWITCH" --list-fast | cut -f3 | sort) <("$SWITCH" --list | cut -f3 | sort)'
-# Both go through render_line, so the SESSION column has to pad identically: if it
-# ever stops doing so, every later column redraws shifted at the swap.
+# Both go through emit, with widths measured on the same registry: if they ever
+# disagree, every column redraws shifted at the swap. The header is the first
+# line of each list, so equal headers means equal widths.
 check "skeleton aligns with the collected list" \
-  eval 'diff <("$SWITCH" --list-fast | cut -f1 | cut -c1-23 | sort) \
-             <("$SWITCH" --list | cut -f1 | cut -c1-23 | sort)'
+  eval 'diff <("$SWITCH" --list-fast | head -1) <("$SWITCH" --list | head -1)'
+
+# Every display field of stdin is exactly $1 characters wide. zsh's ${#} counts
+# characters, unlike awk's length on macOS, so `…` costs one like any letter.
+same_width() {
+  local line
+  while IFS=$'\t' read -r line _; do (( ${#line} == $1 )) || return 1; done
+}
+check "rows are padded to the list width" \
+  eval 'WTS_SWITCH_COLS=60 "$SWITCH" --list | same_width 60 \
+        && WTS_SWITCH_COLS=60 "$SWITCH" --list-fast | same_width 60'
+
+# A cell longer than its column is cut with an ellipsis instead of pushing the
+# rest of the row right. An unregistered tmux session is the cheapest long name.
+LONG=a-session-name-long-enough-to-overflow-its-column
+tmux new-session -d -s "$LONG" -x 80 -y 24
+check "long cells are cut with an ellipsis" \
+  eval 'WTS_SWITCH_COLS=60 "$SWITCH" --list | grep -q "^a-session-name[a-z-]*…"'
+check "the cut row is as wide as the others" \
+  eval 'WTS_SWITCH_COLS=60 "$SWITCH" --list | same_width 60'
+tmux kill-session -t "=$LONG"
 
 # fzf exits 2 on an unknown --bind action, and in a popup that means the frame
 # closes without a word. --filter validates binds headlessly, so the actions the
