@@ -6,6 +6,8 @@
 # tmux sessions unknown to the registry follow.
 #
 #   enter    switch to the session
+#   tab      reply mode: type for the previewed agent, enter sends (fzf >= 0.45)
+#   esc      leave reply mode, or close the popup
 #   ctrl-r   reload the list by hand
 #   ctrl-d   delete the session (wts rm) and reload
 #   ctrl-f   scroll the preview down half a page
@@ -207,8 +209,91 @@ write_scroll() { # $1 = target, $2 = offset
   print -rl -- "$1" "$2" > "$WTS_SWITCH_SCROLL"
 }
 
-preview() { # $1 = target
-  local target="$1" capture
+# ─── Reply mode ──────────────────────────────────────────────────────────────
+# The preview is a capture, not a terminal: there is no cursor to put in it. So
+# answering an agent from the popup works the other way round: `tab` turns the
+# query line into an input for the previewed session, `enter` pushes it with
+# `send-keys`, and the poller's refresh shows the agent's reaction in place.
+#
+# The mode is pinned to one session, recorded on disk like the scroll offset:
+# the poller re-sorts the list by urgency every 2 s, and a cursor kept by index
+# would silently retarget the reply. A wrong `enter` in list mode only switches
+# to the wrong session; a wrong reply types into the wrong agent's prompt.
+#
+# State: <session name> then <target at entry>. The name is the anchor; the
+# target is a fallback for when the cursor has drifted off that row.
+
+reply_active() { [[ -n "${WTS_SWITCH_REPLY:-}" && -f "$WTS_SWITCH_REPLY" ]] }
+
+read_reply() { # sets reply_name and reply_target in the caller's scope
+  { read -r reply_name; read -r reply_target } < "$WTS_SWITCH_REPLY"
+}
+
+# Where a preview, a scroll or a reply goes. The cursor's own target wins as
+# long as the cursor is still on the pinned session: a row that was a skeleton
+# at entry (bare session name) gains its agent pane on the next reload, and
+# the reply should follow it.
+resolve_target() { # $1 = cursor target, $2 = cursor name
+  if reply_active; then
+    local reply_name reply_target
+    read_reply
+    if [[ "${2:-}" != "$reply_name" || -z "${1:-}" ]]; then
+      print -r -- "$reply_target"
+      return
+    fi
+  fi
+  print -r -- "${1:-}"
+}
+
+# A pane target (session:@window.%pane) is already exact. A bare session name
+# needs `=`, or `fix-login` would send into `fix-login-2` — and the trailing
+# `:`: pane commands (send-keys, capture-pane) resolve `=name:` to the active
+# pane but answer "can't find pane" to a plain `=name` (tmux 3.7).
+tmux_target() { # $1 = target
+  [[ "$1" == *%* ]] && print -r -- "$1" || print -r -- "=$1:"
+}
+
+send_reply() { # $1 = target, $2 = text
+  local t
+  t=$(tmux_target "$1")
+  [[ -n "$2" ]] && tmux send-keys -t "$t" -l -- "$2" 2>/dev/null
+  # Text and newline in one read look like a multi-line paste to Claude Code,
+  # which then inserts the newline instead of submitting.
+  sleep 0.1
+  tmux send-keys -t "$t" Enter 2>/dev/null
+}
+
+# Each verb prints an fzf action chain for `transform`, the only way fzf offers
+# to make a key conditional: `enter` must keep switching outside reply mode.
+# Placeholders in the output would be expanded by fzf, so none appear here.
+reply() { # $1 = verb, then verb arguments
+  local verb="$1"; shift
+  case "$verb" in
+    toggle) # <target> <name>
+      if reply_active; then reply leave; return; fi
+      [[ -n "${2:-}" ]] || return
+      print -rl -- "$2" "${1:-$2}" > "$WTS_SWITCH_REPLY"
+      # `|` as the argument delimiter: `)` is legal in a tmux session name.
+      print -r -- "disable-search+clear-query+unbind(ctrl-d)+refresh-preview+change-prompt|reply to ${2//|/}> |"
+      ;;
+    leave)
+      rm -f "$WTS_SWITCH_REPLY"
+      print -r -- "enable-search+clear-query+rebind(ctrl-d)+change-prompt(session> )+refresh-preview"
+      ;;
+    esc)
+      if reply_active; then reply leave; else print -r -- "abort"; fi
+      ;;
+    send) # <query> <cursor target> <cursor name>
+      if ! reply_active; then print -r -- "accept"; return; fi
+      send_reply "$(resolve_target "${2:-}" "${3:-}")" "${1:-}"
+      print -r -- "clear-query+refresh-preview"
+      ;;
+  esac
+}
+
+preview() { # $1 = cursor target, $2 = cursor name
+  local target capture
+  target=$(resolve_target "${1:-}" "${2:-}")
   capture=$(tmux capture-pane -p -e -S "-$SCROLLBACK" -t "$target" 2>/dev/null)
   [[ -n "$capture" ]] || { print -r -- "(no preview)"; return }
 
@@ -233,8 +318,9 @@ preview() { # $1 = target
   print -rl -- "${lines[@]:$((start - 1)):$((end - start + 1))}"
 }
 
-scroll() { # $1 = target, $2 = up|down
-  local target="$1" dir="$2"
+scroll() { # $1 = cursor target, $2 = cursor name, $3 = up|down
+  local target dir="$3"
+  target=$(resolve_target "${1:-}" "${2:-}")
   # Half a page sized on the real window height: fzf exports
   # FZF_PREVIEW_LINES to `execute*` as well as to preview commands.
   local step=$(( ${FZF_PREVIEW_LINES:-20} / 2 ))
@@ -264,8 +350,11 @@ scroll() { # $1 = target, $2 = up|down
 # 0.74), so pane_width maps one to one. fzf does not re-run the preview command
 # on that resize, and it does not have to: the output only depends on
 # FZF_PREVIEW_LINES, which a window on the right never changes.
-fit_preview() { # $1 = target ; prints the fzf action, or nothing
-  local target="$1" width cols="${FZF_COLUMNS:-}"
+fit_preview() { # $1 = cursor target, $2 = cursor name ; prints the action, or nothing
+  local target width cols="${FZF_COLUMNS:-}"
+  # In reply mode the preview shows the pinned session, so the window follows
+  # that pane rather than the row the cursor drifted to.
+  target=$(resolve_target "${1:-}" "${2:-}")
   width=$(tmux display-message -p -t "$target" '#{pane_width}' 2>/dev/null)
   # A gone pane, or a fzf without FZF_COLUMNS: leave the window as it is.
   [[ "$width" == <-> && "$cols" == <-> ]] || return 0
@@ -292,17 +381,23 @@ fi
 
 # Preview subcommands, called by fzf for the current line.
 if [[ "${1:-}" == "--preview" ]]; then
-  preview "${2:-}"
+  preview "${2:-}" "${3:-}"
   exit 0
 fi
 
 if [[ "${1:-}" == "--scroll" ]]; then
-  scroll "${2:-}" "${3:-}"
+  scroll "${2:-}" "${3:-}" "${4:-}"
+  exit 0
+fi
+
+# Reply mode verbs, called by fzf through `transform`; see "Reply mode" above.
+if [[ "${1:-}" == "--reply" ]]; then
+  reply "${2:-}" "${@:3}"
   exit 0
 fi
 
 if [[ "${1:-}" == "--fit" ]]; then
-  fit_preview "${2:-}"
+  fit_preview "${2:-}" "${3:-}"
   exit 0
 fi
 
@@ -390,7 +485,20 @@ fi
 typeset -a fit_opts
 fit_opts=()
 if [[ -n "$fzf_version" ]] && is-at-least 0.46 "$fzf_version"; then
-  fit_opts=(--bind="focus:transform('$self' --fit {2})")
+  fit_opts=(--bind="focus:transform('$self' --fit {2} {3})")
+fi
+
+# Reply mode rests on `transform` (0.45), the only way to make a key conditional.
+# Below that the three keys keep their fzf defaults and the switcher is exactly
+# what it was. `tab` is free: without --multi its default `toggle` does nothing.
+typeset -a reply_opts
+reply_opts=()
+if [[ -n "$fzf_version" ]] && is-at-least 0.45 "$fzf_version"; then
+  reply_opts=(
+    --bind="tab:transform('$self' --reply toggle {2} {3})"
+    --bind="enter:transform('$self' --reply send {q} {2} {3})"
+    --bind="esc:transform('$self' --reply esc)"
+  )
 fi
 
 # The collected list is a subset of registry + tmux sessions, so an empty
@@ -400,6 +508,8 @@ fi
 # Exported rather than recomputed, so that the subprocesses started by
 # --preview and by the binds land on this popup's file.
 export WTS_SWITCH_SCROLL="${TMPDIR:-/tmp}/wts-switch.$$.scroll"
+export WTS_SWITCH_REPLY="${TMPDIR:-/tmp}/wts-switch.$$.reply"
+rm -f "$WTS_SWITCH_REPLY"
 
 # ctrl-d: without a resolvable wts, the bind would fail silently in the popup.
 typeset -a delete_bind
@@ -438,7 +548,7 @@ fi
 cleanup() {
   [[ -n "$poll_pid" ]] && kill "$poll_pid" 2>/dev/null
   [[ -n "$sock" ]] && rm -f "$sock"
-  rm -f "$WTS_SWITCH_SCROLL"
+  rm -f "$WTS_SWITCH_SCROLL" "$WTS_SWITCH_REPLY"
 }
 trap cleanup EXIT INT TERM
 
@@ -469,18 +579,19 @@ selection=$(print -r -- "$list" | fzf \
   "${listen_opts[@]}" \
   "${fast_opts[@]}" \
   "${fit_opts[@]}" \
+  "${reply_opts[@]}" \
   --reverse \
   --delimiter=$'\t' \
   --with-nth=1 \
   --prompt='session> ' \
   --header-lines=1 \
   --ellipsis='…' \
-  --preview="'$self' --preview {2}" \
+  --preview="'$self' --preview {2} {3}" \
   --preview-window="right,${preview_cols},border-left" \
   --bind="ctrl-r:reload('$self' --list)" \
   "${delete_bind[@]}" \
-  --bind="ctrl-f:execute-silent('$self' --scroll {2} down)+refresh-preview" \
-  --bind="ctrl-b:execute-silent('$self' --scroll {2} up)+refresh-preview" \
+  --bind="ctrl-f:execute-silent('$self' --scroll {2} {3} down)+refresh-preview" \
+  --bind="ctrl-b:execute-silent('$self' --scroll {2} {3} up)+refresh-preview" \
 ) || exit 0
 
 [[ -n "$selection" ]] || exit 0
