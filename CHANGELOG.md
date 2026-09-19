@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **The switcher's keys are written under its list.** `prefix+s` had seven bindings and showed none of them: `tab`, `ctrl-x`, `ctrl-d`, `ctrl-f`/`ctrl-b`, `ctrl-r` were documented in the README and in a comment at the top of `wts-switch`, which is exactly where nobody looks while a popup is open. The popup now carries a footer: one line sized to the list (`enter switch · tab reply · ^x stop · ^d rm · …`), which drops its rarest keys rather than being cut mid-word on a narrow popup, and **`?`** unfolds the full table — the tmux bindings (`prefix+s`, `prefix+a`, `prefix+g`, `prefix+:`) included, since those cannot be pressed from inside the popup and are the first to be forgotten. The prefix shown is the one the running server reports, not an assumed `C-b`. In reply mode the footer says what `enter` and `esc` do *there*, and `?` is typed into the reply instead of opening the list; while the list is being filtered, `?` goes into the query too (the AGENT column has `stuck?` in it). Needs fzf 0.65 (`--footer`); older versions keep the popup exactly as it was, and are never handed a `change-footer` they would exit on.
+- **`wts keys`** prints the same table in a terminal, for when the popup is not open — or not open yet. The footer and the command render from one helper (`libexec/wts/wts-keys`), so they cannot drift apart.
+
 ## 0.2.0 — 2026-09-19
 
 - The switcher's list (`prefix+s`) is laid out for the width it actually has. Columns were padded to 22/10/30/14 characters and never cut, so a session name over 22 characters or a `feature/<slug>` branch over 30 pushed its whole row to the right, and the fixed part alone was 80 columns wide when the list pane had 50 to 65: DELTA, SUBJECT and the ` *` mark of the current session were never on screen. The session and branch columns now take the width of their longest value, capped so every column stays visible, every cell too long for its column ends in `…`, and every row is exactly as wide as the list. `*` moved next to the session name. The header re-lays out with the rows (`--header-lines=1`), and the preview takes half the popup instead of 60%.
