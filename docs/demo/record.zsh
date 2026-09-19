@@ -59,10 +59,17 @@ export ZDOTDIR="$D/zdotdir"
 export ANTHROPIC_MODEL="${WTS_DEMO_MODEL:-sonnet}"
 unset TMUX WTS_BRANCH_PREFIX WTS_BASE_BRANCH WTS_SUBDIR WTS_WORKTREES_BASE WTS_NO_LLM
 
+# The sandbox's own socket, named explicitly: tmux (3.4 and later) silently
+# drops a TMUX_TMPDIR that does not exist and falls back to /tmp, so a bare
+# `tmux kill-server` on a first take, before the folder existed, killed the
+# real server and the terminal this script was started from.
+SOCK="$TMUX_TMPDIR/tmux-$UID/default"
 cleanup() {
   # Pane programs write their state on SIGHUP (nvim's shada): give them a
   # moment, or they recreate what rm just removed.
-  tmux kill-server 2>/dev/null && sleep 2
+  if [[ -S "$SOCK" ]]; then
+    tmux -S "$SOCK" kill-server 2>/dev/null && sleep 2
+  fi
   rm -rf "$D"
   rm -rf "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/-private-tmp-wts-demo(|-*)(N)
 }
