@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-09-19
 
 - The switcher's list (`prefix+s`) is laid out for the width it actually has. Columns were padded to 22/10/30/14 characters and never cut, so a session name over 22 characters or a `feature/<slug>` branch over 30 pushed its whole row to the right, and the fixed part alone was 80 columns wide when the list pane had 50 to 65: DELTA, SUBJECT and the ` *` mark of the current session were never on screen. The session and branch columns now take the width of their longest value, capped so every column stays visible, every cell too long for its column ends in `…`, and every row is exactly as wide as the list. `*` moved next to the session name. The header re-lays out with the rows (`--header-lines=1`), and the preview takes half the popup instead of 60%.
 - The switcher preview is **as wide as the agent's pane**, up to the half of the popup it starts with. The preview is a raw `capture-pane`, text at the pane's width: with the editor as the main pane (`main-vertical` at 75%), the agent's pane is 56 columns on a 223-column terminal and a 60% window was 110, so half of it was blank while the list had 76 columns for the 130 it needs to show the subject. The window now follows the highlighted session's pane (`focus` → `transform` → `change-preview-window`, fzf 0.46 or newer; older versions keep the half-width window). The list is laid out for the other half, so a pane wider than that is truncated on the right rather than pushed into the list.
