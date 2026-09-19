@@ -232,6 +232,17 @@ a cell too long for its column is cut with `…` rather than pushing its row out
 of line. `*` after a name marks the session you came from. The preview takes the
 right half.
 
+`tab` **answers the agent without leaving the popup**: the prompt becomes
+`reply to <session>>`, what you type no longer filters the list, and `enter` sends
+the line to the agent's pane followed by Enter — a number for Claude's numbered
+questions and permission prompts, a sentence for the rest, nothing at all for a
+bare Enter. The preview keeps refreshing, so the agent's reaction shows up in
+place; `esc` or `tab` brings the list back (`enter` switches again). The reply
+stays pinned to the session you pressed `tab` on, even if the list re-sorts under
+the cursor, and `ctrl-d` is disabled meanwhile. While the agent column shows `-`,
+wts does not know the agent's pane yet and the reply goes to the session's active
+pane. Needs fzf 0.45 or later; older versions keep the plain switcher.
+
 The popup is **drawn at once**, on a list built from the registry and tmux alone —
 no git, no agent call. fzf swaps in the collected list when it is ready (`load`,
 then `reload-sync`), so the wait happens with the sessions already on screen

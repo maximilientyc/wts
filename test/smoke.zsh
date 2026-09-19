@@ -70,6 +70,15 @@ refute() {
   if "$@" >/dev/null 2>&1; then fail "$desc"; else ok "$desc"; fi
 }
 has_session() { tmux has-session -t "=$1" }
+# A line sent to a shell pane takes a moment to run and print: poll up to 3 s.
+pane_shows() { # <session> <line>
+  local i
+  for i in {1..30}; do
+    tmux capture-pane -p -t "=$1:" 2>/dev/null | grep -qx -- "$2" && return 0
+    sleep 0.1
+  done
+  return 1
+}
 in_registry() { jq -e --arg n "$1" 'has($n)' "$XDG_STATE_HOME/wts/sessions.json" }
 
 # ─── CLI surface ─────────────────────────────────────────────────────────────
@@ -187,6 +196,43 @@ check "--fit caps the preview at half the popup" \
   eval '[[ "$(FZF_COLUMNS=$pane_width "$SWITCH" --fit auth-form)" == "change-preview-window(right,$((pane_width / 2)),border-left)" ]]'
 check "--fit stays quiet for an unknown target" \
   eval '[[ -z "$(FZF_COLUMNS=200 "$SWITCH" --fit no-such-session)" ]]'
+
+# ─── Reply mode ──────────────────────────────────────────────────────────────
+# The verbs are what fzf's `transform` runs on tab / enter / esc: each prints
+# an action chain, and `send` types into a real pane of the private server.
+# auth-form's pane is a plain shell here, so a sent command line runs.
+check "fzf accepts the reply binds" \
+  eval 'printf "x\n" | fzf --bind="tab:transform(true)" --bind="enter:transform(true)" \
+          --bind="esc:transform(true)" --filter=x'
+export WTS_SWITCH_REPLY="$SANDBOX/reply"
+check "enter switches outside reply mode" \
+  eval '[[ $("$SWITCH" --reply send x auth-form auth-form) == accept ]]'
+check "esc closes the popup outside reply mode" \
+  eval '[[ $("$SWITCH" --reply esc) == abort ]]'
+# The chains the verbs print are what fzf executes: an action it does not know
+# is dropped without a word, so each one is parsed by the installed fzf.
+fzf_parses() { printf 'x\n' | fzf --bind="start:$1" --filter=x }
+chain=$("$SWITCH" --reply toggle auth-form auth-form)
+check "tab enters reply mode" \
+  eval 'print -r -- "$chain" | grep -q "^disable-search+.*change-prompt|reply to auth-form> |$"'
+check "fzf parses the enter chain" fzf_parses "$chain"
+check "reply mode is pinned on disk" \
+  eval '[[ $(head -1 "$WTS_SWITCH_REPLY") == auth-form ]]'
+check "enter sends the line to the pane" \
+  eval '[[ $("$SWITCH" --reply send "echo wts-reply-ok" auth-form auth-form) == "clear-query+refresh-preview" ]]'
+check "the line reached the pane" pane_shows auth-form wts-reply-ok
+check "an empty reply sends a bare Enter" \
+  eval '[[ $("$SWITCH" --reply send "" auth-form auth-form) == "clear-query+refresh-preview" ]]'
+# The pinned session wins over a cursor that drifted to another row.
+"$SWITCH" --reply send "echo wts-reply-pinned" export-users-csv export-users-csv >/dev/null
+check "a drifted cursor does not retarget the reply" pane_shows auth-form wts-reply-pinned
+chain=$("$SWITCH" --reply esc)
+check "esc leaves reply mode" \
+  eval 'print -r -- "$chain" | grep -q "^enable-search+.*rebind(ctrl-d)" && [[ ! -e "$WTS_SWITCH_REPLY" ]]'
+check "fzf parses the leave chain" fzf_parses "$chain"
+check "tab toggles back out too" \
+  eval '"$SWITCH" --reply toggle auth-form auth-form >/dev/null && "$SWITCH" --reply toggle auth-form auth-form | grep -q "^enable-search" && [[ ! -e "$WTS_SWITCH_REPLY" ]]'
+unset WTS_SWITCH_REPLY
 
 # ─── No collector may take a worktree's index.lock ───────────────────────────
 # `git status` creates <gitdir>/index.lock before it scans and only releases it
