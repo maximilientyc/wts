@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-09-19
 
 Measured on a generated 150k-file repository with 8 sessions and 3000 local branches (`make bench`; the numbers, the method and what was found are in `docs/big-repo-analysis.md`).
 
