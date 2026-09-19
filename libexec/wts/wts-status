@@ -1,13 +1,18 @@
 #!/usr/bin/env zsh
 # wts-status — state engine: registry + git + tmux + claude agents -> JSON
 #
-# Usage: wts-status [--json | --table | --fzf]
+# Usage: wts-status [--json | --table | --fzf] [--no-git] [name...]
 #
 #   --json  (default) JSON array, one object per registered worktree
 #   --table colored column rendering for `wts ls`
 #   --fzf   sorted lines (stuck first) for wts-switch, fields separated by
 #           \x1f: TAB is an IFS whitespace and would collapse empty fields (an
 #           agent without a tmux pane would shift every column).
+#   --no-git  agents and tmux only: the git columns are 0 in --json and "-" in
+#           the presentation formats. What prefix+a and the switcher's first
+#           fill need, in 50 ms instead of the seconds a `git status` on every
+#           worktree costs on a large repository.
+#   name... only these registered sessions (wts brief <name>).
 #
 # Principle: a single collection pass (one claude call, one tmux call), then
 # rendering. No format may fail because a tool is missing: the affected
@@ -42,13 +47,25 @@ CLAUDE_SESSIONS_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions"
 # `working` forever and the table becomes a lie.
 STALE_AFTER=${WTS_STALE_AFTER:-10}
 
+zmodload zsh/datetime 2>/dev/null
+PASS_T0=${EPOCHREALTIME:-0}
+first_root=""   # repository of the first session: the slow-pass hint checks its config
+
 FORMAT=json
-case "${1:-}" in
-  --json|"") FORMAT=json ;;
-  --table)   FORMAT=table ;;
-  --fzf)     FORMAT=fzf ;;
-  *) print -u2 "wts-status: unknown format '$1' (--json|--table|--fzf)"; exit 2 ;;
-esac
+WITH_GIT=true
+typeset -a ONLY
+ONLY=()
+while (( $# )); do
+  case "$1" in
+    --json)   FORMAT=json ;;
+    --table)  FORMAT=table ;;
+    --fzf)    FORMAT=fzf ;;
+    --no-git) WITH_GIT=false ;;
+    -*) print -u2 "wts-status: unknown option '$1' (--json|--table|--fzf|--no-git)"; exit 2 ;;
+    *)  ONLY+=("$1") ;;
+  esac
+  shift
+done
 
 if ! command -v jq >/dev/null 2>&1; then
   print -u2 "wts-status: jq is required"
@@ -88,13 +105,18 @@ mkdir -p "$PANEHASH_DIR" 2>/dev/null
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
+# The three helpers below memoize per repository. They hand their result back
+# in REPLY rather than on stdout: called as `$(detect_base …)`, the memo was
+# written in the command substitution's subshell and lost, so `branch --merged`
+# (0.15 s warm, 0.7 s cold over 3000 refs) ran once per session instead of
+# once per pass, a third of the tick on a large repository.
 typeset -A base_cache base_ref_cache merged_cache
 
-# Base branch of a repository (same priority order as `wts`).
+# Base branch of a repository (same priority order as `wts`). -> REPLY
 detect_base() {
   local root="$1" head_ref candidate
-  if [[ -n "${base_cache[$root]:-}" ]]; then
-    print -r -- "${base_cache[$root]}"
+  if (( ${+base_cache[$root]} )); then
+    REPLY="${base_cache[$root]}"
     return
   fi
   local base="${WTS_BASE_BRANCH:-}"
@@ -111,7 +133,7 @@ detect_base() {
     fi
   fi
   base_cache[$root]="$base"
-  print -r -- "$base"
+  REPLY="$base"
 }
 
 # What git is actually asked about: origin/<base> when it exists, otherwise the
@@ -129,28 +151,28 @@ detect_base() {
 # show-ref on refs/remotes/origin/$base also covers WTS_BASE_BRANCH=origin/main,
 # which wts-fresh exports: refs/remotes/origin/origin/main does not exist, so the
 # ref is left alone instead of being prefixed twice.
-base_ref_for() {
+base_ref_for() { # -> REPLY
   local root="$1" base="$2"
   local key="$root::$base"
-  if [[ -z "${base_ref_cache[$key]:-}" ]]; then
+  if (( ! ${+base_ref_cache[$key]} )); then
     base_ref_cache[$key]="$base"
     if [[ -n "$base" ]] \
        && git -C "$root" show-ref --verify --quiet "refs/remotes/origin/$base"; then
       base_ref_cache[$key]="origin/$base"
     fi
   fi
-  print -r -- "${base_ref_cache[$key]}"
+  REPLY="${base_ref_cache[$key]}"
 }
 
-# Branches merged into the base, cached per repository.
+# Branches merged into the base, one per line, cached per repository. -> REPLY
 merged_branches() {
   local root="$1" base="$2"
   local key="$root::$base"
-  if [[ -z "${merged_cache[$key]:-}" ]]; then
+  if (( ! ${+merged_cache[$key]} )); then
     merged_cache[$key]=$'\n'$(git -C "$root" branch --merged "$base" \
       --format '%(refname:short)' 2>/dev/null)$'\n'
   fi
-  print -r -- "${merged_cache[$key]}"
+  REPLY="${merged_cache[$key]}"
 }
 
 # ─── Main pass ───────────────────────────────────────────────────────────────
@@ -162,6 +184,7 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
       && IFS= read -r worktree && IFS= read -r branch && IFS= read -r subdir \
       && IFS= read -r context && IFS= read -r created_at; do
   [[ -n "$name" ]] || continue
+  [[ -n "$first_root" ]] || first_root="$repo_root"
 
   # --- tmux -----------------------------------------------------------------
   local_alive=false
@@ -174,9 +197,11 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
   base=""; base_ref=""
   if [[ -d "$worktree" ]]; then
     exists=true
+  fi
+  if $exists && $WITH_GIT; then
     dirty=$(git -C "$worktree" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
-    base=$(detect_base "$repo_root")
-    base_ref=$(base_ref_for "$repo_root" "$base")
+    detect_base "$repo_root"; base="$REPLY"
+    base_ref_for "$repo_root" "$base"; base_ref="$REPLY"
     if [[ -n "$base_ref" ]] && git -C "$worktree" rev-parse --verify --quiet "$base_ref" >/dev/null 2>&1; then
       counts=$(git -C "$worktree" rev-list --left-right --count "$base_ref...HEAD" 2>/dev/null)
       if [[ -n "$counts" ]]; then
@@ -186,28 +211,34 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
       shortstat=$(git -C "$worktree" diff --shortstat "$base_ref...HEAD" 2>/dev/null)
       [[ "$shortstat" =~ '([0-9]+) insertion' ]] && added="${match[1]}"
       [[ "$shortstat" =~ '([0-9]+) deletion' ]] && removed="${match[1]}"
-      if print -r -- "$(merged_branches "$repo_root" "$base_ref")" \
-         | grep -qxF -- "$branch" 2>/dev/null; then
-        merged=true
-      fi
+      merged_branches "$repo_root" "$base_ref"
+      [[ "$REPLY" == *$'\n'"$branch"$'\n'* ]] && merged=true
     fi
   fi
 
   # --- Claude agent ---------------------------------------------------------
   # Join on cwd INSIDE the worktree (not equal): WTS_SUBDIR starts the panes in
-  # a subdirectory of the worktree.
-  agent=$(print -r -- "$agents_json" | jq -c --arg wt "$worktree" \
-    'map(select(.cwd == $wt or (.cwd | startswith($wt + "/")))) | first // null' 2>/dev/null)
-  [[ -n "$agent" ]] || agent=null
-
+  # a subdirectory of the worktree. One jq for every field of the record: with
+  # one per field this loop spawned ten per session, a fifth of a second at
+  # eight sessions and growing with them.
   agent_state=null; agent_waiting=null; agent_name=null
   agent_session=null; agent_pane=null; stale=false
+  raw=""; sid=""
 
-  if [[ "$agent" != "null" ]]; then
-    raw=$(print -r -- "$agent" | jq -r '(.state // .status // "") | ascii_downcase')
-    agent_waiting=$(print -r -- "$agent" | jq -c '.waitingFor // null')
-    agent_name=$(print -r -- "$agent" | jq -c '.name // null')
-    agent_session=$(print -r -- "$agent" | jq -c '.sessionId // null')
+  IFS=$'\x1f' read -r raw agent_waiting agent_name agent_session sid < <(
+    print -r -- "$agents_json" | jq -r --arg wt "$worktree" '
+      map(select(.cwd == $wt or (.cwd | startswith($wt + "/")))) | first
+      | if . == null then empty else
+          [ ((.state // .status // "") | ascii_downcase),
+            (.waitingFor // null | tojson),
+            (.name // null | tojson),
+            (.sessionId // null | tojson),
+            (.sessionId // "") ]
+          | join("\u001f") end' 2>/dev/null)
+  agent_waiting=${agent_waiting:-null}; agent_name=${agent_name:-null}
+  agent_session=${agent_session:-null}
+
+  if [[ -n "$raw" || "$agent_session" != "null" ]]; then
 
     # `state` (background) and `status` (interactive) mapped to one vocabulary.
     # Interactive sessions report `status: waiting` while a question or a permission
@@ -223,7 +254,6 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
       *)              agent_state=$(jq -nc --arg s "$raw" '$s') ;;
     esac
 
-    sid=$(print -r -- "$agent" | jq -r '.sessionId // empty')
     if [[ -n "$sid" ]]; then
       pane_ref=$(print -r -- "$sessions_map" | jq -r --arg s "$sid" '.[$s].tmux // empty')
       if [[ -n "$pane_ref" ]]; then
@@ -271,10 +301,12 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
       agent_name:$agent_name, agent_session:$agent_session,
       agent_pane:$agent_pane, stale:$stale}')")
 
-done < <(jq -r 'to_entries | sort_by(.key)[]
+done < <(jq -r '$ARGS.positional as $only
+  | to_entries | sort_by(.key)[]
+  | select(($only | length) == 0 or (.key | IN($only[])))
   | [.key, (.value.profile // "-"), (.value.repo_root // ""),
      (.value.worktree // ""), (.value.branch // "-"), (.value.subdir // ""),
-     (.value.context // ""), (.value.created_at // "")] | .[]' "$WTS_STATE_FILE")
+     (.value.context // ""), (.value.created_at // "")] | .[]' "$WTS_STATE_FILE" --args "${ONLY[@]}")
 
 # Empty registry: only --json has a representation ("[]"); the presentation
 # formats must emit nothing, otherwise they pollute the caller's list.
@@ -311,30 +343,43 @@ SUBJECT='def subject: [.agent_name, .prompt, .context]
   | gsub("[\\t\\n\\r]"; " ")
   | if length > 50 then .[0:49] + "…" else . end;'
 
+# --no-git: the git columns read "-" (unknown), never "+0/-0 clean" (a claim).
 case "$FORMAT" in
   json)  print -r -- "$all" ;;
   # fzf: a dead tmux session reads "stopped" whatever the agent record says. The
   # row is about the session, and `claude agents` can still list a record whose
   # cwd is that worktree, which would show a ghost "working". --json keeps the
   # raw facts.
-  fzf)   print -r -- "$all" | jq -r "$SUBJECT"'.[]
+  fzf)   print -r -- "$all" | jq -r --argjson git "$WITH_GIT" "$SUBJECT"'.[]
            | [ .name,
                (if (.tmux_alive | not) then "stopped"
                 elif .stale then "stuck?" else (.agent_state // "-") end),
                .branch,
-               ("+\(.added)/-\(.removed)" + (if .ahead > 0 then " ^\(.ahead)" else "" end)),
-               (if .dirty > 0 then "dirty" else "clean" end),
+               (if $git then "+\(.added)/-\(.removed)" + (if .ahead > 0 then " ^\(.ahead)" else "" end) else "-" end),
+               (if ($git | not) then "-" elif .dirty > 0 then "dirty" else "clean" end),
                (.agent_pane // ""),
                subject ]
            | join("")' ;;
-  table) print -r -- "$all" | jq -r "$SUBJECT"'
+  table) print -r -- "$all" | jq -r --argjson git "$WITH_GIT" "$SUBJECT"'
            (["SESSION","AGENT","BRANCH","DELTA","DIRTY","TMUX","SUBJECT"] | @tsv),
            (.[] | [ .name,
                     (if .stale then "stuck?" else (.agent_state // "-") end),
                     .branch,
-                    ("+\(.added)/-\(.removed)" + (if .ahead > 0 then " ^\(.ahead)" else "" end)),
-                    (if .dirty > 0 then "yes" else "no" end),
+                    (if $git then "+\(.added)/-\(.removed)" + (if .ahead > 0 then " ^\(.ahead)" else "" end) else "-" end),
+                    (if ($git | not) then "-" elif .dirty > 0 then "yes" else "no" end),
                     (if .tmux_alive then "running" else "stopped" end),
                     (subject | if . == "" then "-" else . end) ] | @tsv)' \
          | column -t -s $'\t' ;;
 esac
+
+# A slow pass is almost always `git status` walking large worktrees without
+# fsmonitor: 0.5 s against 0.04 s per 150k-file worktree, measured in
+# docs/big-repo-analysis.md. Say so on stderr, only to a human, and only while
+# the repository has not enabled it.
+if [[ "$FORMAT" == table && -t 2 && -n "$first_root" ]] && $WITH_GIT; then
+  pass_s=$(( EPOCHREALTIME - PASS_T0 ))
+  if (( pass_s > 3 )) \
+     && [[ "$(git -C "$first_root" config --get core.fsmonitor 2>/dev/null)" != true ]]; then
+    print -u2 -r -- "→ ${pass_s%%.*} s collecting: \`wts setup git\` shows two git settings that make this ~10x faster"
+  fi
+fi

@@ -18,6 +18,8 @@ share/wts/layouts/         built-in layouts (default.yml)
 examples/layouts/          richer layouts, not installed as built-ins
 completions/_wts           zsh completion
 test/smoke.zsh             end-to-end test in a sandbox
+test/bench-big.zsh         speed on a generated large repository (make bench)
+docs/big-repo-analysis.md  what that bench found, and the fixes it suggests
 docs/demo/                record.zsh + demo.tape: the README GIF (make demo)
 ```
 
@@ -47,7 +49,15 @@ straight from the checkout. Scripts locate each other from their own path
   expansion and fails with "name not found". The `=` itself is required: without
   it tmux accepts a prefix and `fix-login` matches `fix-login-2`. With a format,
   add the colon: `display-message -p -t "=$name" '#{pane_width}'` prints an
-  empty string and exits 0; `-t "=$name:"` prints the width.
+  empty string and exits 0; `-t "=$name:"` prints the width. Same colon for
+  `send-keys` and `capture-pane` on a server started with `-f /dev/null`:
+  `-t "=$name"` fails with "can't find pane", `-t "=$name:"` works.
+- `tmux new-session -e PATH=…` does not reach the pane: tmux rebuilds PATH
+  for a new pane (other variables pass). To put a shim directory first, export
+  it from a wrapper script that is the pane's command.
+- A layout pane that runs `claude` runs the **real** Claude Code even inside a
+  sandbox whose PATH starts with a stub: the pane's login shell rebuilds PATH.
+  Sandbox layouts must name the stub by absolute path (`test/bench-big.zsh`).
 - Field separator `\x1f`, not TAB: TAB is IFS whitespace, so `read` merges
   consecutive delimiters and shifts empty fields.
 - Globs that may match nothing need `(N)`, or zsh prints "no matches found".
@@ -69,6 +79,8 @@ straight from the checkout. Scripts locate each other from their own path
 make lint    # zsh -n on every script
 make test    # lint + test/smoke.zsh: throwaway repo, private tmux server
              # (TMUX_TMPDIR), private XDG dirs, stand-in `claude`, no model call
+make bench   # test/bench-big.zsh: same sandbox, a generated 150k-file repository,
+             # timings and process counts per command (TIER=small for a minute)
 ```
 
 Run it before every push; CI runs the same on `macos-latest`. To try the tmux

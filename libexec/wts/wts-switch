@@ -130,8 +130,13 @@ unregistered() { # <names already listed, one per line>
   done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
 }
 
+# build_list [--no-git]: the collected list. --no-git is the switcher's first
+# fill: agent states in a few tens of ms, the git columns as "-" until the
+# poller's first full pass.
 build_list() {
   local known=""
+  local -a extra
+  extra=("$@")
   current=$(tmux display-message -p '#S' 2>/dev/null)
 
   if [[ -x "$WTS_BIN/wts-status" ]] && command -v jq >/dev/null 2>&1; then
@@ -140,7 +145,7 @@ build_list() {
       [[ -n "$name" ]] || continue
       known+="$name"$'\n'
       add_row "$name" "$agent" "$branch" "$delta" "${subject:-}" "${pane:-$name}"
-    done < <("$WTS_BIN/wts-status" --fzf 2>/dev/null)
+    done < <("$WTS_BIN/wts-status" --fzf "${extra[@]}" 2>/dev/null)
   fi
 
   unregistered "$known"
@@ -494,8 +499,23 @@ kill_session() { # $1 = session name, $2 = display line (its 2nd word is AGENT)
 }
 
 # Exposes the function to the subshell fzf starts for `reload`.
+#
+# A full pass leaves its pid in WTS_SWITCH_BUSY while it runs and its duration
+# in WTS_SWITCH_LAST when it ends: the poller reads both. Without them, a pass
+# longer than the refresh interval was replaced by the next tick before it
+# finished, and on a large repository (12 s per pass at 8 sessions, measured
+# in docs/big-repo-analysis.md) the columns never filled at all.
 if [[ "${1:-}" == "--list" ]]; then
-  build_list
+  if [[ -n "${WTS_SWITCH_BUSY:-}" && "${2:-}" != "--no-git" ]]; then
+    zmodload zsh/datetime 2>/dev/null
+    print -r -- $$ > "$WTS_SWITCH_BUSY"
+    t0=${EPOCHREALTIME:-0}
+    build_list "${@:2}"
+    print -r -- $(( ${EPOCHREALTIME:-0} - t0 )) > "$WTS_SWITCH_LAST"
+    rm -f "$WTS_SWITCH_BUSY"
+  else
+    build_list "${@:2}"
+  fi
   exit 0
 fi
 
@@ -549,7 +569,9 @@ if [[ "${1:-}" == "--next" ]]; then
   current=$(tmux display-message -p '#S' 2>/dev/null)
   # Actionable = stuck, blocked, failed, or turn finished and waiting for input.
   # The current session is skipped so that repeated calls cycle through them.
-  target=$("$WTS_BIN/wts-status" --json 2>/dev/null | jq -r --arg cur "$current" '
+  # --no-git: this only reads agent states and tmux liveness, and the git
+  # columns cost seconds on a large repository.
+  target=$("$WTS_BIN/wts-status" --json --no-git 2>/dev/null | jq -r --arg cur "$current" '
     [ .[]
       | select(.tmux_alive)
       | select(.stale or (.agent_state | IN("blocked","failed","idle")))
@@ -607,13 +629,33 @@ export WTS_SWITCH_COLS=$(( cols - preview_cols - 6 ))
 # immediately and the popup would close without a word. On an older fzf we
 # collect up front, exactly as before. 0.36 is where `reload-sync` appeared;
 # `load` (0.22) and `unbind` (0.24) are older.
+#
+# Decided here because the first fill depends on it: with a poller, the `load`
+# pass is `--no-git` (agent states in tens of milliseconds, git columns "-")
+# and the poller's first tick brings the full list; without one, the `load`
+# pass has to be the full list, since nothing else will ever replace it.
+#
+# sun_path is capped at 104 bytes on macOS. A path that is too long makes the
+# bind fail, fzf exits at once and the popup closes without a word: we would
+# rather knowingly fall back to the static list.
+REFRESH="${WTS_SWITCH_REFRESH:-2}"
+sock=""
+if [[ "$REFRESH" == <-> ]] && (( REFRESH > 0 )) && command -v curl >/dev/null 2>&1; then
+  candidate="${TMPDIR:-/tmp}/wts-switch.$$.sock"
+  (( ${#candidate} <= 100 )) && sock="$candidate"
+fi
+
 typeset -a fast_opts
 fast_opts=()
 fzf_version=$(fzf --version 2>/dev/null | cut -d' ' -f1)
 autoload -Uz is-at-least
 if [[ -n "$fzf_version" ]] && is-at-least 0.36 "$fzf_version"; then
   list=$(build_skeleton)
-  fast_opts=(--bind="load:unbind(load)+reload-sync('$self' --list)")
+  if [[ -n "$sock" ]]; then
+    fast_opts=(--bind="load:unbind(load)+reload-sync('$self' --list --no-git)")
+  else
+    fast_opts=(--bind="load:unbind(load)+reload-sync('$self' --list)")
+  fi
 else
   list=$(build_list)
 fi
@@ -648,6 +690,9 @@ fi
 # --preview and by the binds land on this popup's file.
 export WTS_SWITCH_SCROLL="${TMPDIR:-/tmp}/wts-switch.$$.scroll"
 export WTS_SWITCH_REPLY="${TMPDIR:-/tmp}/wts-switch.$$.reply"
+# Written by `--list` (see there), read by the poller below.
+export WTS_SWITCH_BUSY="${TMPDIR:-/tmp}/wts-switch.$$.busy"
+export WTS_SWITCH_LAST="${TMPDIR:-/tmp}/wts-switch.$$.last"
 rm -f "$WTS_SWITCH_REPLY"
 
 # The footer needs --footer (fzf 0.65) and `transform` (0.45, so `?` can leave
@@ -693,22 +738,13 @@ fi
 # Caveat: the cursor is kept by INDEX, not by name. If the urgency sort
 # reorders the list under the user's feet, the selected line changes session.
 # That is the price of a list that is both sorted AND live.
-REFRESH="${WTS_SWITCH_REFRESH:-2}"
-sock=""
 poll_pid=""
-
-# sun_path is capped at 104 bytes on macOS. A path that is too long makes the
-# bind fail, fzf exits at once and the popup closes without a word: we would
-# rather knowingly fall back to the static list.
-if [[ "$REFRESH" == <-> ]] && (( REFRESH > 0 )) && command -v curl >/dev/null 2>&1; then
-  candidate="${TMPDIR:-/tmp}/wts-switch.$$.sock"
-  (( ${#candidate} <= 100 )) && sock="$candidate"
-fi
 
 cleanup() {
   [[ -n "$poll_pid" ]] && kill "$poll_pid" 2>/dev/null
   [[ -n "$sock" ]] && rm -f "$sock"
-  rm -f "$WTS_SWITCH_SCROLL" "$WTS_SWITCH_REPLY" ${WTS_SWITCH_HELP:+"$WTS_SWITCH_HELP"}
+  rm -f "$WTS_SWITCH_SCROLL" "$WTS_SWITCH_REPLY" "$WTS_SWITCH_BUSY" "$WTS_SWITCH_LAST" \
+    ${WTS_SWITCH_HELP:+"$WTS_SWITCH_HELP"}
 }
 trap cleanup EXIT INT TERM
 
@@ -723,13 +759,31 @@ if [[ -n "$sock" ]]; then
   # makes it exit on its own as soon as the socket stops answering (fzf
   # closed). Killing the subshell does not necessarily kill the running
   # `sleep`, hence the second one.
+  #
+  # Never replace a pass in flight: fzf drops the running reload when the next
+  # one arrives, so on a repository where a pass outlasts the interval the list
+  # never filled. While `--list` is running (its pid in WTS_SWITCH_BUSY, alive)
+  # only the preview is refreshed; and the next reload is scheduled no sooner
+  # than the last pass took (WTS_SWITCH_LAST), so a 12-second pass is followed
+  # by 12 seconds of quiet rather than by another 12-second pass.
   {
     n=0
     while [[ ! -S "$sock" ]] && (( n < 100 )); do sleep 0.1; (( n++ )); done
+    delay="$REFRESH"
     while [[ -S "$sock" ]]; do
-      sleep "$REFRESH"
+      sleep "$delay"
+      if [[ -s "$WTS_SWITCH_BUSY" ]] && kill -0 "$(<"$WTS_SWITCH_BUSY")" 2>/dev/null; then
+        curl -s -m 2 --unix-socket "$sock" -XPOST http://localhost/ \
+          -d "refresh-preview" >/dev/null 2>&1 || break
+        continue
+      fi
       curl -s -m 2 --unix-socket "$sock" -XPOST http://localhost/ \
         -d "reload-sync(\"$self\" --list)+refresh-preview" >/dev/null 2>&1 || break
+      delay="$REFRESH"
+      if [[ -s "$WTS_SWITCH_LAST" ]]; then
+        last=$(<"$WTS_SWITCH_LAST")
+        [[ "$last" == <->(.<->|) ]] && (( last > REFRESH )) && delay=$(printf '%.1f' "$last")
+      fi
     done
   } &
   poll_pid=$!

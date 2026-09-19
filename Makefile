@@ -9,7 +9,7 @@ HELPERS  = $(wildcard libexec/wts/wts-*)
 LAYOUTS  = $(wildcard share/wts/layouts/*.yml)
 EXAMPLES = $(wildcard examples/layouts/*.yml)
 
-.PHONY: install uninstall lint test demo
+.PHONY: install uninstall lint test bench demo
 
 install:
 	install -d "$(BINDIR)" "$(LIBEXECDIR)" "$(SHAREDIR)/layouts" "$(SHAREDIR)/examples/layouts" "$(ZSHCOMPDIR)"
@@ -24,11 +24,14 @@ uninstall:
 	rm -rf "$(LIBEXECDIR)" "$(SHAREDIR)"
 
 lint:
-	@for f in bin/wts $(HELPERS) completions/_wts; do zsh -n "$$f" || exit 1; done
+	@for f in bin/wts $(HELPERS) completions/_wts test/smoke.zsh test/bench-big.zsh; do zsh -n "$$f" || exit 1; done
 	@echo "zsh -n: ok"
 
 test: lint
 	zsh test/smoke.zsh
+
+bench:
+	zsh test/bench-big.zsh --tier $(or $(TIER),large)
 
 demo:
 	zsh docs/demo/record.zsh
