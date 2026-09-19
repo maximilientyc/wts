@@ -42,14 +42,72 @@ typeset -g current=""
 # Each line: <display> TAB <preview-target> TAB <session-name>
 # fzf only shows field 1; fields 2 and 3 drive the preview and the switch.
 #
-# One printf for every producer: the skeleton below and the collected list must
-# line up column for column, and with --header, or the swap would redraw every
-# row shifted.
-render_line() { # <name> <agent> <branch> <delta> <subject> <preview-target>
-  local mark=""
-  [[ "$1" == "$current" ]] && mark=" *"
-  printf '%-22s %-10s %-30s %-14s %s%s\t%s\t%s\n' \
-    "$1" "$2" "$3" "$4" "${5:-}" "$mark" "$6" "$1"
+# The producers collect rows with add_row and `emit` lays the table out in one
+# go, every line exactly as wide as the list. The widths come from the rows
+# themselves, so the skeleton below and the collected list — same registry, same
+# tmux server — compute the same widths and the swap redraws nothing shifted.
+# The header is the first line of the output (--header-lines=1) rather than a
+# --header fixed at startup, so it is laid out again with the rows when a session
+# appears or is deleted under the popup.
+typeset -ga rows
+rows=()
+SEP=$'\x1f'
+
+add_row() { # <name> <agent> <branch> <delta> <subject> <preview-target>
+  rows+=("$1$SEP$2$SEP$3$SEP$4$SEP${5:-}$SEP$6")
+}
+
+# Cut to <width> characters, the last one an ellipsis, into REPLY. zsh counts
+# characters, not bytes, so `…` and accents pad like any other letter.
+fit() { # <text> <width>
+  REPLY="$1"
+  (( ${#REPLY} > $2 )) && REPLY="${REPLY[1,$2-1]}…"
+}
+
+# The agent states, and "+123/-45 ^2".
+AGENT_W=7
+DELTA_W=10
+
+emit() {
+  (( ${#rows} )) || return 0
+  local width="${WTS_SWITCH_COLS:-120}"
+  # Four single-space gaps between five columns.
+  local rest=$(( width - AGENT_W - DELTA_W - 4 ))
+  (( rest < 24 )) && rest=24
+
+  # Like `column -t`, but capped: a 60-character slug must not eat the subject.
+  # The current session's `*` counts as part of its name.
+  local -a f
+  local raw mark name_w=7 branch_w=6
+  for raw in "${rows[@]}"; do
+    f=("${(@ps:\x1f:)raw}")
+    mark=""; [[ "$f[1]" == "$current" ]] && mark="*"
+    (( ${#f[1]} + ${#mark} > name_w )) && name_w=$(( ${#f[1]} + ${#mark} ))
+    (( ${#f[3]} > branch_w )) && branch_w=${#f[3]}
+  done
+  local cap=$(( rest * 45 / 100 ))
+  (( cap < 12 )) && cap=12
+  (( name_w > cap )) && name_w=$cap
+  cap=$(( rest * 35 / 100 ))
+  (( cap < 8 )) && cap=8
+  (( branch_w > cap )) && branch_w=$cap
+  local subject_w=$(( rest - name_w - branch_w ))
+
+  # The header first, with an empty field 6 so that it has 3 TAB fields too. The
+  # `*` is appended after the cut, so a name too long for its column keeps it.
+  local name agent branch delta subject
+  for raw in "SESSION${SEP}AGENT${SEP}BRANCH${SEP}DELTA${SEP}SUBJECT${SEP}" "${rows[@]}"; do
+    f=("${(@ps:\x1f:)raw}")
+    mark=""; [[ -n "$f[6]" && "$f[1]" == "$current" ]] && mark="*"
+    fit "$f[1]" $(( name_w - ${#mark} )); name="$REPLY$mark"
+    fit "$f[2]" $AGENT_W;    agent=$REPLY
+    fit "$f[3]" $branch_w;   branch=$REPLY
+    fit "$f[4]" $DELTA_W;    delta=$REPLY
+    fit "$f[5]" $subject_w;  subject=$REPLY
+    printf '%-*s %-*s %-*s %-*s %-*s\t%s\t%s\n' \
+      $name_w "$name" $AGENT_W "$agent" $branch_w "$branch" \
+      $DELTA_W "$delta" $subject_w "$subject" "$f[6]" "${f[6]:+$f[1]}"
+  done
 }
 
 # tmux sessions missing from the registry (numbered sessions, other projects...).
@@ -58,7 +116,7 @@ unregistered() { # <names already listed, one per line>
   while IFS= read -r s; do
     [[ -n "$s" ]] || continue
     print -r -- "$1" | grep -qxF -- "$s" && continue
-    render_line "$s" "-" "-" "" "(not in registry)" "$s"
+    add_row "$s" "-" "-" "" "(not in registry)" "$s"
   done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
 }
 
@@ -71,11 +129,12 @@ build_list() {
     while IFS=$'\x1f' read -r name agent branch delta dirty pane subject; do
       [[ -n "$name" ]] || continue
       known+="$name"$'\n'
-      render_line "$name" "$agent" "$branch" "$delta" "${subject:-}" "${pane:-$name}"
+      add_row "$name" "$agent" "$branch" "$delta" "${subject:-}" "${pane:-$name}"
     done < <("$WTS_BIN/wts-status" --fzf 2>/dev/null)
   fi
 
   unregistered "$known"
+  emit
 }
 
 # The skeleton: registry and tmux only, no git and no claude call, so it costs
@@ -100,7 +159,7 @@ build_skeleton() {
     while IFS=$'\x1f' read -r name branch subject; do
       [[ -n "$name" ]] || continue
       known+="$name"$'\n'
-      render_line "$name" "-" "${branch:--}" "-" "$subject" "$name"
+      add_row "$name" "-" "${branch:--}" "-" "$subject" "$name"
     done < <(jq -r 'to_entries | sort_by(.key)[]
       | [ .key,
           (.value.branch // "-"),
@@ -112,6 +171,7 @@ build_skeleton() {
   fi
 
   unregistered "$known"
+  emit
 }
 
 # ─── Preview and scroll ──────────────────────────────────────────────────────
@@ -192,7 +252,8 @@ if [[ "${1:-}" == "--list" ]]; then
 fi
 
 # Not used by fzf — the skeleton is passed on stdin — but the smoke test needs to
-# compare the two lists, and it is the quickest way to eyeball the alignment.
+# compare the two lists, and it is the quickest way to eyeball the alignment
+# (WTS_SWITCH_COLS=55 wts-switch --list-fast | cut -f1).
 if [[ "${1:-}" == "--list-fast" ]]; then
   build_skeleton
   exit 0
@@ -235,6 +296,24 @@ if [[ "${1:-}" == "--next" ]]; then
 fi
 
 self="$WTS_BIN/wts-switch"
+
+# The table is laid out for the list's real width: the popup's columns, minus
+# the preview and the 3 columns fzf adds to it (border-left, padding, scrollbar),
+# minus fzf's pointer and marker gutter (2) and the list's scrollbar (1) —
+# measured on fzf 0.74 with a 140-column popup: 64 for a 70-column preview. The
+# preview gets an absolute size so that width is exact rather than a guess at
+# fzf's percentage rounding. Should another fzf lay the panes out a column or two
+# differently, every row is the same length and --ellipsis cuts them all at the
+# same place, so the columns stay aligned and only the subject loses a little.
+# Exported like WTS_SWITCH_SCROLL: the reload children write to a pipe and
+# cannot ask the terminal, and they must use the same number as the skeleton or
+# the swap would redraw every row shifted. /dev/tty rather than stdout: inside
+# `display-popup -E` it is the popup's pty.
+cols=$(stty size </dev/tty 2>/dev/null | cut -d' ' -f2)
+{ [[ "$cols" == <-> ]] && (( cols > 0 )); } || cols="${COLUMNS:-0}"
+(( cols > 0 )) || cols=120
+preview_cols=$(( cols / 2 ))
+export WTS_SWITCH_COLS=$(( cols - preview_cols - 6 ))
 
 # Start from the skeleton and let fzf pull the collected list itself, so the popup
 # is interactive at once instead of after a full collection pass.
@@ -348,9 +427,10 @@ selection=$(print -r -- "$list" | fzf \
   --delimiter=$'\t' \
   --with-nth=1 \
   --prompt='session> ' \
-  --header="$(printf '%-22s %-10s %-30s %-14s %s' SESSION AGENT BRANCH DELTA SUBJECT)" \
+  --header-lines=1 \
+  --ellipsis='…' \
   --preview="'$self' --preview {2}" \
-  --preview-window='right,60%,border-left' \
+  --preview-window="right,${preview_cols},border-left" \
   --bind="ctrl-r:reload('$self' --list)" \
   "${delete_bind[@]}" \
   --bind="ctrl-f:execute-silent('$self' --scroll {2} down)+refresh-preview" \
