@@ -44,7 +44,9 @@ straight from the checkout. Scripts locate each other from their own path
   paths at top level (`WTS_SELF="${0:A}"`) and use the variable in functions.
 - Quote tmux targets: `-t "=$name"`. Unquoted, `=name` is zsh's `=command`
   expansion and fails with "name not found". The `=` itself is required: without
-  it tmux accepts a prefix and `fix-login` matches `fix-login-2`.
+  it tmux accepts a prefix and `fix-login` matches `fix-login-2`. With a format,
+  add the colon: `display-message -p -t "=$name" '#{pane_width}'` prints an
+  empty string and exits 0; `-t "=$name:"` prints the width.
 - Field separator `\x1f`, not TAB: TAB is IFS whitespace, so `read` merges
   consecutive delimiters and shifts empty fields.
 - Globs that may match nothing need `(N)`, or zsh prints "no matches found".

@@ -254,6 +254,15 @@ be undone within two seconds. At rest the preview follows the end of the pane;
 Moving to another session returns to live. Trade-off: `ctrl-f` / `ctrl-b` no longer
 move the cursor in the query — the arrow keys do.
 
+The preview window is **as wide as the agent's pane**, up to the right half it
+starts with. The preview is a raw `capture-pane`, text at the pane's width: with
+the editor as the main pane, a 56-column agent pane drawn in a 110-column window
+left half of it blank while the list was squeezed to 76 columns and lost the
+subject. The width follows the highlighted session (`focus` → `transform` →
+`change-preview-window`, fzf 0.46 or newer; older versions keep the half-width
+window). The list is laid out for the other half, so a wider pane is truncated on
+the right rather than pushed into the list.
+
 `prefix+a` jumps straight to the next agent that needs you (`stuck?`, `blocked`,
 `failed`, `idle`), without a popup; pressing it again cycles through them.
 

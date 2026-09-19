@@ -173,6 +173,21 @@ check "the switcher swaps the skeleton on load, not on start" \
 check "fzf accepts that bind" \
   eval 'printf "x\n" | fzf --bind="load:unbind(load)+reload-sync(true)" --filter=x'
 
+# The preview is a raw capture at the pane's width: the window is fitted to it on
+# focus, up to the half of the popup the list is laid out against, or a narrow
+# agent pane leaves half of the window blank while the list is squeezed. --fit prints the action, fzf runs it.
+check "fzf accepts the fit bind" \
+  eval 'printf "x\n" | fzf --bind="focus:transform(true)" --filter=x'
+# `=auth-form:` with the colon: `display-message -p -t "=auth-form"` prints an
+# empty string and exits 0, so the check would fail on a format that never ran.
+pane_width=$(tmux display-message -p -t "=auth-form:" '#{pane_width}')
+check "--fit sizes the preview to the pane" \
+  eval '[[ "$(FZF_COLUMNS=$((pane_width * 4)) "$SWITCH" --fit auth-form)" == "change-preview-window(right,$pane_width,border-left)" ]]'
+check "--fit caps the preview at half the popup" \
+  eval '[[ "$(FZF_COLUMNS=$pane_width "$SWITCH" --fit auth-form)" == "change-preview-window(right,$((pane_width / 2)),border-left)" ]]'
+check "--fit stays quiet for an unknown target" \
+  eval '[[ -z "$(FZF_COLUMNS=200 "$SWITCH" --fit no-such-session)" ]]'
+
 # ─── No collector may take a worktree's index.lock ───────────────────────────
 # `git status` creates <gitdir>/index.lock before it scans and only releases it
 # after writing the refreshed index back. The collector statuses every registered
