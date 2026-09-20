@@ -1,0 +1,911 @@
+#!/usr/bin/env zsh
+# wts-doc — the library of context documents attached to sessions.
+#
+# Usage: wts-doc add <url|path> [--name <slug>] [--force]
+#        wts-doc ls
+#        wts-doc show [<slug>]
+#        wts-doc sync [<slug>...] [--force]
+#        wts-doc rm <slug>
+#        wts-doc use <slug> <session> [<worktree>]
+#        wts-doc tools [--refresh]
+#        wts-doc pick                                      (internal, fzf)
+#        wts-doc resolve <slug|url|path>                   (internal, -> slug)
+#        wts-doc materialize <worktree> <workdir> <slug>…  (internal, -> $WTS_DOC)
+#
+# A document is declared once and reused: the same spec no longer has to be
+# pasted into every new agent. Declarations live in a small hand-editable file
+# ($WTS_DOCS_PATH); the fetched content is a cache, in the state directory.
+#
+# A URL is fetched by a headless `claude -p` running with THIS machine's own MCP
+# configuration, and the model picks whatever tool can read it. Nothing about a
+# particular provider is hardcoded on purpose: the same document sits behind a
+# Notion connector on one machine and behind a gateway with entirely different
+# tool names on another. This is why the call deviates from wts-name's isolation
+# on exactly three points — and only these:
+#   no --safe-mode           it disables MCP servers outright, which is the point
+#   no --strict-mcp-config   same reason: the user's servers are what we need
+#   --allowedTools …         mandatory: with no allow rule every tool is denied
+#                            ("requires approval which is not available"), which
+#                            is a clean failure, not a hang
+# A wildcard allow rule is refused by the CLI ("an allow pattern must name the
+# scope it widens"), so the list is built per server, `mcp__<server>__*`, from
+# `claude mcp list` — cached, because that call costs seconds and touches the
+# network. Deny rules do accept wildcards, and deny beats allow: the write-shaped
+# tools of an allowed server are refused explicitly.
+# Everything else is kept from wts-name: cwd outside any worktree (otherwise
+# wts-status joins the call's cwd to a session and shows a phantom agent), the
+# URL on stdin (--allowedTools is variadic and would read a positional URL as a
+# tool name), `perl alarm` for the timeout, and no transcript.
+#
+# When nothing can read the document — no connector, no model, offline — the
+# entry degrades to a POINTER: the session's context file carries the URL and
+# asks the agent to fetch it itself. The agent in the pane has the user's full
+# set of connectors and often succeeds where this sandboxed call could not.
+#
+# Variables: WTS_DOCS_PATH (~/.config/wts/docs.json), WTS_DOC_TTL (86400 s),
+#            WTS_DOC_TIMEOUT (90 s), WTS_DOC_MODEL (sonnet — this call runs once
+#            per document, and its only job is not to paraphrase; latency is the
+#            wrong thing to optimize here), WTS_DOC_TOOLS (pinned allow
+#            patterns), WTS_DOC_TOOLS_TTL (86400 s), WTS_DOC_MAX_BYTES (200000),
+#            WTS_NO_LLM=1 (never fetch a URL: cache only)
+
+set -uo pipefail
+
+WTS_SELF="${0:A}"
+WTS_LIBEXEC="${WTS_SELF:h}"
+
+WTS_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wts"
+CACHE_DIR="$WTS_STATE_DIR/docs"
+DOCS_FILE="${WTS_DOCS_PATH:-${XDG_CONFIG_HOME:-$HOME/.config}/wts/docs.json}"
+TOOLS_CACHE="$CACHE_DIR/tools.json"
+
+MAX_BYTES="${WTS_DOC_MAX_BYTES:-200000}"
+TTL="${WTS_DOC_TTL:-86400}"
+
+command -v jq >/dev/null 2>&1 || { print -u2 -- "wts doc: jq is required"; exit 1 }
+
+warn() { print -u2 -r -- "$@" }
+die()  { print -u2 -r -- "$@"; exit 1 }
+
+# The model is only called on an explicit command, never from a listing.
+llm_available() {
+  [[ -z "${WTS_NO_LLM:-}" ]] && command -v claude >/dev/null 2>&1
+}
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  print -r -- "$s"
+}
+
+now_epoch() { date +%s }
+now_iso()   { date -u +%Y-%m-%dT%H:%M:%SZ }
+
+# `date -r` is NOT portable here: GNU coreutils' date may come first in PATH and
+# its -r takes a FILE, not an epoch — the same trap wts-brief documents for
+# `stat`. zsh's own strftime has no such ambiguity.
+zmodload -F zsh/datetime b:strftime 2>/dev/null
+epoch_iso() {
+  local out
+  TZ=UTC strftime -s out '%Y-%m-%dT%H:%M:%SZ' "$1" 2>/dev/null && print -r -- "$out"
+}
+
+# ─── Library file ────────────────────────────────────────────────────────────
+# Four keys per entry, all of them things a human would type: this file is meant
+# to be edited by hand and kept in a dotfiles repository, so volatile values
+# (size, fetch date) live in the cache instead and never churn it.
+
+docs_init() {
+  mkdir -p "${DOCS_FILE:h}" 2>/dev/null
+  [[ -s "$DOCS_FILE" ]] || print -r -- '{"version": 1, "docs": {}}' > "$DOCS_FILE"
+}
+
+docs_write() {  # stdin: the whole new document
+  local tmp="${DOCS_FILE}.tmp.$$"
+  if cat > "$tmp" && [[ -s "$tmp" ]]; then
+    mv "$tmp" "$DOCS_FILE"
+  else
+    rm -f "$tmp"
+    warn "wts doc: library not updated ($DOCS_FILE)"
+    return 1
+  fi
+}
+
+doc_field() {  # <slug> <field>
+  [[ -s "$DOCS_FILE" ]] || return 1
+  jq -r --arg s "$1" --arg f "$2" '.docs[$s][$f] // ""' "$DOCS_FILE" 2>/dev/null
+}
+
+doc_exists() {
+  [[ -s "$DOCS_FILE" ]] || return 1
+  jq -e --arg s "$1" '.docs | has($s)' "$DOCS_FILE" >/dev/null 2>&1
+}
+
+doc_slugs() {
+  [[ -s "$DOCS_FILE" ]] || return 0
+  jq -r '.docs | keys_unsorted[]' "$DOCS_FILE" 2>/dev/null
+}
+
+doc_put() {  # <slug> <title> <source> <kind>
+  docs_init
+  jq --arg s "$1" --arg t "$2" --arg src "$3" --arg k "$4" --arg now "$(now_iso)" \
+     '.version = (.version // 1)
+      | .docs[$s] = {title: $t, source: $src, kind: $k,
+                     added_at: (.docs[$s].added_at // $now)}' \
+     "$DOCS_FILE" 2>/dev/null | docs_write
+}
+
+doc_set_kind() {  # <slug> <kind>
+  jq --arg s "$1" --arg k "$2" '.docs[$s].kind = $k' "$DOCS_FILE" 2>/dev/null | docs_write
+}
+
+doc_del() {
+  [[ -s "$DOCS_FILE" ]] || return 0
+  jq --arg s "$1" 'del(.docs[$s])' "$DOCS_FILE" 2>/dev/null | docs_write
+}
+
+# ─── Cache ───────────────────────────────────────────────────────────────────
+# One pair of files per document rather than one index: writes are independent,
+# so two wts runs attaching different documents never collide, and a corrupted
+# document cannot take the whole library down.
+
+body_file() { print -r -- "$CACHE_DIR/$1.md" }
+meta_file() { print -r -- "$CACHE_DIR/$1.json" }
+
+meta_field() {  # <slug> <field>
+  local f
+  f=$(meta_file "$1")
+  [[ -s "$f" ]] || return 1
+  jq -r --arg k "$2" '.[$k] // ""' "$f" 2>/dev/null
+}
+
+cache_store() {  # <slug> <title> <truncated> ; body on stdin
+  mkdir -p "$CACHE_DIR" 2>/dev/null
+  chmod 700 "$CACHE_DIR" 2>/dev/null
+  local slug="$1" bt="$2" trunc="$3"
+  local tmp="$CACHE_DIR/.$slug.md.$$" bytes
+  cat > "$tmp" || { rm -f "$tmp"; return 1 }
+  bytes=$(wc -c < "$tmp" | tr -d ' ')
+  mv "$tmp" "$(body_file "$slug")" || { rm -f "$tmp"; return 1 }
+  local mtmp="$CACHE_DIR/.$slug.json.$$"
+  jq -n --argjson at "$(now_epoch)" --argjson b "$bytes" --arg t "$bt" \
+        --argjson trunc "$trunc" \
+        '{fetched_at: $at, bytes: $b, title: $t, ok: true, error: "",
+          truncated: $trunc}' > "$mtmp" 2>/dev/null \
+    && mv "$mtmp" "$(meta_file "$slug")" || rm -f "$mtmp"
+}
+
+cache_mark_failed() {  # <slug> <reason>
+  mkdir -p "$CACHE_DIR" 2>/dev/null
+  local mtmp="$CACHE_DIR/.$1.json.$$"
+  jq -n --argjson at "$(now_epoch)" --arg e "$2" \
+        '{fetched_at: $at, bytes: 0, title: "", ok: false, error: $e,
+          truncated: false}' > "$mtmp" 2>/dev/null \
+    && mv "$mtmp" "$(meta_file "$1")" || rm -f "$mtmp"
+}
+
+cache_del() {
+  rm -f "$(body_file "$1")" "$(meta_file "$1")"
+}
+
+# ─── The allow list ──────────────────────────────────────────────────────────
+
+typeset -ga ALLOW
+ALLOW=()
+
+# `claude mcp list` prints "<name>: <url> [(HTTP)] - <status>". Names contain
+# spaces and colons ("claude.ai Notion", "plugin:slack:slack"), so the anchor is
+# the LAST " - ", never the first colon. Only connected servers: one that needs
+# authentication cannot answer and would only widen the allow list. The tool
+# prefix is the name with every non-alphanumeric character replaced by `_`, the
+# same rule Claude Code uses for its project directories.
+enumerate_servers() {
+  command -v claude >/dev/null 2>&1 || return 1
+  local line head name
+  perl -e 'alarm shift; exec @ARGV' 30 claude mcp list 2>/dev/null | while IFS= read -r line; do
+    [[ "$line" == *" - "*Connected* ]] || continue
+    head="${line% - *}"
+    head="${head% (HTTP)}"
+    name="${head%: *}"
+    [[ -n "$name" ]] || continue
+    print -r -- "mcp__${name//[^a-zA-Z0-9]/_}__*"
+  done
+}
+
+allow_list() {  # fills $ALLOW
+  ALLOW=()
+  # Pinned by hand: the escape hatch for a machine where the enumeration is
+  # noisy or where only one connector should ever be used.
+  if [[ -n "${WTS_DOC_TOOLS:-}" ]]; then
+    ALLOW=(${=WTS_DOC_TOOLS})
+  else
+    local age at
+    if [[ -s "$TOOLS_CACHE" ]]; then
+      at=$(jq -r '.at // 0' "$TOOLS_CACHE" 2>/dev/null) || at=0
+      age=$(( $(now_epoch) - ${at:-0} ))
+      if (( age >= 0 && age < ${WTS_DOC_TOOLS_TTL:-86400} )); then
+        ALLOW=(${(f)"$(jq -r '.patterns[]?' "$TOOLS_CACHE" 2>/dev/null)"})
+      fi
+    fi
+    if (( ${#ALLOW} == 0 )); then
+      ALLOW=(${(f)"$(enumerate_servers)"})
+      ALLOW=("${(@)ALLOW:#}")
+      if (( ${#ALLOW} )); then
+        mkdir -p "$CACHE_DIR" 2>/dev/null
+        local ttmp="$CACHE_DIR/.tools.json.$$"
+        printf '%s\n' "${ALLOW[@]}" | jq -R . | jq -sc --argjson at "$(now_epoch)" \
+          '{at: $at, patterns: .}' > "$ttmp" 2>/dev/null \
+          && mv "$ttmp" "$TOOLS_CACHE" || rm -f "$ttmp"
+      else
+        warn "! no MCP server enumerated: only WebFetch will be tried"
+        warn "  pin the right one with WTS_DOC_TOOLS='mcp__<server>__*'"
+      fi
+    fi
+  fi
+  ALLOW=("${(@)ALLOW:#}")
+  # A public URL must stay reachable even with no connector at all.
+  [[ " ${ALLOW[*]} " == *" WebFetch "* ]] || ALLOW+=(WebFetch)
+}
+
+# ─── Fetching ────────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT="You retrieve one document and return it unchanged.
+The user message is a single URL. Read it with whatever tool you have that can
+reach it (a Notion tool, a gateway tool, WebFetch). Try the most specific tool
+first and WebFetch last.
+Answer with exactly this shape and nothing else:
+TITLE: <the document's title, one line>
+---
+<the document, as markdown>
+Reproduce the document's own words. Do not summarize, do not shorten, do not
+comment, do not add a heading it does not have. Keep its headings, lists,
+tables and code blocks.
+If no tool of yours can read that URL, or every tool refuses, answer exactly one
+line: WTS-FETCH-FAILED: <one short reason>"
+
+fetch_url() {  # <url> -> the raw answer on stdout
+  local url="$1"
+  print -r -- "$url" | (
+    cd "$WTS_STATE_DIR" 2>/dev/null || cd /
+    perl -e 'alarm shift; exec @ARGV' "${WTS_DOC_TIMEOUT:-90}" \
+      claude -p --model "${WTS_DOC_MODEL:-${WTS_MODEL:-sonnet}}" \
+        --no-session-persistence --settings '{"disableAllHooks":true}' \
+        --disable-slash-commands --permission-prompts none \
+        --tools WebFetch \
+        --allowedTools "${ALLOW[@]}" \
+        --disallowedTools Bash Write Edit NotebookEdit \
+          'mcp__*create*' 'mcp__*update*' 'mcp__*delete*' 'mcp__*write*' \
+          'mcp__*send*' 'mcp__*upload*' 'mcp__*move*' 'mcp__*spawn*' \
+        --system-prompt "$SYSTEM_PROMPT"
+  ) 2>/dev/null
+}
+
+typeset -g PARSED_TITLE="" PARSED_BODY="" PARSED_ERROR=""
+
+# Degrade, don't die: a chatty answer that still carries the document is kept,
+# an answer too short to be one is refused.
+parse_answer() {  # <raw>
+  PARSED_TITLE=""; PARSED_BODY=""; PARSED_ERROR=""
+  local raw="$1" first
+  if [[ -z "${raw//[[:space:]]/}" ]]; then
+    PARSED_ERROR="no answer (timeout, or claude unavailable)"
+    return 1
+  fi
+  first="${raw%%$'\n'*}"
+  if [[ "$first" == WTS-FETCH-FAILED:* ]]; then
+    PARSED_ERROR=$(trim "${first#WTS-FETCH-FAILED:}")
+    [[ -n "$PARSED_ERROR" ]] || PARSED_ERROR="no tool could read it"
+    return 1
+  fi
+  if [[ "$first" == TITLE:* ]]; then
+    PARSED_TITLE=$(trim "${first#TITLE:}")
+    PARSED_BODY="${raw#*$'\n'}"
+    PARSED_BODY="${PARSED_BODY#---$'\n'}"
+  else
+    if (( ${#raw} < 200 )); then
+      PARSED_ERROR="answer too short to be the document"
+      return 1
+    fi
+    PARSED_BODY="$raw"
+  fi
+  PARSED_BODY=$(trim "$PARSED_BODY")
+  if [[ -z "${PARSED_BODY//[[:space:]]/}" ]]; then
+    PARSED_ERROR="empty document"
+    return 1
+  fi
+  return 0
+}
+
+# A document larger than the cap would eat the agent's context before it starts.
+# Cut on a line boundary, and say so in the file itself rather than silently.
+cap_body() {  # <source> ; body on stdin, capped body on stdout
+  typeset -g CAP_TRUNCATED=false
+  local tmp="${TMPDIR:-/tmp}/wts-doc-cap.$$" bytes
+  cat > "$tmp"
+  bytes=$(wc -c < "$tmp" | tr -d ' ')
+  if (( bytes > MAX_BYTES )); then
+    CAP_TRUNCATED=true
+    head -c "$MAX_BYTES" "$tmp" | sed '$d'
+    print -r -- ""
+    print -r -- "[... truncated by wts at $MAX_BYTES bytes. Full document: $1 ...]"
+  else
+    cat "$tmp"
+  fi
+  rm -f "$tmp"
+}
+
+# ─── Slugs ───────────────────────────────────────────────────────────────────
+# wts-name owns the kebab/stopword rules; WTS_NO_LLM keeps it local and silent.
+
+slug_from() {  # <text> -> slug
+  local s
+  s=$(WTS_NO_LLM=1 "$WTS_LIBEXEC/wts-name" "$1" 2>/dev/null)
+  [[ -n "$s" ]] || s="doc-$(date +%m%d-%H%M)"
+  print -r -- "$s"
+}
+
+free_slug() {  # <base> -> a slug no document uses yet
+  local base="$1" candidate
+  for candidate in "$base" "$base"-{2..9}; do
+    doc_exists "$candidate" || { print -r -- "$candidate"; return 0 }
+  done
+  return 1
+}
+
+# The last meaningful segment of a URL, for when the model gave no title.
+title_from_url() {
+  local u="${1%%\?*}"
+  u="${u%/}"
+  u="${u##*/}"
+  u="${u//-/ }"
+  u="${u//_/ }"
+  u=$(trim "$u")
+  [[ -n "$u" ]] || u="document"
+  print -r -- "$u"
+}
+
+is_url() { [[ "$1" == (http|https)://* ]] }
+
+# ─── Refreshing ──────────────────────────────────────────────────────────────
+
+typeset -g CAP_TRUNCATED=false
+
+store_body() {  # <slug> <title> <source> ; body on stdin
+  mkdir -p "$CACHE_DIR" 2>/dev/null
+  local tmp="$CACHE_DIR/.in.$$" capped="$CACHE_DIR/.cap.$$"
+  cat > "$tmp"
+  cap_body "$3" < "$tmp" > "$capped"
+  local kept=0
+  # A fetch that comes back a fraction of what is cached is almost always a bad
+  # fetch. Replacing a good spec with a stub is the worst thing this can do.
+  if [[ "${4:-}" != force ]]; then
+    local old new
+    old=$(meta_field "$1" bytes 2>/dev/null) || old=0
+    new=$(wc -c < "$capped" | tr -d ' ')
+    if [[ -n "$old" ]] && (( old > 0 && new * 2 < old )); then
+      warn "! $1: the fetch came back much smaller than the cache, cache kept"
+      warn "  accept it with: wts doc sync $1 --force"
+      kept=1
+    fi
+  fi
+  (( kept )) || cache_store "$1" "$2" "$CAP_TRUNCATED" < "$capped"
+  rm -f "$tmp" "$capped"
+  return 0
+}
+
+refresh_file() {  # <slug> <path> [force]
+  local title
+  if [[ ! -f "$2" ]]; then
+    warn "! $1: $2 is gone"
+    [[ -s "$(body_file "$1")" ]] && return 0
+    return 1
+  fi
+  title=$(grep -m1 '^# ' "$2" 2>/dev/null | sed 's/^#[[:space:]]*//')
+  [[ -n "$title" ]] || title="${2:t:r}"
+  store_body "$1" "$title" "$2" "${3:-}" < "$2"
+  doc_put "$1" "$title" "$2" file
+  return 0
+}
+
+refresh_url() {  # <slug> <url> [force]
+  local raw title
+  if ! llm_available; then
+    [[ -s "$(body_file "$1")" ]] && return 0
+    cache_mark_failed "$1" "no model call (claude unavailable or WTS_NO_LLM=1)"
+    return 1
+  fi
+  allow_list
+  raw=$(fetch_url "$2")
+  if ! parse_answer "$raw"; then
+    warn "! $1: $PARSED_ERROR"
+    # The cache, when there is one, is worth more than the failure.
+    [[ -s "$(body_file "$1")" ]] && return 0
+    cache_mark_failed "$1" "$PARSED_ERROR"
+    return 1
+  fi
+  title="$PARSED_TITLE"
+  [[ -n "$title" ]] || title=$(title_from_url "$2")
+  print -r -- "$PARSED_BODY" | store_body "$1" "$title" "$2" "${3:-}"
+  doc_put "$1" "$title" "$2" url
+  return 0
+}
+
+# 0 when the document has usable content afterwards (fresh or cached).
+refresh_doc() {  # <slug> [force]
+  local slug="$1" force="${2:-}" kind source at age
+  kind=$(doc_field "$slug" kind)
+  source=$(doc_field "$slug" source)
+  [[ -n "$source" ]] || { warn "! $slug: unknown document"; return 1 }
+  case "$kind" in
+    file) refresh_file "$slug" "$source" "$force" ;;
+    *)    refresh_url  "$slug" "$source" "$force" ;;
+  esac
+}
+
+# On attach: a local file is always re-read (it is a `cat`, a TTL would be
+# meaningless), a URL only past its TTL, and a pointer on every attach — there
+# is nothing to lose and a connector may have appeared since.
+ensure_fresh() {  # <slug>
+  local slug="$1" kind at age
+  kind=$(doc_field "$slug" kind)
+  case "$kind" in
+    file) refresh_doc "$slug"; return $? ;;
+    pointer) refresh_doc "$slug" >/dev/null 2>&1; return 0 ;;
+  esac
+  if [[ ! -s "$(body_file "$slug")" ]]; then
+    refresh_doc "$slug" >/dev/null || return 0
+    return 0
+  fi
+  at=$(meta_field "$slug" fetched_at 2>/dev/null) || at=0
+  age=$(( $(now_epoch) - ${at:-0} ))
+  if (( age < 0 || age >= TTL )); then
+    print -u2 -r -- "→ $slug: cache older than $(( TTL / 3600 ))h, refreshing…"
+    refresh_doc "$slug" >/dev/null
+  fi
+  return 0
+}
+
+# ─── Materializing into a worktree ───────────────────────────────────────────
+
+# The path of the context file relative to the pane's working directory: Claude
+# Code resolves an `@` reference from the pane's cwd, and the pane starts in
+# $WTS_WORKDIR, which WTS_SUBDIR can push below the worktree root.
+doc_rel_path() {  # <worktree> <workdir>
+  local wt="${1:A}" wd="${2:A}" rest up="" part
+  if [[ "$wd" == "$wt" || -z "$wd" ]]; then
+    print -r -- ".wts/context.md"
+    return
+  fi
+  if [[ "$wd" != "$wt"/* ]]; then
+    print -r -- "$wt/.wts/context.md"
+    return
+  fi
+  rest="${wd#$wt/}"
+  for part in ${(s:/:)rest}; do up+="../" done
+  print -r -- "${up}.wts/context.md"
+}
+
+materialize() {  # <worktree> <workdir> <slug>…
+  local worktree="$1" workdir="$2"
+  shift 2
+  (( $# )) || return 1
+  [[ -d "$worktree" ]] || { warn "! worktree not found: $worktree"; return 1 }
+
+  local dir="$worktree/.wts"
+  mkdir -p "$dir" 2>/dev/null || return 1
+
+  # Ignored per worktree, by the worktree itself. `*` matches dotfiles too, so
+  # this .gitignore ignores itself and the directory has nothing reportable
+  # left: `git status` stays clean without touching the repository's own
+  # configuration. $GIT_DIR/info/exclude would have been shared by every
+  # worktree and the main checkout, and would have outlived `wts rm`.
+  print -r -- '*' > "$dir/.gitignore" 2>/dev/null
+
+  local tmp="$dir/.context.md.$$" slug title source kind at fetched body
+  local -i budget=$MAX_BYTES bytes
+  {
+    print -r -- "<!-- Generated by wts. Do not edit: this file is rewritten on"
+    print -r -- "     every attach, and editing it does not change the library."
+    print -r -- "     Edit the source document instead, then: wts doc sync -->"
+    print -r -- ""
+    print -r -- "# Context for this session"
+    for slug in "$@"; do
+      doc_exists "$slug" || { warn "! $slug: not in the library, skipped"; continue }
+      title=$(doc_field "$slug" title)
+      source=$(doc_field "$slug" source)
+      kind=$(doc_field "$slug" kind)
+      body=$(body_file "$slug")
+      at=$(meta_field "$slug" fetched_at 2>/dev/null) || at=""
+      # A pointer has a metadata timestamp but no content: saying it was
+      # "fetched" would tell the agent the opposite of the truth.
+      if [[ -s "$body" && -n "$at" && "$at" != 0 ]]; then
+        fetched=$(epoch_iso "$at") || fetched="unknown"
+        [[ -n "$fetched" ]] || fetched="unknown"
+      else
+        fetched="never"
+      fi
+      print -r -- ""
+      print -r -- "## ${title:-$slug}"
+      print -r -- "<!-- wts-doc: $slug -->"
+      print -r -- "- source: $source"
+      print -r -- "- kind: $kind"
+      print -r -- "- fetched: $fetched"
+      print -r -- ""
+      if [[ -s "$body" ]]; then
+        bytes=$(wc -c < "$body" | tr -d ' ')
+        if (( bytes > budget )); then
+          print -r -- "[... omitted by wts: the total context cap of $MAX_BYTES bytes"
+          print -r -- "     was reached. Read it at: $source ...]"
+        else
+          cat "$body"
+          budget=$(( budget - bytes ))
+        fi
+      else
+        print -r -- "wts could not read this document from this machine. Fetch it"
+        print -r -- "yourself with a tool you have, then continue."
+      fi
+      print -r -- ""
+      print -r -- "---"
+    done
+  } > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1 }
+  mv "$tmp" "$dir/context.md" || { rm -f "$tmp"; return 1 }
+
+  doc_rel_path "$worktree" "$workdir"
+}
+
+# ─── Adding ──────────────────────────────────────────────────────────────────
+
+source_slug() {  # <source> -> the slug already pointing at it, if any
+  [[ -s "$DOCS_FILE" ]] || return 1
+  jq -r --arg s "$1" \
+    '.docs | to_entries[] | select(.value.source == $s) | .key' \
+    "$DOCS_FILE" 2>/dev/null | head -n 1
+}
+
+rename_doc() {  # <from> <to>
+  jq --arg a "$1" --arg b "$2" '.docs[$b] = .docs[$a] | del(.docs[$a])' \
+     "$DOCS_FILE" 2>/dev/null | docs_write
+  [[ -f "$(body_file "$1")" ]] && mv "$(body_file "$1")" "$(body_file "$2")"
+  [[ -f "$(meta_file "$1")" ]] && mv "$(meta_file "$1")" "$(meta_file "$2")"
+  return 0
+}
+
+human_size() {
+  if (( $1 >= 1024 )); then print -r -- "$(( $1 / 1024 )) KB"; else print -r -- "$1 B"; fi
+}
+
+report_doc() {  # <slug>
+  local kind bytes
+  kind=$(doc_field "$1" kind)
+  bytes=$(meta_field "$1" bytes 2>/dev/null) || bytes=0
+  if [[ "$kind" == pointer || "${bytes:-0}" == 0 ]]; then
+    print -r -- "+ $1  $(doc_field "$1" title)  (link only, the agent will fetch it)"
+  else
+    print -r -- "+ $1  $(doc_field "$1" title)  ($kind, $(human_size "$bytes"))"
+  fi
+}
+
+add_doc() {  # <source> [--name <slug>] [--force]  -> the slug on stdout(quiet)
+  local src="$1" want="" force="" quiet="${ADD_QUIET:-}"
+  shift
+  while (( $# )); do
+    case "$1" in
+      --name) want="${2:-}"; shift ;;
+      --name=*) want="${1#--name=}" ;;
+      --force) force=force ;;
+      *) die "wts doc add: unexpected argument '$1'" ;;
+    esac
+    shift
+  done
+
+  local kind title slug existing prov
+  if is_url "$src"; then
+    kind=url
+  elif [[ -f "${src:A}" ]]; then
+    src="${src:A}"; kind=file
+  else
+    return 2   # neither a URL nor a file: the caller words the error
+  fi
+
+  if [[ -n "$want" ]]; then
+    [[ "$want" =~ '^[a-z0-9][a-z0-9-]*$' ]] \
+      || die "wts doc: '$want' is not a valid name ([a-z0-9-])"
+    if doc_exists "$want" && [[ -z "$force" ]]; then
+      die "wts doc: '$want' is already in the library (--force to replace it)"
+    fi
+    slug="$want"
+  else
+    existing=$(source_slug "$src") || existing=""
+    if [[ -n "$existing" ]]; then
+      # Same source, already known: reuse it rather than make a twin.
+      [[ -n "$quiet" ]] || print -r -- "= $existing is already in the library"
+      ensure_fresh "$existing"
+      [[ -n "$quiet" ]] && print -r -- "$existing"
+      return 0
+    fi
+  fi
+
+  docs_init
+  if [[ "$kind" == file ]]; then
+    title=$(grep -m1 '^# ' "$src" 2>/dev/null | sed 's/^#[[:space:]]*//')
+    [[ -n "$title" ]] || title="${src:t:r}"
+    [[ -n "$slug" ]] || slug=$(free_slug "$(slug_from "$title")") \
+      || die "wts doc: no free name from '$(slug_from "$title")'"
+    doc_put "$slug" "$title" "$src" file
+    refresh_file "$slug" "$src" force
+  else
+    # The title only exists once the page has been read, and the name is made
+    # from the title: fetch under a provisional name, then rename.
+    prov="${slug:-wts-pending-$$}"
+    doc_put "$prov" "$(title_from_url "$src")" "$src" url
+    # Always on stderr, quiet or not: a fetch takes seconds and silence looks
+    # like a hang. Only stdout is kept clean, for `resolve`.
+    print -u2 -r -- "→ fetching $src …"
+    if ! refresh_url "$prov" "$src" force; then
+      doc_set_kind "$prov" pointer
+    fi
+    if [[ -z "$slug" ]]; then
+      title=$(doc_field "$prov" title)
+      slug=$(free_slug "$(slug_from "$title")") || slug="$prov"
+      [[ "$slug" == "$prov" ]] || rename_doc "$prov" "$slug"
+    fi
+  fi
+
+  if [[ -n "$quiet" ]]; then
+    print -r -- "$slug"
+  else
+    report_doc "$slug"
+  fi
+  return 0
+}
+
+# ─── Picking ─────────────────────────────────────────────────────────────────
+
+pick_doc() {  # -> a slug on stdout, empty when the user gave up
+  local -a slugs
+  slugs=(${(f)"$(doc_slugs)"})
+  slugs=("${(@)slugs:#}")
+  if (( ${#slugs} == 0 )); then
+    warn "wts doc: the library is empty (wts doc add <url|path>)"
+    return 1
+  fi
+  local line choice
+  if command -v fzf >/dev/null 2>&1 && [[ -t 0 && -t 1 ]]; then
+    choice=$(doc_table | fzf --reverse --height=100% --no-multi \
+                             --prompt='doc> ' --with-nth=1,2,3 2>/dev/null)
+    print -r -- "${${(z)choice}[1]:-}"
+    return 0
+  fi
+  # No fzf, or no terminal: degrade to a numbered list rather than give up.
+  local -i i=0
+  for line in "${slugs[@]}"; do
+    (( ++i ))
+    print -u2 -r -- "  $i) $line — $(doc_field "$line" title)"
+  done
+  print -u2 -n -- "document? [1-$i] "
+  read -r choice
+  [[ "$choice" == <-> ]] && (( choice >= 1 && choice <= i )) \
+    && print -r -- "${slugs[choice]}"
+  return 0
+}
+
+doc_table() {
+  local slug at age title kind
+  for slug in ${(f)"$(doc_slugs)"}; do
+    [[ -n "$slug" ]] || continue
+    title=$(doc_field "$slug" title)
+    kind=$(doc_field "$slug" kind)
+    at=$(meta_field "$slug" fetched_at 2>/dev/null) || at=""
+    if [[ -n "$at" && "$at" != 0 ]]; then
+      age=$(( ( $(now_epoch) - at ) / 86400 ))
+      if (( age <= 0 )); then age="today"; else age="${age}d ago"; fi
+    else
+      age="never"
+    fi
+    printf '%-24s %-40s %-8s %s\n' "$slug" "${title:0:40}" "$kind" "$age"
+  done
+}
+
+# ─── Attaching to a running session ──────────────────────────────────────────
+# The registry is bin/wts's, but `wts doc use` must persist what it attaches or
+# `wts restore` would silently drop it. Same jq + tmp + mv discipline, and the
+# same rule: never clobber what is already there.
+
+registry_add_doc() {  # <session> <slug>
+  local file="$WTS_STATE_DIR/sessions.json" tmp
+  [[ -s "$file" ]] || return 1
+  tmp="${file}.tmp.$$"
+  if jq --arg n "$1" --arg d "$2" \
+       'if has($n) then .[$n].docs = (((.[$n].docs // []) + [$d]) | unique) else . end' \
+       "$file" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$file"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+registry_docs() {  # <session> -> one slug per line
+  local file="$WTS_STATE_DIR/sessions.json"
+  [[ -s "$file" ]] || return 0
+  jq -r --arg n "$1" '.[$n].docs // [] | .[]' "$file" 2>/dev/null
+}
+
+# The collector is the single source for an agent's pane (it reads Claude Code's
+# undocumented session file); never re-derive it here. --no-git: this needs no
+# git column and would otherwise pay seconds on a large repository.
+agent_pane_of() {  # <session>
+  local pane
+  pane=$("$WTS_LIBEXEC/wts-status" --json --no-git "$1" 2>/dev/null \
+         | jq -r '.[0].agent_pane // ""' 2>/dev/null)
+  [[ -n "$pane" ]] || pane="$1"
+  print -r -- "$pane"
+}
+
+use_doc() {  # <slug|""> <session> <worktree> <workdir>
+  local slug="$1" session="$2" worktree="$3" workdir="${4:-$3}"
+  if [[ -z "$slug" ]]; then
+    slug=$(pick_doc) || return 1
+    [[ -n "$slug" ]] || return 0
+  fi
+  doc_exists "$slug" || die "wts doc: '$slug' is not in the library (wts doc ls)"
+  ensure_fresh "$slug"
+  registry_add_doc "$session" "$slug"
+
+  local -a slugs
+  slugs=(${(f)"$(registry_docs "$session")"})
+  slugs=("${(@)slugs:#}")
+  (( ${#slugs} )) || slugs=("$slug")
+
+  local rel
+  rel=$(materialize "$worktree" "$workdir" "${slugs[@]}") || return 1
+  print -r -- "→ $rel ($(( ${#slugs} )) document(s))"
+
+  local title line target
+  title=$(doc_field "$slug" title)
+  title="${title//[[:cntrl:]]/ }"
+  title="${title//\"/\'}"
+  line="Read @$rel - I have just attached \"${title:0:60}\" to this session."
+  target=$(agent_pane_of "$session")
+  if "$WTS_LIBEXEC/wts-switch" --send "$target" "$line" 2>/dev/null; then
+    print -r -- "→ sent to the agent of '$session'"
+  else
+    print -r -- "→ paste this into the agent: Read @$rel"
+  fi
+}
+
+# ─── Commands ────────────────────────────────────────────────────────────────
+
+usage() {
+  sed -n '3,/^#$/p' "$WTS_SELF" | sed 's/^# \{0,1\}//'
+}
+
+cmd="${1:-}"
+(( $# )) && shift
+
+case "$cmd" in
+  add)
+    [[ -n "${1:-}" ]] || die "usage: wts doc add <url|path> [--name <slug>] [--force]"
+    src="$1"; shift
+    add_doc "$src" "$@"
+    rc=$?
+    (( rc == 2 )) && die "wts doc: '$src' is neither a URL nor a readable file"
+    exit $rc
+    ;;
+
+  ls)
+    slugs=(${(f)"$(doc_slugs)"})
+    slugs=("${(@)slugs:#}")
+    if (( ${#slugs} == 0 )); then
+      print -r -- "no document yet — wts doc add <url|path>"
+      exit 0
+    fi
+    printf '%-24s %-40s %-8s %s\n' SLUG TITLE KIND FETCHED
+    doc_table
+    ;;
+
+  show)
+    slug="${1:-}"
+    if [[ -z "$slug" ]]; then
+      slugs=(${(f)"$(doc_slugs)"})
+      slugs=("${(@)slugs:#}")
+      (( ${#slugs} == 1 )) || die "usage: wts doc show <slug>   (wts doc ls)"
+      slug="${slugs[1]}"
+    fi
+    doc_exists "$slug" || die "wts doc: '$slug' is not in the library (wts doc ls)"
+    body=$(body_file "$slug")
+    if [[ -s "$body" ]]; then
+      cat "$body"
+    else
+      print -r -- "$slug: link only, nothing cached — $(doc_field "$slug" source)"
+      err=$(meta_field "$slug" error 2>/dev/null) || err=""
+      [[ -n "$err" ]] && print -r -- "reason: $err"
+    fi
+    ;;
+
+  sync)
+    force=""
+    targets=()
+    while (( $# )); do
+      case "$1" in
+        --force) force=force ;;
+        *) targets+=("$1") ;;
+      esac
+      shift
+    done
+    if (( ${#targets} == 0 )); then
+      targets=(${(f)"$(doc_slugs)"})
+      targets=("${(@)targets:#}")
+    fi
+    (( ${#targets} )) || { print -r -- "no document yet — wts doc add <url|path>"; exit 0 }
+    failed=0
+    for slug in "${targets[@]}"; do
+      doc_exists "$slug" || { warn "! $slug: not in the library"; failed=1; continue }
+      print -u2 -r -- "↻ $slug …"
+      refresh_doc "$slug" "$force" || failed=1
+      report_doc "$slug"
+    done
+    exit $failed
+    ;;
+
+  rm)
+    slug="${1:-}"
+    [[ -n "$slug" ]] || die "usage: wts doc rm <slug>"
+    doc_exists "$slug" || die "wts doc: '$slug' is not in the library (wts doc ls)"
+    # The library is the user's: warn about the sessions still pointing at it,
+    # remove anyway. A missing slug is skipped on the next materialize.
+    users=$(jq -r --arg d "$slug" \
+              'to_entries[] | select((.value.docs // []) | index($d)) | .key' \
+              "$WTS_STATE_DIR/sessions.json" 2>/dev/null | paste -sd' ' -)
+    [[ -n "${users// /}" ]] && warn "! still attached to: $users"
+    doc_del "$slug"
+    cache_del "$slug"
+    print -r -- "- $slug"
+    ;;
+
+  use)
+    [[ -n "${2:-}" ]] || die "usage: wts doc use <slug> [<session>]"
+    use_doc "$1" "$2" "${3:-}" "${4:-${3:-}}"
+    ;;
+
+  tools)
+    [[ "${1:-}" == "--refresh" ]] && rm -f "$TOOLS_CACHE"
+    allow_list
+    print -r -- "allowed for the fetch:"
+    for t in "${ALLOW[@]}"; do print -r -- "  $t"; done
+    [[ -n "${WTS_DOC_TOOLS:-}" ]] && print -r -- "(pinned by WTS_DOC_TOOLS)"
+    exit 0
+    ;;
+
+  pick)
+    pick_doc
+    ;;
+
+  resolve)
+    v="${1:-}"
+    [[ -n "$v" ]] || exit 2
+    if doc_exists "$v"; then
+      print -r -- "$v"
+      exit 0
+    fi
+    ADD_QUIET=1 add_doc "$v"
+    exit $?
+    ;;
+
+  materialize)
+    [[ -n "${3:-}" ]] || exit 1
+    worktree="$1"; workdir="$2"; shift 2
+    materialize "$worktree" "$workdir" "$@"
+    ;;
+
+  help|-h|--help|"")
+    usage
+    [[ -z "$cmd" ]] && exit 2
+    exit 0
+    ;;
+
+  *)
+    die "wts doc: unknown command '$cmd' (add, ls, show, sync, rm, use, tools)"
+    ;;
+esac

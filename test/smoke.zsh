@@ -79,6 +79,16 @@ pane_shows() { # <session> <line>
   done
   return 1
 }
+# Like pane_shows, but for text the pane only displays: a line typed at a
+# prompt carries the prompt as a prefix, so the match cannot be anchored.
+pane_contains() { # <session> <text>
+  local i
+  for i in {1..30}; do
+    tmux capture-pane -pJ -t "=$1:" 2>/dev/null | grep -qF -- "$2" && return 0
+    sleep 0.1
+  done
+  return 1
+}
 in_registry() { jq -e --arg n "$1" 'has($n)' "$XDG_STATE_HOME/wts/sessions.json" }
 
 # ─── CLI surface ─────────────────────────────────────────────────────────────
@@ -90,11 +100,19 @@ check "setup tmux prints absolute helper paths" eval '"$WTS" setup tmux | grep -
 check "layouts lists the user layout" eval '"$WTS" layouts | grep -q "^smoke	"'
 check "layouts lists the built-in default" eval '"$WTS" layouts | grep -qF "default	$ROOT/share/wts/layouts/default.yml"'
 
-# The built-in layout renders, fresh and restored, with a phrase to escape.
+# The built-in layout renders, fresh and restored, with and without a context
+# document, and with a phrase that needs escaping. This is the guard on the two
+# layers of escaping the claude pane goes through (Ruby's shellescape for the
+# pane's shell, then tmuxinator's own for send-keys) and on the YAML quoting of
+# the restore pre-fill: a backslash in a double-quoted scalar stops the file
+# from parsing at all.
 for restore in "" 1; do
-  check "default layout renders (restore=${restore:-0})" env \
-    WTS_NAME=render WTS_ROOT="$SANDBOX" WTS_WORKDIR="$SANDBOX" WTS_RESTORE="$restore" \
-    WTS_PROMPT="it's a test; ok" tmuxinator debug --project-config "$ROOT/share/wts/layouts/default.yml"
+  for doc in "" ".wts/context.md"; do
+    check "default layout renders (restore=${restore:-0}, doc=${doc:-none})" env \
+      WTS_NAME=render WTS_ROOT="$SANDBOX" WTS_WORKDIR="$SANDBOX" WTS_RESTORE="$restore" \
+      WTS_DOC="$doc" WTS_PROMPT="it's a test; ok" \
+      tmuxinator debug --project-config "$ROOT/share/wts/layouts/default.yml"
+  done
 done
 
 # ─── Repo ────────────────────────────────────────────────────────────────────
@@ -267,7 +285,7 @@ check "an empty reply sends a bare Enter" \
 check "a drifted cursor does not retarget the reply" pane_shows auth-form wts-reply-pinned
 chain=$("$SWITCH" --reply esc)
 check "esc leaves reply mode" \
-  eval 'print -r -- "$chain" | grep -q "^enable-search+.*rebind(ctrl-d,ctrl-x)" && [[ ! -e "$WTS_SWITCH_REPLY" ]]'
+  eval 'print -r -- "$chain" | grep -q "^enable-search+.*rebind(ctrl-d,ctrl-x,ctrl-e)" && [[ ! -e "$WTS_SWITCH_REPLY" ]]'
 check "fzf parses the leave chain" fzf_parses "$chain"
 check "tab toggles back out too" \
   eval '"$SWITCH" --reply toggle auth-form auth-form >/dev/null && "$SWITCH" --reply toggle auth-form auth-form | grep -q "^enable-search" && [[ ! -e "$WTS_SWITCH_REPLY" ]]'
@@ -323,12 +341,12 @@ check "? collapses it again" \
   eval '"$SWITCH" --keys toggle "" >/dev/null && [[ ! -e "$WTS_SWITCH_HELP" ]]'
 chain=$("$SWITCH" --reply toggle auth-form auth-form)
 check "reply mode unbinds ? and repaints the footer" \
-  eval 'print -r -- "$chain" | grep -qF "unbind(ctrl-d,ctrl-x,?)" &&
+  eval 'print -r -- "$chain" | grep -qF "unbind(ctrl-d,ctrl-x,ctrl-e,?)" &&
         print -r -- "$chain" | grep -qF "change-footer|enter send"'
 check "fzf parses the reply chain with its footer" fzf_parses "$chain"
 chain=$("$SWITCH" --reply esc)
 check "leaving reply mode rebinds ? and puts the list's keys back" \
-  eval 'print -r -- "$chain" | grep -qF "rebind(ctrl-d,ctrl-x,?)" &&
+  eval 'print -r -- "$chain" | grep -qF "rebind(ctrl-d,ctrl-x,ctrl-e,?)" &&
         print -r -- "$chain" | grep -qF "change-footer|enter switch"'
 check "fzf parses the leave chain with its footer" fzf_parses "$chain"
 unset WTS_SWITCH_FOOTER
@@ -471,6 +489,78 @@ check "status --json <name> collects that session only" \
 check "switch --list --no-git renders" eval '"$SWITCH" --list --no-git | grep -q "auth-form"'
 check "setup git prints the fsmonitor settings" \
   eval '"$WTS" setup git | grep -q "core.fsmonitor true"'
+
+# ─── Context documents ───────────────────────────────────────────────────────
+# All of it under WTS_NO_LLM=1 with a local markdown file: no model is ever
+# called, and a URL degrades to a pointer — which is exactly the path a machine
+# with no connector takes.
+
+SPEC="$SANDBOX/spec.md"
+print -rl -- "# Payments architecture" "" "Webhooks must be idempotent." > "$SPEC"
+
+check "doc add takes a local markdown file" "$WTS" doc add "$SPEC" --name spec
+check "the body is cached" test -s "$XDG_STATE_HOME/wts/docs/spec.md"
+check "the library entry knows it is a file" \
+  jq -e '.docs.spec.kind == "file"' "$XDG_CONFIG_HOME/wts/docs.json"
+check "doc ls lists it" eval 'out=$("$WTS" doc ls); [[ "$out" == *spec* ]]'
+check "doc show prints the body" \
+  eval 'out=$("$WTS" doc show spec); [[ "$out" == *idempotent* ]]'
+refute "doc show of an unknown document fails" "$WTS" doc show nope
+check "the same source is reused, not twinned" \
+  eval 'out=$("$WTS" doc add "$SPEC"); [[ "$out" == *"already in the library"* ]]'
+check "a URL with no model becomes a pointer" \
+  "$WTS" doc add https://example.invalid/page --name ptr
+check "the pointer says so" jq -e '.docs.ptr.kind == "pointer"' "$XDG_CONFIG_HOME/wts/docs.json"
+
+WTS_NO_ATTACH=1 "$WTS" docsess smoke --doc spec >/dev/null
+check "--doc writes the context file" test -s "$WT/docsess/.wts/context.md"
+check "the document body is in it" grep -q idempotent "$WT/docsess/.wts/context.md"
+check "every document is marked with its slug" \
+  grep -q "wts-doc: spec" "$WT/docsess/.wts/context.md"
+# The assertion that carries the rest: a worktree dirtied by .wts/ is one
+# `wts gc` refuses to tear down and `wts ls` shows as dirty, forever, for every
+# session that ever had a document.
+check "the worktree stays clean" \
+  eval '[[ -z "$(git -C "$WT/docsess" status --porcelain)" ]]'
+check "the registry records the document" \
+  jq -e '.docsess.docs == ["spec"]' "$XDG_STATE_HOME/wts/sessions.json"
+WTS_NO_ATTACH=1 "$WTS" docsess smoke >/dev/null
+check "an idempotent re-run does not detach it" \
+  jq -e '.docsess.docs == ["spec"]' "$XDG_STATE_HOME/wts/sessions.json"
+
+check "--doc=<slug> is accepted too" \
+  env WTS_NO_ATTACH=1 "$WTS" docsess2 smoke --doc=spec
+check "and attaches" test -s "$WT/docsess2/.wts/context.md"
+"$WTS" rm docsess2 -f >/dev/null
+
+fails_with "is a layout, not a document" env WTS_NO_ATTACH=1 "$WTS" amb smoke --doc smoke
+refute "a layout given to --doc creates nothing" test -e "$WT/amb"
+fails_with "not a document" env WTS_NO_ATTACH=1 "$WTS" amb smoke --doc nope
+refute "an unknown document creates nothing" test -e "$WT/amb"
+
+rm -rf "$WT/docsess/.wts"
+"$WTS" stop docsess >/dev/null
+"$WTS" restore docsess >/dev/null
+check "restore rebuilds a context file that disappeared" test -s "$WT/docsess/.wts/context.md"
+
+check "--send is the one sender into a pane" \
+  "$SWITCH" --send docsess "echo wts-doc-send-ok"
+check "the sent line lands" pane_shows docsess wts-doc-send-ok
+"$WTS" doc use spec docsess >/dev/null
+check "doc use reaches the session's pane" pane_contains docsess ".wts/context.md"
+
+check "fzf accepts the ctrl-e binding" \
+  eval 'printf "x\n" | fzf --bind="ctrl-e:execute(true)+refresh-preview" --filter=x'
+check "the key table lists ^e" \
+  eval 'out=$("$WTS" keys); [[ "$out" == *"^e"* && "$out" == *"context document"* ]]'
+
+"$WTS" rm docsess -f >/dev/null
+refute "rm leaves no husk behind .wts/" test -d "$WT/docsess"
+"$WTS" doc rm spec >/dev/null
+refute "doc rm drops the cached body" test -e "$XDG_STATE_HOME/wts/docs/spec.md"
+refute "doc rm drops the library entry" \
+  jq -e '.docs | has("spec")' "$XDG_CONFIG_HOME/wts/docs.json"
+"$WTS" doc rm ptr >/dev/null
 
 # ─── Stop and restore ────────────────────────────────────────────────────────
 # `wts stop` leaves exactly the state `wts restore` replays: tmux session gone,

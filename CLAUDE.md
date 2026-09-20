@@ -14,6 +14,7 @@ libexec/wts/wts-fresh      tmux `command-alias` entry: fetch origin/<default>, t
 libexec/wts/wts-name       slug from a phrase (Claude Haiku, local fallback)
 libexec/wts/wts-keys       the key table: switcher footer and `wts keys`
 libexec/wts/wts-brief      done/next per session (Claude Haiku, cached)
+libexec/wts/wts-doc        context document library: fetch (any MCP), cache, materialize
 share/wts/layouts/         built-in layouts (default.yml)
 examples/layouts/          richer layouts, not installed as built-ins
 completions/_wts           zsh completion
@@ -37,8 +38,12 @@ straight from the checkout. Scripts locate each other from their own path
 - Degrade, don't die: without `claude`, `jq`, `curl` or a tmux server, the
   affected columns show `-` and the rest works. Helpers use `set -uo pipefail`
   without `-e` for that reason; `bin/wts` uses `set -euo pipefail`.
-- The model is only called on explicit commands (`wts "<phrase>"`, `wts brief`),
-  never from `ls`, the switcher or hooks. `WTS_NO_LLM=1` disables it.
+- The model is only called on explicit commands (`wts "<phrase>"`, `wts brief`,
+  `wts doc add|sync`), never from `ls`, the switcher or hooks. `WTS_NO_LLM=1`
+  disables it. `wts-name` and `wts-brief` call it with MCP and tools **off**;
+  `wts-doc` is the one exception and says why in its header — fetching a page is
+  precisely a job for the machine's own connectors, whose names differ from one
+  machine to the next, so the allow list is enumerated, never hardcoded.
 - Layout files stay ASCII (Ruby reads them under `LANG=C` otherwise fails).
 
 ## zsh and tmux pitfalls already hit

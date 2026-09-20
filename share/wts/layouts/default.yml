@@ -20,18 +20,41 @@
   #  - newlines are flattened (they would submit the line), a trailing `;` is
   #    removed (tmux eats it).
   # On restore nothing starts: the command is pre-filled on the command line
-  # of the pane's zsh (`print -z`), press Enter to run it. The leading space
+  # of the pane's zsh (`print -z`), press Enter to run it. It carries the
+  # document too, since a restored session may never have read it. The leading space
   # keeps it out of the history (histignorespace). `--continue` only when wts
   # found a conversation for this directory (WTS_RESUME): without one it fails.
   clean = ->(v) { v.to_s.dup.force_encoding('UTF-8').scrub.gsub(/[[:cntrl:]]/, ' ').strip }
+  # A context document attached with --doc: wts wrote it inside the worktree
+  # and hands over its path relative to the pane's working directory, because
+  # Claude Code resolves an `@` reference from the pane's cwd. Only a path wts
+  # itself generates is accepted: it is interpolated into a quoted command line
+  # below, where a stray quote would break the pane's zsh.
+  doc = clean.(ENV['WTS_DOC'])
+  doc = '' unless doc =~ %r{\A[A-Za-z0-9._/-]+\z}
   task = clean.(ENV['WTS_PROMPT']).sub(/;+\z/, '').strip
+  unless doc.empty?
+    task = task.empty? ?
+      "Read @#{doc}: it is the context for this session. Tell me in three lines what it covers, then wait for my instructions." :
+      "Read @#{doc} first, it is the context for this task. #{task}"
+  end
+  inner = task.empty? ? 'claude' : "claude #{task.shellescape}"
   claude_cmd =
     if restore
-      ENV['WTS_RESUME'].to_s == '1' ? %q{" print -z 'claude --continue'"} : %q{" print -z claude"}
-    elsif task.empty?
-      'claude'
+      # wts always restores with an empty WTS_PROMPT, so the pre-filled line
+      # never carries the phrase - only the document, whose path wts generated
+      # and whose charset is checked above. That keeps every string here free
+      # of backslashes: shellescape's ones would be read as escapes by the YAML
+      # double-quoted scalar and the file would stop parsing.
+      if ENV['WTS_RESUME'].to_s == '1'
+        %q{" print -z 'claude --continue'"}
+      elsif doc.empty?
+        %q{" print -z claude"}
+      else
+        %Q{" print -z 'claude \\"Read @#{doc} first: it is the context for this session.\\"'"}
+      end
     else
-      "claude #{task.shellescape}"
+      inner
     end
 
   # The editor tmuxinator sees ($EDITOR of the shell that ran wts), else vi.

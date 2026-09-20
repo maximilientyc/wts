@@ -5,6 +5,7 @@
 #        wts <name> "<phrase>" [layout] [context...]
 #        wts "<phrase>" [layout] [context...]
 #        wts new [-p layout] <name|"phrase"...>
+#        wts doc add <url|path> | ls | show | sync | rm | use <slug> [session]
 #        wts ls | wts status [--json|--table|--fzf]
 #        wts brief [name...]
 #        wts restore [name...]
@@ -22,6 +23,8 @@
 #                Without <name>, Claude proposes the name (a few seconds)
 #   [layout]   : tmuxinator layout (default: default), see `wts layouts`
 #   [context]  : exposed to the layout as $WTS_CONTEXT
+#   --doc <d>  : attach a context document (a slug of `wts doc ls`, a URL or a
+#                markdown file); repeatable, and bare --doc at the end picks one
 #
 #   new        : create several sessions at once, then attach to the first
 #   ls         : list registered sessions and their state (agent, git delta)
@@ -35,6 +38,8 @@
 #     -f       : force (dirty worktree, unmerged branch)
 #   pr         : open the session's pull request on GitHub (needs gh); the
 #                current session when run inside one
+#   doc        : the library of reusable context documents (a Notion page, a
+#                markdown file) attached to a session with --doc
 #   gc         : clean up from the remote: worktrees and branches whose PR is
 #                merged (squash included) or whose remote branch is gone,
 #                plus any stale index.lock blocking writes in a worktree
@@ -55,6 +60,8 @@
 #   wts stop auth-form
 #   wts pr auth-form
 #   wts rm auth-form -f
+#   wts doc add https://notion.so/Payments-abc123
+#   wts auth-form "limit the rate per key" --doc payments-architecture
 
 set -euo pipefail
 
@@ -92,19 +99,23 @@ registry_init() {
   [[ -s "$WTS_STATE_FILE" ]] || echo '{}' > "$WTS_STATE_FILE"
 }
 
-# registry_put <session> <layout> <repo_root> <worktree> <branch> <subdir> <context> [prompt]
+# registry_put <session> <layout> <repo_root> <worktree> <branch> <subdir> <context> [prompt] [docs-json]
 # The prompt is only known at creation: a later `wts <name>` (idempotence)
 # comes without a phrase and must not erase it, hence the old one is kept.
+# The attached documents follow the same rule: a re-run comes without --doc and
+# must not detach what `wts doc use` attached since.
 registry_put() {
   registry_available || return 0
   registry_init
   local tmp="${WTS_STATE_FILE}.tmp.$$"
   if jq --arg n "$1" --arg profile "$2" --arg repo_root "$3" --arg worktree "$4" \
         --arg branch "$5" --arg subdir "$6" --arg context "$7" --arg prompt "${8:-}" \
+        --argjson docs "${9:-[]}" \
         --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         '.[$n] = {profile: $profile, repo_root: $repo_root, worktree: $worktree,
                   branch: $branch, subdir: $subdir, context: $context,
                   prompt: (if $prompt == "" then (.[$n].prompt // "") else $prompt end),
+                  docs: (if ($docs | length) == 0 then (.[$n].docs // []) else $docs end),
                   created_at: (.[$n].created_at // $now)}' \
         "$WTS_STATE_FILE" > "$tmp" 2>/dev/null; then
     mv "$tmp" "$WTS_STATE_FILE"
@@ -301,6 +312,35 @@ usage() {
   sed -n '3,/^$/p' "$WTS_SELF" | sed 's/^# \{0,1\}//'
 }
 
+# ─── --doc ───────────────────────────────────────────────────────────────────
+# Fills $DOC_REQ with the requested documents and $DOC_REST with everything
+# else. It must run BEFORE the phrase/layout/context parsing, which is purely
+# positional: a --doc left in place would land in $PROFILE or in $CONTEXT.
+# A bare `--doc` as the last argument opens the picker; anywhere else it takes
+# the next argument, with no lookahead heuristic — guessing wrong here would
+# attach the wrong document to a fresh agent.
+# `wts new` re-invokes wts with two positionals only and cannot pass an option
+# through, so it hands its own documents over in $WTS_DOC_ARGS (\x1f-separated:
+# a value can be a URL with anything in it).
+typeset -ga DOC_REQ DOC_REST
+strip_doc_args() {
+  DOC_REQ=(${(@ps:\x1f:)${WTS_DOC_ARGS:-}})
+  DOC_REQ=("${(@)DOC_REQ:#}")
+  DOC_REST=()
+  while (( $# )); do
+    case "$1" in
+      --doc=*) DOC_REQ+=("${1#--doc=}") ;;
+      --doc)   if (( $# == 1 )); then
+                 DOC_REQ+=("")
+               else
+                 DOC_REQ+=("${2:-}"); shift
+               fi ;;
+      *)       DOC_REST+=("$1") ;;
+    esac
+    shift
+  done
+}
+
 # ─── Help, version, stray options ────────────────────────────────────────────
 # Handled before anything else: without this, `wts --help` went down the normal
 # flow and created a worktree, a branch and a session named `--help`.
@@ -469,7 +509,7 @@ if [[ "$1" == "restore" ]]; then
   ignored=0
 
   while IFS= read -r name && IFS= read -r profile && IFS= read -r worktree \
-        && IFS= read -r subdir && IFS= read -r context; do
+        && IFS= read -r subdir && IFS= read -r context && IFS= read -r docs; do
     [[ -n "$name" ]] || continue
 
     if (( ${#wanted} )) && [[ -z "${wanted[(r)$name]:-}" ]]; then
@@ -505,6 +545,16 @@ if [[ "$1" == "restore" ]]; then
     export WTS_CONTEXT="$context"
     export WTS_PROMPT=""
 
+    # The context file lives in the worktree, which survives a reboot — but not
+    # a `wts gc` husk sweep or a manual rm. Rebuilt from the cache, never
+    # fetched: a restore is not an explicit attach. Reset on every iteration,
+    # like WTS_RESUME below.
+    export WTS_DOC=""
+    if [[ -n "$docs" && -x "$WTS_LIBEXEC/wts-doc" ]]; then
+      WTS_DOC=$("$WTS_LIBEXEC/wts-doc" materialize "$worktree" "$workdir" \
+                  ${(ps:\x1f:)docs} 2>/dev/null) || WTS_DOC=""
+    fi
+
     # The layout pre-fills `claude --continue` when there is a conversation to
     # resume for this directory, plain `claude` otherwise (--continue would
     # fail). Reset on every iteration: the export would leak into the next one.
@@ -521,7 +571,7 @@ if [[ "$1" == "restore" ]]; then
       echo "⚠ $name: tmuxinator failed to start" >&2
       (( ignored++ )) || true
     fi
-  done < <(jq -r 'to_entries | sort_by(.key)[] | [.key, (.value.profile // ""), (.value.worktree // ""), (.value.subdir // ""), (.value.context // "")] | .[]' "$WTS_STATE_FILE")
+  done < <(jq -r 'to_entries | sort_by(.key)[] | [.key, (.value.profile // ""), (.value.worktree // ""), (.value.subdir // ""), (.value.context // ""), ((.value.docs // []) | join("\u001f"))] | .[]' "$WTS_STATE_FILE")
 
   echo "→ $restored session(s) restored, $ignored skipped"
   if (( restored > 0 )); then
@@ -689,6 +739,13 @@ if [[ "$1" == "rm" ]]; then
   if [[ -d "$worktree_path" ]]; then
     BRANCH=$(git -C "$worktree_path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 
+    # .wts/ is git-ignored, and `git worktree remove` leaves ignored files
+    # behind: without this, every session that had a document would leave a
+    # husk folder for `wts gc` to find. Never a symlink, never anything else.
+    if [[ -d "$worktree_path/.wts" && ! -L "$worktree_path/.wts" ]]; then
+      rm -rf -- "$worktree_path/.wts"
+    fi
+
     # Deleting a 150k-file worktree takes git ten seconds, silently.
     echo "→ removing worktree $worktree_path…"
     if [[ "$FORCE" == true ]]; then
@@ -745,6 +802,56 @@ if [[ "$1" == "gc" ]]; then
   exec "$WTS_LIBEXEC/wts-gc" "$@"
 fi
 
+# ─── Subcommand: doc ─────────────────────────────────────────────────────────
+# The library of reusable context documents. `use` is the only verb that names a
+# session, so the name is resolved here, where the registry and its typo
+# tolerance live; every other verb goes straight to the helper.
+
+if [[ "$1" == "doc" ]]; then
+  if [[ ! -x "$WTS_LIBEXEC/wts-doc" ]]; then
+    echo "wts: $WTS_LIBEXEC/wts-doc not found" >&2
+    exit 1
+  fi
+  shift
+  if [[ "${1:-}" == "use" ]]; then
+    shift
+    DOC_SLUG="${1:-}"
+    (( $# > 0 )) && shift
+    DOC_SESSION="${1:-}"
+    if [[ -z "$DOC_SESSION" ]]; then
+      # #S is only meaningful under $TMUX: outside a client it names the last
+      # used session, which is not "the session I am in".
+      [[ -n "${TMUX:-}" ]] && DOC_SESSION=$(tmux display-message -p '#S' 2>/dev/null || echo "")
+      if [[ -z "$DOC_SESSION" ]]; then
+        echo "Usage: wts doc use <slug> <session> (no session needed inside one)" >&2
+        exit 1
+      fi
+    fi
+    DOC_SESSION="${DOC_SESSION//\//-}"
+    if ! registry_available || [[ ! -s "$WTS_STATE_FILE" ]]; then
+      echo "wts: '$DOC_SESSION' is not a wts session" >&2
+      exit 1
+    fi
+    if resolved=$(registry_resolve_name "$DOC_SESSION"); then
+      DOC_SESSION="$resolved"
+    else
+      exit 1
+    fi
+    DOC_WT=$(jq -r --arg n "$DOC_SESSION" '.[$n].worktree // ""' "$WTS_STATE_FILE")
+    DOC_SUB=$(jq -r --arg n "$DOC_SESSION" '.[$n].subdir // ""' "$WTS_STATE_FILE")
+    if [[ -z "$DOC_WT" || ! -d "$DOC_WT" ]]; then
+      echo "wts: '$DOC_SESSION' has no worktree in the registry" >&2
+      exit 1
+    fi
+    DOC_WD="$DOC_WT"
+    if [[ -n "$DOC_SUB" && -d "$DOC_WT/$DOC_SUB" ]]; then
+      DOC_WD="$DOC_WT/$DOC_SUB"
+    fi
+    exec "$WTS_LIBEXEC/wts-doc" use "$DOC_SLUG" "$DOC_SESSION" "$DOC_WT" "$DOC_WD"
+  fi
+  exec "$WTS_LIBEXEC/wts-doc" "$@"
+fi
+
 # ─── Subcommand: new ─────────────────────────────────────────────────────────
 # Batch creation. Why: `wts a & wts b & wts c` does NOT work, because the
 # normal flow ends with `exec tmuxinator start`: the first call replaces the
@@ -753,6 +860,18 @@ fi
 
 if [[ "$1" == "new" ]]; then
   shift
+  strip_doc_args "$@"
+  set -- "${DOC_REST[@]}"
+  # A bare --doc is resolved once here: left to the children, the picker would
+  # open once per session of the batch.
+  if (( ${#DOC_REQ} )) && [[ -x "$WTS_LIBEXEC/wts-doc" ]]; then
+    for i in {1..${#DOC_REQ}}; do
+      if [[ -z "${DOC_REQ[i]}" ]]; then
+        DOC_REQ[i]=$("$WTS_LIBEXEC/wts-doc" pick) || exit 1
+      fi
+    done
+    DOC_REQ=("${(@)DOC_REQ:#}")
+  fi
   NEW_PROFILE="default"
   if [[ "${1:-}" == "-p" ]]; then
     [[ -n "${2:-}" ]] || { echo "wts: -p expects a layout" >&2; exit 1 }
@@ -779,7 +898,8 @@ if [[ "$1" == "new" ]]; then
   for n in "$@"; do
     echo "── $n ($NEW_PROFILE)"
     rm -f "$session_out"
-    if WTS_NO_ATTACH=1 WTS_SESSION_OUT="$session_out" "$WTS_SELF" "$n" "$NEW_PROFILE"; then
+    if WTS_NO_ATTACH=1 WTS_SESSION_OUT="$session_out" \
+       WTS_DOC_ARGS="${(pj:\x1f:)DOC_REQ}" "$WTS_SELF" "$n" "$NEW_PROFILE"; then
       if [[ -s "$session_out" ]]; then
         started+=("$(<"$session_out")")
       else
@@ -801,6 +921,13 @@ if [[ "$1" == "new" ]]; then
 fi
 
 # ─── Normal flow ─────────────────────────────────────────────────────────────
+
+strip_doc_args "$@"
+set -- "${DOC_REST[@]}"
+if (( $# < 1 )); then
+  echo "wts: nothing to create (see: wts help)" >&2
+  exit 2
+fi
 
 # A phrase (an argument containing whitespace, in position 1 or 2) describes
 # the task: it is removed from the positionals and handed to Claude
@@ -902,6 +1029,40 @@ if ! git -C "$repo_root" rev-parse --verify --quiet "$BASE_BRANCH" >/dev/null; t
   exit 1
 fi
 
+# ─── Documents (--doc) ───────────────────────────────────────────────────────
+# Resolved here, after the layout, the repository and the base branch have been
+# validated and before the naming call: an unknown document must fail while
+# nothing exists yet — no branch, no worktree, no model call — and the picker
+# must open before the "naming…" wait rather than behind it.
+
+typeset -a DOC_SLUGS
+DOC_SLUGS=()
+if (( ${#DOC_REQ} )); then
+  if [[ ! -x "$WTS_LIBEXEC/wts-doc" ]]; then
+    echo "wts: $WTS_LIBEXEC/wts-doc not found" >&2
+    exit 1
+  fi
+  for _req in "${DOC_REQ[@]}"; do
+    if [[ -z "$_req" ]]; then
+      _slug=$("$WTS_LIBEXEC/wts-doc" pick) || exit 1
+      [[ -n "$_slug" ]] || continue
+    elif ! _slug=$("$WTS_LIBEXEC/wts-doc" resolve "$_req"); then
+      # `--doc` always takes the next argument, so a layout typed after it is
+      # read as a document. It is the one mistake worth naming precisely.
+      if layout_file "$_req" >/dev/null 2>&1; then
+        echo "wts: '--doc $_req' — '$_req' is a layout, not a document." >&2
+        echo "     layout then doc:  wts ${NAME:-<name>} $_req --doc <slug>" >&2
+        echo "     doc then layout:  wts ${NAME:-<name>} --doc=<slug> $_req" >&2
+      else
+        echo "wts: '--doc $_req' — not a document, a URL or a readable file" >&2
+        echo "     the library: wts doc ls" >&2
+      fi
+      exit 1
+    fi
+    DOC_SLUGS+=("$_slug")
+  done
+fi
+
 # ─── Session name ────────────────────────────────────────────────────────────
 # Phrase without a name: wts-name proposes a slug. Placed after the cheap checks
 # (layout, repo, base): the model is never called for a creation bound to fail.
@@ -1001,6 +1162,22 @@ if [[ -n "${WTS_SUBDIR:-}" ]]; then
   fi
 fi
 
+# ─── Context documents ───────────────────────────────────────────────────────
+# Written after the worktree exists and before the layout is rendered. The path
+# is relative to the pane's working directory, because Claude Code resolves an
+# `@` reference from the pane's cwd.
+
+WTS_DOC=""
+if (( ${#DOC_SLUGS} )); then
+  if WTS_DOC=$("$WTS_LIBEXEC/wts-doc" materialize "$worktree_path" "$WORKDIR" \
+                 "${DOC_SLUGS[@]}"); then
+    echo "→ context: ${#DOC_SLUGS} document(s) in $WTS_DOC"
+  else
+    echo "⚠ the context document could not be written" >&2
+    WTS_DOC=""
+  fi
+fi
+
 # ─── tmuxinator ──────────────────────────────────────────────────────────────
 
 # Variables exposed to the YAML layout through ERB (ENV['WTS_*'])
@@ -1009,12 +1186,17 @@ export WTS_ROOT="$worktree_path"
 export WTS_WORKDIR="$WORKDIR"
 export WTS_CONTEXT="$CONTEXT"
 export WTS_PROMPT="$PROMPT"
+export WTS_DOC
 
 # ─── Registry ────────────────────────────────────────────────────────────────
 # Recorded before the exec: exec replaces the current process.
 
+DOCS_JSON="[]"
+if (( ${#DOC_SLUGS} )); then
+  DOCS_JSON=$(printf '%s\n' "${DOC_SLUGS[@]}" | jq -R . | jq -sc .) || DOCS_JSON="[]"
+fi
 registry_put "$SESSION" "$PROFILE" "$repo_root" "$worktree_path" "$BRANCH" \
-  "${WTS_SUBDIR:-}" "$CONTEXT" "$PROMPT"
+  "${WTS_SUBDIR:-}" "$CONTEXT" "$PROMPT" "$DOCS_JSON"
 
 # `wts new` reads the chosen name back here (it may have been proposed, then
 # suffixed).
