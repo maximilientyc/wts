@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 — unreleased
+## 0.3.1 — 2026-09-20
 
 - **`ctrl-o` in the switcher opens the session's pull request on GitHub.** Reaching
   the PR of a session meant switching to it, reading the branch and opening GitHub
