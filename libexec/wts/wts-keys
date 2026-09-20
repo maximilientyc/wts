@@ -27,11 +27,35 @@ KEYS=(
   "tab${SEP}reply${SEP}reply to the agent, enter sends"
   "^x${SEP}stop${SEP}stop the session, keep the worktree"
   "^d${SEP}rm${SEP}remove session, worktree and branch"
+  "^o${SEP}pr${SEP}open the pull request on GitHub"
   "^f/^b${SEP}scroll${SEP}scroll the preview half a page"
   "^r${SEP}reload${SEP}reload the list now"
   "esc${SEP}close${SEP}close, or leave reply mode"
   "?${SEP}keys${SEP}show or hide these keys"
 )
+
+# ctrl-o exists only with gh: the switcher binds it then and exports
+# WTS_SWITCH_PR for its footer subprocesses; `wts keys` looks for gh itself. The
+# entry is dropped here rather than in the renderers, so the footer and the
+# terminal list never disagree with what is bound.
+typeset -g IN_FOOTER=0
+has_pr() {
+  if (( IN_FOOTER )); then
+    [[ "${WTS_SWITCH_PR:-}" == 1 ]]
+  else
+    command -v gh >/dev/null 2>&1
+  fi
+}
+prune_keys() {
+  has_pr && return 0
+  local raw
+  local -a kept
+  kept=()
+  for raw in "${KEYS[@]}"; do
+    [[ "$raw" == "^o${SEP}"* ]] || kept+=("$raw")
+  done
+  KEYS=("${kept[@]}")
+}
 
 # The tmux bindings `wts setup tmux` installs. They cannot be pressed from
 # inside the popup, which is exactly why they are the ones that get forgotten.
@@ -159,7 +183,11 @@ text() {
     f=("${(@ps:\x1f:)raw}")
     printf '  %-7s %s\n' "$f[1]" "$f[3]"
   done
-  print -r -- "  ctrl-x is 'wts stop', ctrl-d is 'wts rm'."
+  if has_pr; then
+    print -r -- "  ctrl-x is 'wts stop', ctrl-d is 'wts rm', ctrl-o is 'wts pr'."
+  else
+    print -r -- "  ctrl-x is 'wts stop', ctrl-d is 'wts rm'."
+  fi
   print -r -- ""
   print -r -- "tmux (from 'wts setup tmux')"
   tmux_keys
@@ -170,6 +198,8 @@ text() {
 }
 
 if [[ "${1:-}" == "--footer" ]]; then
+  IN_FOOTER=1
+  prune_keys
   case "${2:-collapsed}" in
     expanded) expanded ;;
     reply)    reply_line ;;
@@ -183,4 +213,5 @@ if [[ -n "${1:-}" && "$1" != "--text" ]]; then
   exit 2
 fi
 
+prune_keys
 text
