@@ -25,7 +25,7 @@ each other, and for finding your way back afterwards:
 It is opinionated — zsh, tmux, tmuxinator, Claude Code — because it was built for
 one person's workflow. It is shared in case that workflow is also yours.
 
-![wts: a context document added to the library, a session started from a sentence with that document attached, the switcher with agents blocked, working and idle, a blocked agent answered and an idle session stopped from the popup, then wts ls, wts brief and wts gc](docs/demo.gif)
+![wts: a context document added to the library, a session started from a sentence with that document attached, prefix+a jumping straight to the agent that is blocked, the switcher answering it, attaching the document to an agent already running and stopping a finished session, then wts ls, wts brief, wts restore bringing the stopped session back and wts gc](docs/demo.gif)
 
 ## Requirements
 
