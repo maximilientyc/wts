@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.2 — 2026-09-20
 
 - **The document picker shows the whole row.** Now that the picker opens (0.4.1),
   what it displays is wrong: `--with-nth=1,2,3` was meant to pick the slug, title
