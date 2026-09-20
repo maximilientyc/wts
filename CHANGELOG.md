@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.1 — 2026-09-20
 
 - **The document picker actually opens.** A bare `--doc`, `wts doc use` without a
   slug and the switcher's `ctrl-e` all advertise an fzf picker over the library;
