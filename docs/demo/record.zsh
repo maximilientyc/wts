@@ -49,6 +49,9 @@ export XDG_STATE_HOME="$D/state"
 # inherit the environment, and nvim would start without your config. The folder
 # stays empty, so sessions use the built-in default layout.
 export WTS_LAYOUTS_PATH="$D/layouts"
+# The document library is a file of its own, not part of XDG_STATE_HOME: the
+# real one is ~/.config/wts/docs.json, and the tape adds a document to it.
+export WTS_DOCS_PATH="$D/docs.json"
 # A file rather than nvim's start screen, which belongs to your config, not
 # to wts. bin/wts opens on its usage.
 export EDITOR="nvim bin/wts"
@@ -58,6 +61,7 @@ export EDITOR="nvim bin/wts"
 export ZDOTDIR="$D/zdotdir"
 export ANTHROPIC_MODEL="${WTS_DEMO_MODEL:-sonnet}"
 unset TMUX WTS_BRANCH_PREFIX WTS_BASE_BRANCH WTS_SUBDIR WTS_WORKTREES_BASE WTS_NO_LLM
+unset WTS_DOC_TOOLS WTS_DOC_TTL WTS_DOC_MODEL
 
 # The sandbox's own socket, named explicitly: tmux (3.4 and later) silently
 # drops a TMUX_TMPDIR that does not exist and falls back to /tmp, so a bare

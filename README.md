@@ -18,11 +18,14 @@ each other, and for finding your way back afterwards:
   session, from git and the agent's transcript.
 - **Starts from a sentence.** `wts "rate-limit the public API per key"` names the
   session for you and hands the sentence to Claude.
+- **Carries the context you keep re-pasting.** `wts doc add <url|path>` puts a
+  spec, an architecture page or a file of conventions in a small library, fetched
+  once, and `--doc <slug>` attaches it: the agent opens on the document.
 
 It is opinionated — zsh, tmux, tmuxinator, Claude Code — because it was built for
 one person's workflow. It is shared in case that workflow is also yours.
 
-![wts: a session started from a sentence, the switcher with agents blocked, working and idle, a blocked agent answered and an idle session stopped from the popup, then wts ls, wts brief and wts gc](docs/demo.gif)
+![wts: a context document added to the library, a session started from a sentence with that document attached, the switcher with agents blocked, working and idle, a blocked agent answered and an idle session stopped from the popup, then wts ls, wts brief and wts gc](docs/demo.gif)
 
 ## Requirements
 
