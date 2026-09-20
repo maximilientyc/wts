@@ -554,6 +554,23 @@ check "fzf accepts the ctrl-e binding" \
 check "the key table lists ^e" \
   eval 'out=$("$WTS" keys); [[ "$out" == *"^e"* && "$out" == *"context document"* ]]'
 
+# The library picker, driven the way ctrl-e drives it: from a terminal, with its
+# stdout captured. It was gated on -t 1, which no caller can satisfy -- they all
+# read the slug from a command substitution -- so fzf never opened once and the
+# numbered fallback took every call. The pane's PATH comes from a wrapper
+# because tmux rebuilds it for a new pane.
+cat > "$SANDBOX/bin/pick-probe" <<EOF
+#!/bin/sh
+export PATH="$PATH"
+export XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_STATE_HOME="$XDG_STATE_HOME"
+_=\$("$ROOT/libexec/wts/wts-doc" pick)
+EOF
+chmod +x "$SANDBOX/bin/pick-probe"
+tmux new-session -d -s pickprobe -x 100 -y 20 "$SANDBOX/bin/pick-probe"
+check "the doc picker opens fzf on a terminal, not the numbered list" \
+  pane_contains pickprobe "doc>"
+tmux kill-session -t "=pickprobe" 2>/dev/null || true
+
 "$WTS" rm docsess -f >/dev/null
 refute "rm leaves no husk behind .wts/" test -d "$WT/docsess"
 "$WTS" doc rm spec >/dev/null

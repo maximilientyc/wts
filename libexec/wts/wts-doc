@@ -671,7 +671,14 @@ pick_doc() {  # -> a slug on stdout, empty when the user gave up
     return 1
   fi
   local line choice
-  if command -v fzf >/dev/null 2>&1 && [[ -t 0 && -t 1 ]]; then
+  # Not -t 1: this function answers on stdout and every caller captures it in a
+  # command substitution, so stdout is a pipe even in front of a real terminal.
+  # Gated on -t 1 the picker never opened once, the numbered list below took
+  # every call, and the switcher's ctrl-e -- whose whole point is the library
+  # picker -- was the worst hit: it goes through `wts doc use ""`, one more
+  # command substitution inside fzf's own `execute`. Stdin and stderr are the
+  # terminal on all of those paths, and fzf draws on /dev/tty, not on stdout.
+  if command -v fzf >/dev/null 2>&1 && [[ -t 0 && -t 2 ]]; then
     choice=$(doc_table | fzf --reverse --height=100% --no-multi \
                              --prompt='doc> ' --with-nth=1,2,3 2>/dev/null)
     print -r -- "${${(z)choice}[1]:-}"
