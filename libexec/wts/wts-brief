@@ -66,6 +66,9 @@ claude_project_dir() {
 }
 
 # Headless call: same options, for the same reasons, as wts-name.
+# ask_claude <errfile> — stderr goes to that file rather than /dev/null: a
+# rejected model id and a timeout used to leave the same silence, impossible to
+# diagnose on someone else's machine.
 ask_claude() {
   (
     cd "$WTS_STATE_DIR" 2>/dev/null || cd /
@@ -73,7 +76,26 @@ ask_claude() {
       claude -p --model "$MODEL" --safe-mode --strict-mcp-config \
         --no-session-persistence --settings '{"disableAllHooks":true}' \
         --tools "" --system-prompt "$SYSTEM_PROMPT"
-  ) 2>/dev/null
+  ) 2>"$1"
+}
+
+# why <idx> <exit-code> — why that session has no summary, on one line.
+why() {
+  local idx="$1" code="$2" msg="" l
+  [[ -s "$tmpdir/$idx.err" ]] && msg=$(oneline "$(<"$tmpdir/$idx.err")")
+  if (( code == 142 )); then              # perl's alarm: 128 + SIGALRM
+    l="no answer in ${TIMEOUT}s"
+  elif [[ -n "$msg" ]]; then
+    # Where claude wrote its own diagnosis. Status 0 included: an unrecognized
+    # model is answered in prose, not with a failure.
+    l="claude: $msg"
+  elif (( code != 0 )); then
+    l="claude exited with status $code"
+  else
+    l="unexpected answer"
+  fi
+  (( ${#l} > 100 )) && l="${l[1,99]}…"
+  print -r -- "$l"
 }
 
 # oneline <text> — on one line, whitespace squeezed.
@@ -85,6 +107,8 @@ oneline() {
 #   <idx>.head      header (fields separated by \x1f)
 #   <idx>.facts     facts sent to Claude
 #   <idx>.fallback  raw facts shown without a summary
+#   <idx>.err       the call's stderr, read only when there is no summary
+#   <idx>.why       why there is no summary, shown above the raw facts
 #   <idx>.key       cache key
 #   <idx>.brief     the summary, if cached
 #   <idx>.note      nothing to summarize (no visible work)
@@ -220,13 +244,17 @@ collect() {
 # summarize <idx> — asks Claude; only writes the summary (and the cache) if the
 # answer has the expected shape, otherwise the display falls back to raw facts.
 summarize() {
-  local idx="$1" out done_line next_line name
-  out=$(ask_claude < "$tmpdir/$idx.facts")
+  local idx="$1" out code done_line next_line name
+  out=$(ask_claude "$tmpdir/$idx.err" < "$tmpdir/$idx.facts")
+  code=$?
   done_line=$(print -r -- "$out" | grep -m1 -iE '^[[:space:]*_]*done[[:space:]*_]*:' \
               | sed -E 's/^[^:]*:[[:space:]*_]*//; s/[*_[:space:]]+$//')
   next_line=$(print -r -- "$out" | grep -m1 -iE '^[[:space:]*_]*next[[:space:]*_]*:' \
               | sed -E 's/^[^:]*:[[:space:]*_]*//; s/[*_[:space:]]+$//')
-  [[ -n "$done_line" && -n "$next_line" ]] || return 1
+  if [[ -z "$done_line" || -z "$next_line" ]]; then
+    why "$idx" "$code" > "$tmpdir/$idx.why"
+    return 1
+  fi
 
   name=${"$(<"$tmpdir/$idx.head")"%%$'\x1f'*}
   printf 'done: %s\nnext: %s\n' "$done_line" "$next_line" > "$tmpdir/$idx.brief"
@@ -304,7 +332,11 @@ for (( i = 1; i <= total; i++ )); do
   elif [[ -s "$tmpdir/$i.brief" ]]; then
     sed 's/^/  /' "$tmpdir/$i.brief"
   else
-    $use_llm && print -r -- "  ${dim}(summary unavailable, raw facts)${reset}"
+    if [[ -s "$tmpdir/$i.why" ]]; then
+      print -r -- "  ${dim}(summary unavailable: $(<"$tmpdir/$i.why"), raw facts)${reset}"
+    elif $use_llm; then
+      print -r -- "  ${dim}(summary unavailable, raw facts)${reset}"
+    fi
     if [[ -s "$tmpdir/$i.fallback" ]]; then
       sed 's/^/  /' "$tmpdir/$i.fallback"
     else

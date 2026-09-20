@@ -128,6 +128,43 @@ check "phrase stored in the registry" \
 refute "missing layout fails" env WTS_NO_ATTACH=1 "$WTS" other nope
 refute "missing layout creates nothing" test -e "$WT/other"
 
+# ─── Naming ────────────────────────────────────────────────────────────────────
+# Every way the call can fail used to read "Claude unavailable or no answer",
+# which made a rejected model id on another machine undiagnosable. The stand-in
+# claude reads stdin first: the real one does, and a stub that exits on a full
+# pipe would fail the pipeline rather than the call.
+
+NAME="$ROOT/libexec/wts/wts-name"
+STUBS="$SANDBOX/name-stubs"
+mkdir -p "$STUBS"
+name_with() { # <sh-body> [env=value...] — wts-name against that stand-in claude
+  local body="$1"; shift
+  print -r -- "#!/bin/sh
+cat >/dev/null
+$body" > "$STUBS/claude"
+  chmod +x "$STUBS/claude"
+  env PATH="$STUBS:$PATH" WTS_NO_LLM= "$@" "$NAME" "export users as csv" 2>&1
+}
+
+check "an answer that is a name becomes the slug" eval '
+  [[ "$(name_with "echo fix-csv-export")" == "fix-csv-export" ]]'
+check "a rejected model never becomes a branch name" eval '
+  out=$(name_with "echo \"There is an issue with the selected model, sorry\"
+        echo \"[claude-code:unrecognized_model] {}\" >&2")
+  [[ "$out" == *"claude: [claude-code:unrecognized_model]"* \
+     && "$out" == *export-users-csv* && "$out" != *selected* ]]'
+check "a failing claude reports what it wrote" eval '
+  [[ "$(name_with "echo boom >&2; exit 1")" == *"claude: boom"* ]]'
+check "a silent failure reports its status" eval '
+  [[ "$(name_with "exit 3")" == *"claude exited with status 3"* ]]'
+check "a timeout says how long it waited" eval '
+  [[ "$(name_with "sleep 3" WTS_NAME_TIMEOUT=1)" == *"no answer in 1s"* ]]'
+check "without claude the warning says so" eval '
+  [[ "$(env PATH=/usr/bin:/bin WTS_NO_LLM= "$NAME" "export users as csv" 2>&1)" \
+     == *"claude not found in PATH"* ]]'
+check "WTS_NO_LLM stays silent" eval '
+  [[ "$("$NAME" "export users as csv" 2>&1)" == "export-users-csv" ]]'
+
 # ─── Inspect ─────────────────────────────────────────────────────────────────
 
 check "ls shows the session" eval '"$WTS" ls | grep -q "^auth-form "'
