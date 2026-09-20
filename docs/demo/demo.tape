@@ -1,7 +1,17 @@
 # The README demo. Run it through docs/demo/record.zsh (`make demo`), which
-# builds the sandbox this tape expects: a clone in ./wts, four sessions with
-# their agents blocked, working and idle, and a squash-merged branch. Needs
-# fzf 0.45 or newer for the reply step (tab).
+# builds the sandbox this tape expects: a clone in ./wts, two documents in the
+# library, four sessions with their agents blocked, working and idle, and a
+# squash-merged branch. Needs fzf 0.45 or newer for the reply step (tab), and
+# 0.65 or newer for the key table (?).
+#
+# One morning with four agents: a document put in the library, a session started
+# from a sentence, the agent that is blocked answered, another handed the
+# document while it works, a finished one stopped and then brought back, and the
+# merged branch collected.
+#
+# Rows in the popup are reached by typing a filter, never with Down: the list
+# re-sorts by urgency every WTS_SWITCH_REFRESH seconds, so a row moves under the
+# cursor as soon as the agent it shows changes state.
 #
 # Waits on the prompt use /❯$/, the line the cursor is on: your zsh prompt
 # (powerlevel10k) ends with that character when the command has returned.
@@ -54,31 +64,56 @@ Sleep 10s
 Show
 Sleep 4s
 
-# 3. The switcher: whoever needs you comes first, with a live preview of its
-# pane. gc-quiet is blocked on a numbered question: tab pins it, "1" + enter
-# answers from the popup and the preview shows the agent going on. Then
-# name-fallback, whose one-line job is done, is stopped with ctrl-x: the row
-# reads "stopped", the worktree stays.
+# 3. Somewhere else an agent is stuck on a question. prefix+a goes straight to
+# it: the engine already sorts blocked first, so no list is needed to find it.
+Ctrl+B
+Type "a"
+Sleep 4s
+
+# 4. The switcher: everyone at once, whoever needs you first, with a live
+# preview of the agent's pane. `?` unfolds everything the popup can do.
 Ctrl+B
 Type "s"
 Wait+Screen@20s /blocked/
 Sleep 2500ms
-Down
-Sleep 1500ms
-Down
-Sleep 1500ms
-Up
+Type "?"
+Sleep 3s
+Type "?"
 Sleep 1s
-Up
-Sleep 1s
+
+# 5. The blocked agent asked a numbered question: tab pins the row, "1" and
+# enter answer from the popup, and the preview shows the agent going on.
 Tab
 Sleep 1500ms
 Type "1"
 Sleep 800ms
 Enter
-Sleep 6s
+Sleep 5s
 Escape
 Sleep 1500ms
+
+# 6. The agent next door has been working without the conventions: ctrl-e
+# attaches the document to a session already running, and types the reference
+# into its pane — no restart, no re-pasting.
+#
+# The picker ctrl-e opens is the numbered one, not the fzf one: under fzf's
+# `execute` stdout is not a tty (stdin and stderr are), so pick_doc's
+# `-t 0 && -t 1` test fails and it degrades rather than give up. "2" is the
+# conventions document: record.zsh seeds big-repo first, scene 1 appends it.
+Type "stale"
+Sleep 1s
+Ctrl+E
+Sleep 2500ms
+Type "2"
+Sleep 1s
+Enter
+Sleep 4s
+Enter
+Sleep 2500ms
+
+# 7. name-fallback's one-line job is done: ctrl-x stops the session and keeps
+# the worktree. The row reads "stopped".
+Ctrl+U
 Type "name"
 Sleep 1s
 Ctrl+X
@@ -88,13 +123,11 @@ Type "y"
 Sleep 3s
 Ctrl+U
 Sleep 1s
-Type "gc"
-Sleep 1s
-Enter
-Sleep 4s
+Escape
+Sleep 1500ms
 
-# 4. The session's shell window: state of every session, then where each
-# one stands.
+# 8. The session's shell window: state of every session, then where each one
+# stands.
 Ctrl+B
 Type "n"
 Sleep 1s
@@ -116,9 +149,23 @@ Sleep 1500ms
 Hide
 Wait+Line@180s /❯$/
 Show
-Sleep 7s
+Sleep 6s
 
-# 5. Cleanup: the squash-merged branch goes, busy sessions stay.
+# 9. Second thoughts about the one that was stopped: restore replays it from
+# the registry, with `claude --continue` pre-filled in its pane. The same
+# command is what brings all of them back after a reboot.
+Hide
+Type "clear"
+Enter
+Sleep 500ms
+Show
+Type "wts restore"
+Sleep 500ms
+Enter
+Wait+Line@60s /❯$/
+Sleep 4s
+
+# 10. Cleanup: the squash-merged branch goes, busy sessions stay.
 Hide
 Type "clear"
 Enter
@@ -128,4 +175,4 @@ Type "wts gc --apply"
 Sleep 500ms
 Enter
 Wait+Line@60s /❯$/
-Sleep 7s
+Sleep 5s

@@ -98,24 +98,30 @@ tmux new-session -d -s demo-bootstrap -x "$COLS" -y "$ROWS"
 tmux set -g default-size "${COLS}x${ROWS}"
 
 print "record: starting the off-camera sessions"
+# A second document in the library, so the tape's ctrl-e opens a picker with
+# something to pick rather than a single row. A local file: wts-doc never calls
+# the model for one, so this costs no turn and touches no network.
+wts doc add docs/big-repo-analysis.md --name big-repo >/dev/null 2>&1 ||
+  die "wts doc add failed"
+
 start() { WTS_NO_ATTACH=1 wts "$@" >/dev/null 2>&1 || die "wts $1 failed to start" }
 start gc-quiet "Add a --quiet flag to wts gc. Before writing any code, ask me whether --quiet should also silence the warnings."
-start review-helpers "Review every script in libexec/wts/ for edge cases the README does not document. Read only: do not edit anything. Then list them by script."
+start stale-guard-docs "Document the stale guard in the README: read every script in libexec/wts/ to find each place it is involved, then draft the paragraph. Read only: do not edit anything."
 start name-fallback "In one sentence: what does libexec/wts/wts-name do when WTS_NO_LLM=1?"
-start ignore-orig
+start orig-leftovers
 tmux kill-session -t "=demo-bootstrap"
 
-# ignore-orig: one commit, pushed, squash-merged into the base, remote branch
+# orig-leftovers: one commit, pushed, squash-merged into the base, remote branch
 # deleted. That is the case `wts gc` exists for: git branch --merged misses it.
 g() { git -c commit.gpgsign=false "$@" }
-wt="$D/wts-worktrees/ignore-orig"
+wt="$D/wts-worktrees/orig-leftovers"
 print -r -- '*.orig' >> "$wt/.gitignore"
 g -C "$wt" commit -qam "Ignore *.orig merge leftovers"
-g -C "$wt" push -q -u origin ignore-orig
-g merge -q --squash ignore-orig
-g commit -qm "Ignore *.orig merge leftovers (#12)"
+g -C "$wt" push -q -u origin orig-leftovers
+g merge -q --squash orig-leftovers
+g commit -qm "Ignore *.orig merge leftovers (#13)"
 g push -q origin "$base"
-g push -q origin --delete ignore-orig
+g push -q origin --delete orig-leftovers
 
 # Claude asks whether to trust a folder it has never seen, and the default
 # answer is "No, exit": pick the other one. The answer is stored for the clone's
@@ -123,7 +129,7 @@ g push -q origin --delete ignore-orig
 # Then wait for the three states the switcher has to show.
 ready() {
   wts status --json | jq -e 'map({(.name): .agent_state}) | add
-    | .["gc-quiet"] == "blocked" and .["review-helpers"] == "working"
+    | .["gc-quiet"] == "blocked" and .["stale-guard-docs"] == "working"
       and .["name-fallback"] == "idle"' >/dev/null
 }
 print "record: waiting for the agents (blocked, working, idle)"
