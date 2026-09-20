@@ -8,7 +8,9 @@
 # Six categories, all restricted to the current repository:
 #   1. husk folders        — `git worktree remove` does NOT delete git-ignored
 #                            files, so a folder without `.git` is left behind
-#                            in <repo>-worktrees/.
+#                            in <repo>-worktrees/. wts's own .wts/ (the context
+#                            documents) is one, and is taken away just below
+#                            rather than left to become a husk.
 #   2. worktrees to remove — those holding a dead branch.
 #   3. dead branches       — content entirely present in the base.
 #   4. orphan branches     — remote gone, content MISSING from the base.
@@ -548,6 +550,12 @@ for rec in "${teardown[@]}"; do
     else
       tmux kill-session -t "=$sess" 2>/dev/null && print "✓ session $sess killed"
     fi
+  fi
+  # .wts/ holds the session's context documents and is git-ignored, so git
+  # leaves it behind and the folder becomes a husk (category 1) on the very
+  # next pass. Never a symlink, never anything but that folder.
+  if [[ -d "$wt/.wts" && ! -L "$wt/.wts" ]]; then
+    rm -rf -- "$wt/.wts"
   fi
   if git -C "$repo_root" worktree remove "$wt" 2>/dev/null; then
     print "✓ worktree $wt removed"

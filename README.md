@@ -97,6 +97,7 @@ wts rm auth-form -f                    # session + worktree + branch + registry 
 wts <name> ["<phrase>"] [layout] [context...]
 wts "<phrase>" [layout] [context...]
 wts new [-p layout] <name|"phrase">...
+wts doc add <url|path> | ls | show | sync | rm | use <slug> [name]
 wts ls
 wts status [--json|--table|--fzf]
 wts brief [name...]
@@ -116,6 +117,7 @@ wts auth-form feature                  # your "feature" layout: branch feature/a
 wts fix-ABC123 sentry ABC123           # "ABC123" reaches the layout as $WTS_CONTEXT
 wts new cors rate-limit csv-export     # three worktrees and sessions at once
 wts review/login-flow                  # an existing origin branch: checked out for review
+wts auth-form "rate-limit it" --doc api-spec   # with a context document attached
 wts rm auth-frm -f                     # typo-tolerant: resolves to auth-form
 ```
 
@@ -240,6 +242,8 @@ branch and the registry entry stay, the popup stays open and the row reads
 `stopped`), `ctrl-d` removes it entirely (`wts rm`), `ctrl-o` opens the branch's
 pull request on GitHub (`wts pr`, through `gh pr view --web`: without a PR the popup
 says so and stays open; without `gh` the key is neither bound nor listed),
+`ctrl-e` attaches a [context document](#context-documents-wts-doc) to the session
+and tells its agent (`wts doc use`, picker included),
 `ctrl-f` / `ctrl-b` scroll the preview by half a page, `ctrl-r` reloads. The
 current session is never killed from the popup, which it would close. tmux
 sessions unknown to wts are listed after, and `ctrl-x` works on them too.
@@ -362,6 +366,100 @@ wts new "rate-limit the API per key" "export as CSV"   # names proposed one by o
 `exec tmuxinator start`, so the first call replaces the process. `wts new` starts
 each session detached, then attaches to the first. Creations are sequential: in
 parallel, two similar phrases could get the same name.
+
+## Context documents: `wts doc`
+
+A technical spec in Notion, an architecture page, a file of conventions on disk:
+the same context, pasted by hand into every new agent. `wts doc` keeps a small
+library of those documents — fetched once, cached — and `--doc` attaches one to a
+session.
+
+```sh
+wts doc add https://www.notion.so/Payments-architecture-abc123   # once, ~10-30 s
+wts auth-form "limit the rate per key" --doc payments-architecture
+wts auth-form "limit the rate per key" --doc    # pick one from the library
+wts fix-typo "a comma too many"                 # nothing attached
+```
+
+**Nothing is attached unless you ask for it.** There is deliberately no
+per-repository pinning: several projects run at once, and the document that
+matters to one worktree is noise in the next.
+
+`--doc` is repeatable and takes a slug of `wts doc ls`, a URL, or a path. It
+**always consumes the next argument** — a bare `--doc` at the very end of the
+line opens an fzf picker instead. `wts <name> <layout> --doc <slug>` is the
+unambiguous order, and `--doc=<slug>` works anywhere.
+
+### Where it lands
+
+wts writes `<worktree>/.wts/context.md` — every attached document one after
+another, each with its title, source and fetch date — and the Claude pane starts
+on `claude "Read @.wts/context.md first, …"`. The folder carries its own
+`.gitignore` containing `*`, so it never appears in `git status`, never makes a
+worktree look dirty to `wts gc`, and goes away with the worktree.
+
+Layouts receive the path in `WTS_DOC`, relative to the pane's working directory
+(Claude Code resolves an `@` reference from the pane's cwd). A layout of your own
+picks it up with the few lines the built-in `default.yml` uses.
+
+### Fetching: whatever this machine can read
+
+A URL is fetched by a headless `claude -p` started with **this machine's own MCP
+configuration**, and the model uses whatever tool can read it. Nothing about a
+particular provider is hardcoded, on purpose: the same page sits behind a Notion
+connector on one machine and behind a gateway with entirely different tool names
+on another, and both work with no configuration.
+
+The allow list is built per server from `claude mcp list` (cached for a day —
+the CLI refuses a bare `mcp__*` wildcard in an allow rule), plus `WebFetch`, with
+every write-shaped tool denied. `WTS_DOC_TOOLS='mcp__<server>__*'` pins it when
+that enumeration is noisy or when only one connector should ever be used.
+
+A local markdown file never calls the model at all, and is re-read on every attach.
+
+**When nothing can read it, the document degrades to a pointer:** the context
+file carries the URL and asks the agent to fetch it itself. The agent in the pane
+has your full set of connectors and often succeeds where the headless call could
+not. The same happens offline, without `claude`, or with `WTS_NO_LLM=1`.
+
+### Freshness
+
+`wts doc add` fetches. On attach, a URL older than `WTS_DOC_TTL` (24 h) is
+fetched again, under a timeout, falling back to the cache when the network or the
+connector is missing — so an attach is never blocked by them. `wts doc sync`
+refreshes on demand. A fetch that comes back a fraction of the cached size is
+refused and the cache kept (`--force` accepts it): silently replacing a good spec
+with a stub is the worst thing this could do.
+
+### Attaching to a session already running
+
+```sh
+wts doc use payments-architecture             # from inside the worktree
+wts doc use payments-architecture auth-form   # or by name, typo-tolerant
+```
+
+The context file is rewritten and the reference is sent into the agent's pane, so
+an agent already working picks it up without being restarted. In the switcher,
+`ctrl-e` does the same on the highlighted row, picker included.
+
+```
+wts doc add <url|path> [--name <slug>] [--force]   add a document
+wts doc ls                                         the library
+wts doc show <slug>                                what will be injected
+wts doc sync [<slug>...] [--force]                 fetch again
+wts doc rm <slug>                                  forget it
+wts doc use <slug> [<session>]                     attach to a running session
+wts doc tools [--refresh]                          what the fetch may use
+```
+
+The library itself is `~/.config/wts/docs.json` (`WTS_DOCS_PATH`), four keys per
+entry and meant to be edited by hand; the fetched content is a cache, under
+`~/.local/state/wts/docs/`.
+
+> **Privacy.** `wts doc add` and `wts doc sync` send the document's URL to the
+> model through your own `claude -p`, which then reads the page with your own
+> connectors. The content is written in clear text inside the worktree. Set
+> `WTS_NO_LLM=1` to never call the model — documents then stay pointers.
 
 ## Garbage collection
 
@@ -535,6 +633,13 @@ locale (`LANG=C`), Ruby refuses to read them ("invalid byte sequence in US-ASCII
 | `WTS_NAME_TIMEOUT`      | `30`                          | naming timeout, seconds                                |
 | `WTS_BRIEF_TIMEOUT`     | `45`                          | timeout of one summary, seconds                        |
 | `WTS_BRIEF_JOBS`        | `4`                           | concurrent summaries                                   |
+| `WTS_DOCS_PATH`         | `~/.config/wts/docs.json`     | the context document library                           |
+| `WTS_DOC_TTL`           | `86400`                       | seconds before an attached URL document is fetched again |
+| `WTS_DOC_TIMEOUT`       | `90`                          | fetch timeout, seconds (MCP handshakes are slow)       |
+| `WTS_DOC_MODEL`         | `sonnet`                      | model used to fetch a document (fidelity over latency) |
+| `WTS_DOC_TOOLS`         | (enumerated)                  | pinned allow patterns for the fetch, space-separated   |
+| `WTS_DOC_TOOLS_TTL`     | `86400`                       | seconds the `claude mcp list` enumeration is cached    |
+| `WTS_DOC_MAX_BYTES`     | `200000`                      | cap on a document, and on all of them together         |
 | `WTS_STALE_AFTER`       | `10`                          | seconds before a frozen `working` agent shows `stuck?` |
 | `WTS_SWITCH_REFRESH`    | `2`                           | switcher refresh interval, `0` for a static list       |
 | `WTS_SWITCH_SCROLLBACK` | `2000`                        | lines of tmux history reachable in the preview         |
@@ -617,6 +722,13 @@ the repository has not enabled them. Measurements and the reasoning are in
   else breaks.
 - The restore pre-fill (`print -z`) assumes zsh in the panes.
 - `wts rm` and `wts gc` act on the repository of the current directory.
+- **A document fetched through `WebFetch` is a model's rendering of the page, not
+  the page.** That tool summarizes whatever it reads, and asking it not to does not
+  change that. A document read through an MCP connector comes back verbatim; check
+  with `wts doc show <slug>` when fidelity matters.
+- **A document's content is written in clear text inside the worktree**
+  (`.wts/context.md`). Keep secrets out of the library.
+- A session named `doc` is shadowed by the subcommand, as `pr` and `rm` already are.
 
 ## Contributing
 

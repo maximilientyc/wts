@@ -20,6 +20,47 @@
   shows. Behind Amazon Bedrock or Google Vertex AI, where the `haiku` alias need not
   resolve, that is the difference between a puzzling name and a one-line diagnosis
   (set `WTS_MODEL` to the id your platform accepts).
+- **`wts doc`: the context document you keep pasting into every agent, attached in
+  one word.** A spec in Notion, an architecture page, a file of conventions on
+  disk — the link was found again, the page waited for and the prompt rewritten at
+  every new worktree. `wts doc add <url|path>` puts a document in a small library,
+  fetched once and cached, and `wts <name> "<phrase>" --doc <slug>` attaches it:
+  wts writes `<worktree>/.wts/context.md` and the Claude pane starts on
+  `claude "Read @.wts/context.md first, …"`. Nothing is attached unless asked —
+  there is no per-repository pinning on purpose, since several projects run at once
+  and the document that matters to one worktree is noise in the next. `--doc` is
+  repeatable, takes a slug, a URL or a path, and a bare `--doc` at the end of the
+  line opens a picker. Layouts get the path in `WTS_DOC`.
+- **The fetch uses whatever *this* machine can read.** A URL is fetched by a
+  headless `claude -p` started with the machine's own MCP configuration, and the
+  model picks the tool that can reach it: nothing about a provider is hardcoded,
+  because the same page sits behind a Notion connector on one machine and behind a
+  gateway with entirely different tool names on another. The allow list is built
+  per server from `claude mcp list` and cached for a day (the CLI refuses a bare
+  `mcp__*` wildcard in an allow rule), every write-shaped tool is denied, and
+  `WTS_DOC_TOOLS` pins it by hand. When nothing can read the document it degrades
+  to a **pointer**: the context file carries the URL and asks the agent to fetch it
+  itself, which it usually can — it has the full set of connectors the headless
+  call does not. A local file never calls the model at all.
+- **`wts doc use <slug> [session]` attaches to a session already running**, and
+  sends the reference into the agent's pane so it picks the document up without
+  being restarted. **`ctrl-e`** in the switcher does the same on the highlighted
+  row, picker included; it is unbound while replying, where it is an end-of-line
+  reflex. `wts-switch --send` is now the single place that knows how to type into
+  an agent's pane.
+- The attached documents are recorded in the registry, so `wts restore` re-exports
+  `WTS_DOC` and rebuilds a context file that disappeared — from the cache, never
+  from the network: a restore is not an explicit attach.
+- `.wts/` carries its own `.gitignore` containing `*` rather than an entry in
+  `info/exclude`, which git shares between **every** worktree and the main checkout
+  and which would have outlived `wts rm`. The worktree therefore stays clean in
+  `git status`, which is what keeps `wts gc` able to tear it down and `wts ls` from
+  showing it dirty forever. `wts rm` and `wts gc` take the folder away before
+  `git worktree remove`, which leaves git-ignored files behind and would have made
+  a husk out of every session that ever had a document.
+- A URL fetched through `WebFetch` comes back as the model's rendering of the page,
+  not the page: that tool summarizes whatever it reads, whatever it is asked. An
+  MCP connector returns it verbatim. `wts doc show <slug>` is there to check.
 
 ## 0.3.1 — 2026-09-20
 

@@ -12,6 +12,7 @@
 #   ctrl-d   delete the session (wts rm) and reload
 #   ctrl-x   kill the tmux session only (wts stop), after a y/N prompt
 #   ctrl-o   open the session's pull request on GitHub (wts pr, needs gh)
+#   ctrl-e   attach a context document to the session (wts doc use)
 #   ctrl-f   scroll the preview down half a page
 #   ctrl-b   scroll the preview up half a page
 #   ?        show or hide the full key list in the footer (fzf >= 0.65)
@@ -342,7 +343,7 @@ reply() { # $1 = verb, then verb arguments
       footer=$(footer_action)
       # `?` goes with ctrl-d and ctrl-x: unbound, it is typed into the reply
       # instead of opening the key list, which is what a reply needs it for.
-      local switched="ctrl-d,ctrl-x"
+      local switched="ctrl-d,ctrl-x,ctrl-e"
       footer_active && switched="$switched,?"
       # `|` as the argument delimiter: `)` is legal in a tmux session name.
       chain=(disable-search clear-query "unbind($switched)" refresh-preview
@@ -351,7 +352,7 @@ reply() { # $1 = verb, then verb arguments
       ;;
     leave)
       rm -f "$WTS_SWITCH_REPLY"
-      local switched="ctrl-d,ctrl-x"
+      local switched="ctrl-d,ctrl-x,ctrl-e"
       footer_active && switched="$switched,?"
       # After the reply file is gone, so the footer is the list's again.
       footer=$(footer_action)
@@ -516,6 +517,27 @@ open_pr() { # $1 = session name
   return 0
 }
 
+# ─── Context document ────────────────────────────────────────────────────────
+# ctrl-e: `wts doc use` on the selected row, under `execute` like ctrl-o. With
+# no slug it opens the library picker, an inner fzf: `execute` hands over the
+# alternate screen and blocks this one until it exits — the same terminal
+# kill_session reads its y/N from. It always waits for a key: unlike ctrl-o,
+# nothing else takes the focus, and what was attached is worth reading.
+attach_doc() { # $1 = session name
+  local name="$1"
+  [[ -n "$name" ]] || return 0   # `execute` also fires on an empty list
+  print -n '\e[2J\e[H'
+  if [[ -z "$WTS_CMD" ]]; then
+    print -r -- "wts: wts not found next to this helper nor in PATH — any key"
+    wait_key
+    return 0
+  fi
+  "$WTS_CMD" doc use "" "$name"
+  print -n "press any key"
+  wait_key
+  return 0
+}
+
 # Exposes the function to the subshell fzf starts for `reload`.
 #
 # A full pass leaves its pid in WTS_SWITCH_BUSY while it runs and its duration
@@ -580,6 +602,19 @@ fi
 
 if [[ "${1:-}" == "--pr" ]]; then
   open_pr "${2:-}"
+  exit 0
+fi
+
+if [[ "${1:-}" == "--doc" ]]; then
+  attach_doc "${2:-}"
+  exit 0
+fi
+
+# `wts doc use` sends into an agent's pane too. The `=name:` target form and the
+# pause before Enter are hard-won and not worth having in two places, so that
+# knowledge stays here and wts-doc calls this verb.
+if [[ "${1:-}" == "--send" ]]; then
+  send_reply "${2:-}" "${3:-}"
   exit 0
 fi
 
@@ -757,6 +792,16 @@ if [[ -n "$WTS_CMD" ]] && command -v gh >/dev/null 2>&1; then
   pr_bind=(--bind="ctrl-o:execute('$self' --pr {3})")
 fi
 
+# ctrl-e: `wts doc use` on the selected row. Bound only when the helper is
+# there, and wts-keys reads WTS_SWITCH_DOC so the footer lists exactly the keys
+# that work. No reload: the list has nothing new to show, but the preview does.
+typeset -a doc_bind
+doc_bind=()
+if [[ -n "$WTS_CMD" && -x "$WTS_BIN/wts-doc" ]]; then
+  export WTS_SWITCH_DOC=1
+  doc_bind=(--bind="ctrl-e:execute('$self' --doc {3})+refresh-preview")
+fi
+
 # ─── Live refresh ────────────────────────────────────────────────────────────
 # fzf has no timer event: its bindable events are start, load, resize, result,
 # change, focus, multi, one, zero, backward-eof, jump, jump-cancel,
@@ -841,6 +886,7 @@ selection=$(print -r -- "$list" | fzf \
   "${delete_bind[@]}" \
   "${kill_bind[@]}" \
   "${pr_bind[@]}" \
+  "${doc_bind[@]}" \
   --bind="ctrl-f:execute-silent('$self' --scroll {2} {3} down)+refresh-preview" \
   --bind="ctrl-b:execute-silent('$self' --scroll {2} {3} up)+refresh-preview" \
 ) || exit 0

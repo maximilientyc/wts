@@ -15,6 +15,10 @@
 
 set -uo pipefail
 
+# Resolved at top level, never inside a function: with zsh's FUNCTION_ARGZERO,
+# $0 there is the function's name, not this file.
+WTS_KEYS_DIR="${0:A:h}"
+
 SEP=$'\x1f'
 
 # <key> <terse, for the collapsed line> <what it does>
@@ -28,16 +32,18 @@ KEYS=(
   "^x${SEP}stop${SEP}stop the session, keep the worktree"
   "^d${SEP}rm${SEP}remove session, worktree and branch"
   "^o${SEP}pr${SEP}open the pull request on GitHub"
+  "^e${SEP}doc${SEP}attach a context document"
   "^f/^b${SEP}scroll${SEP}scroll the preview half a page"
   "^r${SEP}reload${SEP}reload the list now"
   "esc${SEP}close${SEP}close, or leave reply mode"
   "?${SEP}keys${SEP}show or hide these keys"
 )
 
-# ctrl-o exists only with gh: the switcher binds it then and exports
-# WTS_SWITCH_PR for its footer subprocesses; `wts keys` looks for gh itself. The
-# entry is dropped here rather than in the renderers, so the footer and the
-# terminal list never disagree with what is bound.
+# ctrl-o exists only with gh, ctrl-e only with the wts-doc helper: the switcher
+# binds them then and exports WTS_SWITCH_PR / WTS_SWITCH_DOC for its footer
+# subprocesses; `wts keys` looks for itself. The entries are dropped here rather
+# than in the renderers, so the footer and the terminal list never disagree with
+# what is bound.
 typeset -g IN_FOOTER=0
 has_pr() {
   if (( IN_FOOTER )); then
@@ -46,13 +52,23 @@ has_pr() {
     command -v gh >/dev/null 2>&1
   fi
 }
+has_doc() {
+  if (( IN_FOOTER )); then
+    [[ "${WTS_SWITCH_DOC:-}" == 1 ]]
+  else
+    [[ -x "$WTS_KEYS_DIR/wts-doc" ]]
+  fi
+}
 prune_keys() {
-  has_pr && return 0
-  local raw
+  local raw drop
   local -a kept
+  drop=()
+  has_pr  || drop+=("^o")
+  has_doc || drop+=("^e")
+  (( ${#drop} )) || return 0
   kept=()
   for raw in "${KEYS[@]}"; do
-    [[ "$raw" == "^o${SEP}"* ]] || kept+=("$raw")
+    [[ -n "${drop[(r)${raw%%${SEP}*}]:-}" ]] || kept+=("$raw")
   done
   KEYS=("${kept[@]}")
 }
@@ -183,11 +199,12 @@ text() {
     f=("${(@ps:\x1f:)raw}")
     printf '  %-7s %s\n' "$f[1]" "$f[3]"
   done
-  if has_pr; then
-    print -r -- "  ctrl-x is 'wts stop', ctrl-d is 'wts rm', ctrl-o is 'wts pr'."
-  else
-    print -r -- "  ctrl-x is 'wts stop', ctrl-d is 'wts rm'."
-  fi
+  # Names the command behind each key, and only the keys actually bound.
+  local -a behind
+  behind=("ctrl-x is 'wts stop'" "ctrl-d is 'wts rm'")
+  has_pr  && behind+=("ctrl-o is 'wts pr'")
+  has_doc && behind+=("ctrl-e is 'wts doc use'")
+  print -r -- "  ${(j:, :)behind}."
   print -r -- ""
   print -r -- "tmux (from 'wts setup tmux')"
   tmux_keys
