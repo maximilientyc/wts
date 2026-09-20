@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- **Naming falls back to the local name far less often.** A naming call answers in
+  3 to 16 seconds (measured over a dozen calls on this machine), and it was capped
+  at 15: two runs in five were killed mid-answer, the phrase was named locally, and
+  nothing said the model had been called at all — the worktree this was found in was
+  itself named that way. `WTS_NAME_TIMEOUT` now defaults to 30 seconds.
+- **A call that fails says why.** `wts-name` and `wts brief` sent the model call's
+  stderr to `/dev/null`, so a missing `claude`, an expired login, a corporate proxy
+  and a timeout all read `Claude unavailable or no answer`. The warning now carries
+  the timeout it hit, the status `claude` exited with, or the line `claude` wrote
+  itself; `wts brief` prints the same reason above the raw facts it falls back to.
+- **A model id `claude` does not recognize can no longer become a branch name.** It
+  is not a failure it exits on: it answers in prose with status 0, and *"There's an
+  issue with the selected model…"* kebab-cased and cut to 40 characters looks like a
+  perfectly good branch name. An answer longer than six words is now refused, and
+  the `[claude-code:unrecognized_model]` line written on stderr is what the warning
+  shows. Behind Amazon Bedrock or Google Vertex AI, where the `haiku` alias need not
+  resolve, that is the difference between a puzzling name and a one-line diagnosis
+  (set `WTS_MODEL` to the id your platform accepts).
+
 ## 0.3.1 — 2026-09-20
 
 - **`ctrl-o` in the switcher opens the session's pull request on GitHub.** Reaching

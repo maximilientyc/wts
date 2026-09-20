@@ -158,9 +158,12 @@ arguments (layout and context keep their places), then the Claude pane starts wi
 SUBJECT column until Claude names the conversation.
 
 **Without a name**, `wts-name` asks Claude Haiku for a 2–4 word kebab-case slug
-(about 5 s). The call is isolated: `--safe-mode`, hooks disabled, no MCP server, no
+(3 to 15 s). The call is isolated: `--safe-mode`, hooks disabled, no MCP server, no
 tool, no transcript, run outside any worktree. Past `WTS_NAME_TIMEOUT`, without
-`claude`, or with `WTS_NO_LLM=1`, the name is derived locally from the phrase.
+`claude`, with `WTS_NO_LLM=1`, or when the answer is not a name, the name is derived
+locally from the phrase and a warning on stderr says which of those happened — an
+unrecognized `WTS_MODEL` included, which `claude` answers in prose rather than with
+a failure.
 
 **A proposed name is always unique.** Otherwise branch resolution would silently
 check out another session's branch. It gets `-2`, `-3`… until it is free
@@ -216,8 +219,8 @@ uncommitted changes and the transcript's size and date: while nothing moved,
 `wts brief` answers instantly. The transcript used is the live agent's, else the
 most recent one of the worktree — never one older than the session, which would
 belong to a previous session of the same name. Without `claude`, with
-`WTS_NO_LLM=1`, or when the answer is malformed, the raw facts are shown. The model
-is never called by `wts ls` or the switcher.
+`WTS_NO_LLM=1`, or when the answer is malformed, the raw facts are shown, under the
+reason the summary is missing. The model is never called by `wts ls` or the switcher.
 
 > **Privacy.** `wts brief` sends to the model, through your own `claude -p`: the
 > branch's commit log and diff stats, the session's starting prompt, your last
@@ -529,7 +532,7 @@ locale (`LANG=C`), Ruby refuses to read them ("invalid byte sequence in US-ASCII
 | `WTS_BRANCH_PREFIX`     | from the layout               | branch prefix override, even empty                     |
 | `WTS_MODEL`             | `haiku`                       | model used for naming and `wts brief`                  |
 | `WTS_NO_LLM`            | (none)                        | `1`: never call the model                              |
-| `WTS_NAME_TIMEOUT`      | `15`                          | naming timeout, seconds                                |
+| `WTS_NAME_TIMEOUT`      | `30`                          | naming timeout, seconds                                |
 | `WTS_BRIEF_TIMEOUT`     | `45`                          | timeout of one summary, seconds                        |
 | `WTS_BRIEF_JOBS`        | `4`                           | concurrent summaries                                   |
 | `WTS_STALE_AFTER`       | `10`                          | seconds before a frozen `working` agent shows `stuck?` |
@@ -539,6 +542,12 @@ locale (`LANG=C`), Ruby refuses to read them ("invalid byte sequence in US-ASCII
 | `CLAUDE_CONFIG_DIR`     | `~/.claude`                   | where Claude Code keeps sessions and transcripts       |
 
 `XDG_STATE_HOME` and `XDG_CONFIG_HOME` are honored.
+
+`WTS_MODEL` is passed to `claude --model` as is. The `haiku` alias resolves on the
+Claude API; behind Amazon Bedrock or Google Vertex AI it need not — ids are prefixed
+(`anthropic.claude-haiku-4-5`) or dated with an `@` there. Set `WTS_MODEL` to the id
+your platform accepts: an id `claude` does not recognize is answered in prose, which
+`wts` reports as `claude: [claude-code:unrecognized_model]` and falls back from.
 
 ### Base branch detection
 
