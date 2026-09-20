@@ -566,10 +566,22 @@ export XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_STATE_HOME="$XDG_STATE_HOME"
 _=\$("$ROOT/libexec/wts/wts-doc" pick)
 EOF
 chmod +x "$SANDBOX/bin/pick-probe"
+# A title of more than two words, to catch the other half of the bug: the rows
+# are printf-padded columns and fzf splits on runs of whitespace, so the
+# --with-nth=1,2,3 that used to be here showed the slug and the first two words
+# of the title -- and never the kind or the age.
+LONG="$SANDBOX/contract.md"
+print -rl -- "# The idempotent webhook delivery contract" "" "One retry." > "$LONG"
+"$WTS" doc add "$LONG" --name contract >/dev/null
 tmux new-session -d -s pickprobe -x 100 -y 20 "$SANDBOX/bin/pick-probe"
 check "the doc picker opens fzf on a terminal, not the numbered list" \
   pane_contains pickprobe "doc>"
+check "the picker shows the whole title, not its first two words" \
+  pane_contains pickprobe "The idempotent webhook delivery contract"
+check "the picker shows the kind and age columns too" \
+  pane_contains pickprobe "file"
 tmux kill-session -t "=pickprobe" 2>/dev/null || true
+"$WTS" doc rm contract >/dev/null
 
 "$WTS" rm docsess -f >/dev/null
 refute "rm leaves no husk behind .wts/" test -d "$WT/docsess"

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **The document picker shows the whole row.** Now that the picker opens (0.4.1),
+  what it displays is wrong: `--with-nth=1,2,3` was meant to pick the slug, title
+  and kind columns, but `doc_table` aligns those with `printf` padding and fzf's
+  default delimiter is a run of whitespace — so the three fields were the slug and
+  the first *two words* of the title. `The product spec` read `The product`, and
+  the kind and age columns never showed at all. The flag is gone: the row is
+  already a table, and the picker now prints the one `wts doc ls` does.
+
 ## 0.4.1 — 2026-09-20
 
 - **The document picker actually opens.** A bare `--doc`, `wts doc use` without a

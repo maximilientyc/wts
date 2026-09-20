@@ -679,8 +679,13 @@ pick_doc() {  # -> a slug on stdout, empty when the user gave up
   # command substitution inside fzf's own `execute`. Stdin and stderr are the
   # terminal on all of those paths, and fzf draws on /dev/tty, not on stdout.
   if command -v fzf >/dev/null 2>&1 && [[ -t 0 && -t 2 ]]; then
+    # No --with-nth: doc_table aligns its columns with printf padding, and
+    # fzf's default delimiter is a run of whitespace, so 1,2,3 selected the
+    # slug and the first two words of the title -- "The product spec" showed
+    # as "The product", and kind and age never showed at all. The row is
+    # already a table; show it whole, the one `wts doc ls` prints.
     choice=$(doc_table | fzf --reverse --height=100% --no-multi \
-                             --prompt='doc> ' --with-nth=1,2,3 2>/dev/null)
+                             --prompt='doc> ' 2>/dev/null)
     print -r -- "${${(z)choice}[1]:-}"
     return 0
   fi
