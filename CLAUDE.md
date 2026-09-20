@@ -63,6 +63,12 @@ straight from the checkout. Scripts locate each other from their own path
 - A layout pane that runs `claude` runs the **real** Claude Code even inside a
   sandbox whose PATH starts with a stub: the pane's login shell rebuilds PATH.
   Sandbox layouts must name the stub by absolute path (`test/bench-big.zsh`).
+- An interactive picker whose output is captured must not gate on `-t 1`. A
+  helper that answers on stdout is read from a command substitution, which makes
+  stdout a pipe in front of a real terminal — measured: `0-2` there, `012` only
+  when nothing captures it (fzf's `execute` does hand its child all three).
+  Test `-t 0`/`-t 2`; fzf draws on `/dev/tty`, not on the captured stdout, and
+  works with its own stderr on `/dev/null`.
 - Field separator `\x1f`, not TAB: TAB is IFS whitespace, so `read` merges
   consecutive delimiters and shifts empty fields.
 - Globs that may match nothing need `(N)`, or zsh prints "no matches found".

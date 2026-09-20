@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- **The document picker actually opens.** A bare `--doc`, `wts doc use` without a
+  slug and the switcher's `ctrl-e` all advertise an fzf picker over the library;
+  none of them ever showed one. The picker was gated on `[[ -t 0 && -t 1 ]]`, and
+  `-t 1` cannot be true: the picker answers with a slug on stdout and every caller
+  reads it from a command substitution, so stdout is a pipe even in front of a real
+  terminal. `ctrl-e` was the worst hit — it goes through `wts doc use ""`, one more
+  command substitution, inside fzf's own `execute` — and the numbered fallback it
+  landed on prints to the screen `execute` had just handed over. The test is now
+  `[[ -t 0 && -t 2 ]]`: stdin and stderr are the terminal on all of those paths,
+  and fzf draws on `/dev/tty`, not on the captured stdout. The numbered list stays
+  for a run with no terminal or no fzf, where it was always the right answer.
+
 ## 0.4.0 — 2026-09-20
 
 - **Naming falls back to the local name far less often.** A naming call answers in
