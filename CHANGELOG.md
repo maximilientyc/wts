@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-09-20
 
 - **Naming falls back to the local name far less often.** A naming call answers in
   3 to 16 seconds (measured over a dozen calls on this machine), and it was capped
