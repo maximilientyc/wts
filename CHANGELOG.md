@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0 — unreleased
+
+- **`ctrl-o` in the switcher opens the session's pull request on GitHub.** Reaching
+  the PR of a session meant switching to it, reading the branch and opening GitHub
+  by hand. The key runs the new `wts pr [name]` (the current session when run inside
+  one), which is `gh pr view <branch> --web` in the session's repository: it finds
+  the PR by head branch, merged or closed ones included, on a GitHub Enterprise
+  remote too. Without a PR the popup prints why and waits for a key, like `ctrl-x`.
+  `gh` is optional: without it the key is not bound, and the footer and `wts keys`
+  do not list it.
+
 ## 0.3.0 — 2026-09-19
 
 Measured on a generated 150k-file repository with 8 sessions and 3000 local branches (`make bench`; the numbers, the method and what was found are in `docs/big-repo-analysis.md`).

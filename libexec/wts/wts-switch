@@ -11,6 +11,7 @@
 #   ctrl-r   reload the list by hand
 #   ctrl-d   delete the session (wts rm) and reload
 #   ctrl-x   kill the tmux session only (wts stop), after a y/N prompt
+#   ctrl-o   open the session's pull request on GitHub (wts pr, needs gh)
 #   ctrl-f   scroll the preview down half a page
 #   ctrl-b   scroll the preview up half a page
 #   ?        show or hide the full key list in the footer (fzf >= 0.65)
@@ -498,6 +499,23 @@ kill_session() { # $1 = session name, $2 = display line (its 2nd word is AGENT)
   return 0
 }
 
+# ─── Pull request ────────────────────────────────────────────────────────────
+# ctrl-o: `wts pr` on the selected row, under `execute` like ctrl-x. Only a
+# failure (no PR for the branch, unregistered session, gh not logged in) waits
+# for a key: on success the browser has the focus and the list comes back.
+open_pr() { # $1 = session name
+  local name="$1"
+  [[ -n "$name" ]] || return 0   # `execute` also fires on an empty list
+  print -n '\e[2J\e[H'
+  if [[ -z "$WTS_CMD" ]]; then
+    print -r -- "wts: wts not found next to this helper nor in PATH — any key"
+    wait_key
+    return 0
+  fi
+  "$WTS_CMD" pr "$name" || { print -n "press any key"; wait_key }
+  return 0
+}
+
 # Exposes the function to the subshell fzf starts for `reload`.
 #
 # A full pass leaves its pid in WTS_SWITCH_BUSY while it runs and its duration
@@ -557,6 +575,11 @@ fi
 
 if [[ "${1:-}" == "--kill" ]]; then
   kill_session "${2:-}" "${3:-}"
+  exit 0
+fi
+
+if [[ "${1:-}" == "--pr" ]]; then
+  open_pr "${2:-}"
   exit 0
 fi
 
@@ -723,6 +746,17 @@ if [[ -n "$WTS_CMD" ]]; then
   kill_bind=(--bind="ctrl-x:execute('$self' --kill {3} {1})+reload('$self' --list)")
 fi
 
+# ctrl-o: `wts pr` needs gh. Without it the key is not bound, and wts-keys reads
+# WTS_SWITCH_PR so the footer lists exactly the keys that work. No reload: the
+# list has nothing new to show. Kept bound in reply mode: harmless there, and
+# the unbind/rebind lists stay the same whether gh is installed or not.
+typeset -a pr_bind
+pr_bind=()
+if [[ -n "$WTS_CMD" ]] && command -v gh >/dev/null 2>&1; then
+  export WTS_SWITCH_PR=1
+  pr_bind=(--bind="ctrl-o:execute('$self' --pr {3})")
+fi
+
 # ─── Live refresh ────────────────────────────────────────────────────────────
 # fzf has no timer event: its bindable events are start, load, resize, result,
 # change, focus, multi, one, zero, backward-eof, jump, jump-cancel,
@@ -806,6 +840,7 @@ selection=$(print -r -- "$list" | fzf \
   --bind="ctrl-r:reload('$self' --list)" \
   "${delete_bind[@]}" \
   "${kill_bind[@]}" \
+  "${pr_bind[@]}" \
   --bind="ctrl-f:execute-silent('$self' --scroll {2} {3} down)+refresh-preview" \
   --bind="ctrl-b:execute-silent('$self' --scroll {2} {3} up)+refresh-preview" \
 ) || exit 0

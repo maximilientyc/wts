@@ -300,6 +300,72 @@ refute "an fzf without --footer is never handed a change-footer" \
 "$SWITCH" --reply esc >/dev/null
 unset WTS_SWITCH_REPLY WTS_SWITCH_HELP WTS_SWITCH_COLS
 
+# ─── pr: ctrl-o and `wts pr` ─────────────────────────────────────────────────
+# A stand-in gh: logs where and how it is called, and knows exactly one PR. The
+# real gh would hit the network and needs a login; CI has one on PATH, so every
+# "without gh" case below runs with a PATH that has nothing but zsh and jq.
+export WTS_SMOKE_GH_LOG="$SANDBOX/gh.log"
+export WTS_SMOKE_PR_BRANCH="feature/auth-form"
+cat > "$SANDBOX/bin/gh" <<'EOF'
+#!/bin/sh
+printf '%s\t%s\n' "$PWD" "$*" >> "$WTS_SMOKE_GH_LOG"
+if [ "$1" = pr ] && [ "$2" = view ] && [ "$3" = "$WTS_SMOKE_PR_BRANCH" ]; then
+  echo "Opening https://example.test/pull/1 in your browser."
+  exit 0
+fi
+echo "no pull requests found for branch \"$3\"" >&2
+exit 1
+EOF
+chmod +x "$SANDBOX/bin/gh"
+mkdir -p "$SANDBOX/nogh"
+ln -s "$(command -v jq)" "$SANDBOX/nogh/jq"
+ln -s "$(command -v zsh)" "$SANDBOX/nogh/zsh"
+
+# Exit non-zero, and the message (stdout or stderr) matches.
+fails_with() { # <pattern> <cmd...>
+  local pat="$1" out; shift
+  out=$("$@" 2>&1) && return 1
+  print -r -- "$out" | grep -q -- "$pat"
+}
+
+check "wts pr opens the pull request of the session's branch" \
+  eval '"$WTS" pr auth-form | grep -q "Opening https://example.test/pull/1"'
+check "gh runs in the repository, by head branch, with --web" \
+  grep -qxF "$REPO	pr view feature/auth-form --web" "$WTS_SMOKE_GH_LOG"
+check "a branch without a pull request says so and fails" \
+  fails_with "no pull requests found" "$WTS" pr export-users-csv
+check "a tmux session wts never created is refused before gh" \
+  fails_with "not a wts session" "$WTS" pr "$LONG"
+refute "gh was not asked about that session" grep -q "$LONG" "$WTS_SMOKE_GH_LOG"
+check "no name outside tmux is a usage error" fails_with "Usage: wts pr" "$WTS" pr
+# `env`, not a prefix assignment on fails_with: that would strip grep from the
+# helper too.
+check "without gh, wts pr says what to install" \
+  fails_with "gh not found" env PATH="$SANDBOX/nogh" "$WTS" pr auth-form
+
+# The bind is gated on gh the same way, and the key list follows the bind.
+check "fzf accepts the ctrl-o bind" \
+  eval 'printf "x\n" | fzf --bind="ctrl-o:execute(true)" --filter=x'
+check "the switcher binds ctrl-o to --pr" grep -qF "ctrl-o:execute('\$self' --pr {3})" "$SWITCH"
+check "--pr on an empty list is a no-op" eval '[[ -z $("$SWITCH" --pr "" </dev/null) ]]'
+check "wts keys lists ctrl-o with gh" eval '"$WTS" keys | grep -F "  ^o " | grep -q "pull request"'
+check "wts keys hides ctrl-o without gh, and keeps the rest" \
+  eval 'out=$(PATH="$SANDBOX/nogh" "$KEYS") && print -r -- "$out" | grep -q "^  ^x " \
+        && ! print -r -- "$out" | grep -q "\^o"'
+check "the footer lists ctrl-o when the switcher bound it" \
+  eval 'WTS_SWITCH_COLS=89 WTS_SWITCH_PR=1 "$KEYS" --footer collapsed | grep -qF "^o pr"'
+refute "the footer hides ctrl-o when it is not bound" \
+  eval 'WTS_SWITCH_COLS=89 "$KEYS" --footer collapsed | grep -qF "^o pr"'
+check "the footer still fits with ctrl-o" \
+  eval 'for w in 24 40 60 89 200; do
+          for mode in collapsed expanded reply; do
+            while IFS= read -r line; do
+              (( ${#line} <= w - 2 )) || exit 1
+            done < <(WTS_SWITCH_COLS=$w WTS_SWITCH_PR=1 "$KEYS" --footer $mode)
+          done
+        done'
+check "wts pr is completed" grep -q '"pr:open the session' "$ROOT/completions/_wts"
+
 # ─── No collector may take a worktree's index.lock ───────────────────────────
 # `git status` creates <gitdir>/index.lock before it scans and only releases it
 # after writing the refreshed index back. The collector statuses every registered

@@ -33,6 +33,8 @@ one person's workflow. It is shared in case that workflow is also yours.
   state columns, naming from a phrase, `wts brief`, resume on restore. Without it
   everything else works and the agent columns show `-`.
 - Optional: [direnv](https://direnv.net), for a per-repository `WTS_SUBDIR`
+- Optional: [gh](https://cli.github.com), for `ctrl-o` in the switcher and `wts pr`
+  (open the session's pull request). Without it the key is not offered.
 
 ## Install
 
@@ -100,6 +102,7 @@ wts status [--json|--table|--fzf]
 wts brief [name...]
 wts restore [name...]
 wts stop <name>
+wts pr [name]
 wts rm <name> [-f]
 wts gc [--apply] [--no-fetch]
 wts layouts
@@ -231,10 +234,12 @@ unfolds the whole table — the tmux bindings included, since those are the ones
 you cannot press from inside the popup. `enter` switches, `ctrl-x`
 kills the selected tmux session (`wts stop`, after a y/N prompt: the worktree, the
 branch and the registry entry stay, the popup stays open and the row reads
-`stopped`), `ctrl-d` removes it entirely (`wts rm`), `ctrl-f` / `ctrl-b` scroll the
-preview by half a page, `ctrl-r` reloads. The current session is never killed from
-the popup, which it would close. tmux sessions unknown to wts are listed after, and
-`ctrl-x` works on them too.
+`stopped`), `ctrl-d` removes it entirely (`wts rm`), `ctrl-o` opens the branch's
+pull request on GitHub (`wts pr`, through `gh pr view --web`: without a PR the popup
+says so and stays open; without `gh` the key is neither bound nor listed),
+`ctrl-f` / `ctrl-b` scroll the preview by half a page, `ctrl-r` reloads. The
+current session is never killed from the popup, which it would close. tmux
+sessions unknown to wts are listed after, and `ctrl-x` works on them too.
 
 The footer is sized to the list: a narrow popup keeps the keys you press most
 and drops the rest, `?` still shows them all. While you are filtering the list,

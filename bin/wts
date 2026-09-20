@@ -9,6 +9,7 @@
 #        wts brief [name...]
 #        wts restore [name...]
 #        wts stop <name>
+#        wts pr [name]
 #        wts rm <name> [-f]
 #        wts gc [--apply] [--no-fetch]
 #        wts layouts
@@ -32,6 +33,8 @@
 #                registry entry stay (wts restore restarts it)
 #   rm         : delete the tmux session, the worktree and the branch
 #     -f       : force (dirty worktree, unmerged branch)
+#   pr         : open the session's pull request on GitHub (needs gh); the
+#                current session when run inside one
 #   gc         : clean up from the remote: worktrees and branches whose PR is
 #                merged (squash included) or whose remote branch is gone,
 #                plus any stale index.lock blocking writes in a worktree
@@ -50,6 +53,7 @@
 #   wts brief
 #   wts restore
 #   wts stop auth-form
+#   wts pr auth-form
 #   wts rm auth-form -f
 
 set -euo pipefail
@@ -573,6 +577,67 @@ if [[ "$1" == "stop" ]]; then
     echo "→ worktree kept, wts restore $SESSION restarts it"
   fi
   exit 0
+fi
+
+# ─── Subcommand: pr ──────────────────────────────────────────────────────────
+# `gh pr view <branch> --web` in the session's repository. gh rather than a URL
+# built from the remote: it finds the PR by head branch (merged and closed ones
+# too), and works on a GitHub Enterprise remote. The switcher's ctrl-o calls this.
+
+if [[ "$1" == "pr" ]]; then
+  if [[ $# -gt 2 ]]; then
+    echo "Usage: wts pr [name]" >&2
+    exit 1
+  fi
+
+  if [[ $# -eq 2 ]]; then
+    # Session name: slashes sanitized, as at creation (team/foo → team-foo).
+    SESSION="${2//\//-}"
+  elif [[ -n "${TMUX:-}" ]]; then
+    # #S is only meaningful under $TMUX: outside a client it names the last
+    # used session, which is not "the session I am in".
+    SESSION=$(tmux display-message -p '#S' 2>/dev/null)
+  else
+    echo "Usage: wts pr <name> (no name needed inside a tmux session)" >&2
+    exit 1
+  fi
+
+  if ! registry_available || [[ ! -s "$WTS_STATE_FILE" ]]; then
+    echo "wts: '$SESSION' is not a wts session" >&2
+    exit 1
+  fi
+  if resolved=$(registry_resolve_name "$SESSION"); then
+    SESSION="$resolved"
+  else
+    exit 1
+  fi
+  # The switcher also lists tmux sessions wts never created, and ctrl-o works
+  # on any row: say so instead of asking gh about an unknown branch.
+  if ! jq -e --arg n "$SESSION" 'has($n)' "$WTS_STATE_FILE" >/dev/null 2>&1; then
+    echo "wts: '$SESSION' is not a wts session" >&2
+    exit 1
+  fi
+  BRANCH=$(jq -r --arg n "$SESSION" '.[$n].branch // ""' "$WTS_STATE_FILE")
+  REPO_ROOT=$(jq -r --arg n "$SESSION" '.[$n].repo_root // ""' "$WTS_STATE_FILE")
+  if [[ -z "$BRANCH" || ! -d "$REPO_ROOT" ]]; then
+    echo "wts: '$SESSION' has no branch or repository in the registry" >&2
+    exit 1
+  fi
+
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "wts: gh not found (brew install gh)" >&2
+    exit 1
+  fi
+
+  # gh's own line ("Opening … in your browser.") is the success message. On
+  # failure its stderr is the reason, and names the branch (no PR for it, not
+  # logged in): one line, prefixed, so the popup shows something readable.
+  if out=$(cd "$REPO_ROOT" && gh pr view "$BRANCH" --web 2>&1); then
+    [[ -n "$out" ]] && print -r -- "$out"
+    exit 0
+  fi
+  print -u2 -r -- "wts: ${out:-gh pr view failed for branch '$BRANCH'}"
+  exit 1
 fi
 
 # ─── Subcommand: rm ──────────────────────────────────────────────────────────
