@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.3 — 2026-09-24
+
+- **A fetch that fails says why, and the run stays useful.** `wts gc` ran its fetch
+  with `2>/dev/null`, so `Remote: fetch failed — analysis on local state` was
+  everything a broken fetch ever said, whatever had broken. That hid the one failure
+  that costs the most: `--prune` builds a *single* ref transaction for every deletion
+  it has to make, so one ref git cannot lock loses the whole fetch — `origin/<base>`
+  included — and every category then compares against a base days old and proposes
+  nothing. gc now prints git's first lines verbatim, retries without `--prune` (each
+  update its own transaction, so the base does come back fresh) and says precisely
+  what is left degraded: only the `[gone]` detection, hence cat. 4. And it names the
+  cause when it is the one behind `cannot lock ref`: two remote-tracking refs
+  differing only by case — `origin/rm/x` and `origin/RM/x` — are **one path** on a
+  case-insensitive filesystem, which is most macOS checkouts. Found on a repository
+  where 4 such pairs among 13,901 refs had been blocking all 11,564 prunes for days;
+  `git fetch` alone worked, so nothing pointed at it. The repair gc prints is one
+  `git update-ref -d` per ref, because two in a transaction collide all over again.
+- Fixed on the way: the stderr capture used `mktemp -t <prefix>`, which is BSD-only.
+  With Homebrew's coreutils ahead of it in `PATH` that is "too few X's in template",
+  and the capture fell back to `/dev/null` — the very bug being fixed.
+
 ## 0.4.2 — 2026-09-20
 
 - **The document picker shows the whole row.** Now that the picker opens (0.4.1),
