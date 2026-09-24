@@ -712,4 +712,49 @@ check "merged seen through origin/<base>" \
 check "base still reports the short name" \
   eval '"$WTS" status --json | jq -e ".[] | select(.name == \"fresh-cut\") | .base == \"main\""'
 
+# ─── gc: a fetch that fails says why ─────────────────────────────────────────
+# `wts gc` used to run its fetch with 2>/dev/null, so "fetch failed" was all any
+# broken fetch ever said — and a fetch it cannot prune is the one failure that
+# makes gc find nothing at all (an aborted transaction leaves origin/<base>
+# behind too). Both checks need the remote added just above.
+
+git -C "$REPO" remote set-url origin "$SANDBOX/code/gone.git"
+check "gc prints git's own error" eval '
+  out=$("$WTS" gc 2>/dev/null)
+  [[ "$out" == *"fetch --prune FAILED"* && "$out" == *"does not appear to be a git repository"* ]]'
+check "a network failure names no colliding ref" eval '
+  out=$("$WTS" gc 2>/dev/null)
+  [[ "$out" != *"differ only by case"* ]]'
+git -C "$REPO" remote set-url origin "$ORIGIN"
+
+# Two refs differing only by case are ONE path on a case-insensitive filesystem,
+# which is most macOS checkouts: the prune can neither lock them separately nor
+# match their old values, so its single transaction aborts and takes the fetch
+# with it. Reproduced exactly as a real repository gets there: pack the first ref
+# away, after which nothing on disk stops the second spelling from being created.
+if print -n '' > "$SANDBOX/A" && [[ -e "$SANDBOX/a" ]]; then
+  rm -f "$SANDBOX/A"
+  sha=$(git -C "$REPO" rev-parse main)
+  other=$(git -C "$REPO" rev-parse main^)
+  git -C "$REPO" update-ref refs/remotes/origin/zz/gone "$sha"
+  git -C "$REPO" pack-refs --all
+  git -C "$REPO" update-ref refs/remotes/origin/ZZ/gone "$other"
+  check "gc names the refs colliding by case" eval '
+    out=$("$WTS" gc 2>/dev/null)
+    [[ "$out" == *"differ only by case"* \
+    && "$out" == *"refs/remotes/origin/zz/gone"* \
+    && "$out" == *"refs/remotes/origin/ZZ/gone"* \
+    && "$out" == *"update-ref -d"* ]]'
+  # One deletion per command: the two of them in a single transaction is the
+  # collision itself, and the repair gc prints has to work.
+  git -C "$REPO" update-ref -d refs/remotes/origin/ZZ/gone
+  git -C "$REPO" update-ref -d refs/remotes/origin/zz/gone
+  check "gc is happy again once they are gone" eval '
+    out=$("$WTS" gc)
+    [[ "$out" == *"fetch --prune ok"* ]]'
+else
+  rm -f "$SANDBOX/A"
+  ok "case collision skipped (case-sensitive filesystem)"
+fi
+
 print -r -- "── $passed checks passed"

@@ -42,7 +42,14 @@
 #   - orphan branches (cat. 4) are NEVER deleted automatically: a deleted remote
 #     branch does not prove its work landed anywhere;
 #   - an index.lock is only reported once it is empty, several minutes old and
-#     held by nobody: deleting a live one corrupts its owner's index.
+#     held by nobody: deleting a live one corrupts its owner's index;
+#   - a `--prune` is ONE ref transaction for every deletion, so a single ref git
+#     cannot lock loses the whole fetch, origin/<base> included, and every
+#     category below then compares against a base days old. The fetch keeps
+#     git's stderr for that reason, and retries without --prune. Known cause on
+#     macOS: two refs differing only by case (origin/rm/x and origin/RM/x) are
+#     ONE path on a case-insensitive filesystem, so neither can be locked nor
+#     verified separately, and the transaction aborts.
 #
 # Variables: WTS_LOCK_STALE_AFTER (300 s before an index.lock counts as stale).
 
@@ -91,14 +98,93 @@ $APPLY && print "Mode: DELETE" || print "Mode: dry run (--apply to execute)"
 # ─── Sync with the remote ────────────────────────────────────────────────────
 # Without --prune, a branch deleted on origin keeps its local tracking ref and
 # goes unnoticed. The prune is what makes `[gone]` appear.
+
+# Remote-tracking refs that differ only by case. On a case-insensitive
+# filesystem (APFS, by default) they are ONE path: packed-refs holds both names
+# happily, `git rev-parse` answers the same loose file for both, and a prune can
+# neither lock them separately nor match their old values — the transaction
+# aborts and the whole fetch goes with it. This is the one fetch failure whose
+# message ("cannot lock ref") says nothing about the cause, and its repair is one
+# deletion per ref, so it is worth naming. Only called when a fetch has failed.
+case_colliding_refs() {
+  git -C "$repo_root" for-each-ref --format='%(refname)' refs/remotes/ 2>/dev/null | awk '
+    { k = tolower($0)
+      if (k in seen) { if (!(k in shown)) { print seen[k]; shown[k] = 1 } print }
+      else seen[k] = $0 }'
+}
+
+# git's stderr used to go to /dev/null, which left "fetch failed" as the only
+# thing a broken fetch ever said.
+#
+# The FIRST lines, not a grep for `^(error|fatal):`: git leads with its diagnosis
+# and trails with boilerplate, and the most useful line often carries no prefix at
+# all — an authentication failure opens on ssh's own "git@github.com: Permission
+# denied (publickey)." and only then says `fatal:`. Nothing else writes on stderr
+# here, since the fetch is --quiet.
+report_fetch_error() {
+  local f="$1" l
+  local -a lines
+  [[ -s "$f" ]] || return 0
+  lines=("${(@f)$(<"$f")}")
+  lines=("${(@)lines:#}")          # git pads with blank lines before boilerplate
+  for l in "${lines[@]:0:3}"; do print "  $l"; done
+  # A failing prune can print one `error:` per ref it could not lock: cap, count.
+  (( ${#lines} > 3 )) && print "  (+ $(( ${#lines} - 3 )) more line(s) from git)"
+  return 0
+}
+
+# True when the fetch failed on a ref it could not write, rather than on the
+# network. Only then is the case collision below worth naming: those refs are
+# real either way, but they are not why an unreachable remote failed.
+is_ref_lock_failure() {
+  local f="$1"
+  # No capture (mktemp failed) means no way to tell: say yes rather than hide the
+  # one hint that explains an otherwise mute failure.
+  [[ -n "$f" ]] || return 0
+  grep -qE "cannot lock ref|could not delete references|\.lock': File exists" "$f" 2>/dev/null
+}
+
 if $FETCH && [[ -n "$(git -C "$repo_root" remote 2>/dev/null)" ]]; then
   # The longest silence of the command on a real remote: say it is happening.
   [[ -t 2 ]] && print -u2 "→ fetch --all --prune…"
-  if git -C "$repo_root" fetch --all --prune --quiet 2>/dev/null; then
+  # Spelled out rather than `mktemp -t wts-gc-fetch`: with GNU coreutils in front
+  # of the BSD one (Homebrew), `-t` without X's is "too few X's in template" and
+  # the capture silently went back to /dev/null. Same form as wts-name.
+  fetch_err=$(mktemp "${TMPDIR:-/tmp}/wts-gc-fetch.XXXXXX" 2>/dev/null) || fetch_err=""
+  if git -C "$repo_root" fetch --all --prune --quiet 2>"${fetch_err:-/dev/null}"; then
     print "Remote: fetch --prune ok"
   else
-    print "Remote: fetch failed — analysis on local state (results may be stale)"
+    print "Remote: fetch --prune FAILED"
+    report_fetch_error "$fetch_err"
+    # An aborted transaction updated NOTHING, origin/<base> included. Without
+    # --prune each update is its own transaction and the refs that cannot be
+    # deleted are simply not part of it, so this second fetch does go through:
+    # the base is fresh again and only `[gone]` stays out of reach.
+    if git -C "$repo_root" fetch --all --quiet 2>/dev/null; then
+      print "  refs updated without --prune: the base is fresh, but a deleted"
+      print "  remote is not seen, so cat. 4 (orphan branches) under-reports"
+    else
+      print "  analysis on local state (results may be stale)"
+    fi
+    typeset -a collisions
+    collisions=()
+    is_ref_lock_failure "$fetch_err" && collisions=("${(@f)$(case_colliding_refs)}")
+    collisions=("${(@)collisions:#}")
+    if (( ${#collisions} )); then
+      # "not a stale lock" on purpose: git's own second line blames a concurrent
+      # process or a leftover .lock, and cat. 6 below is about exactly that, so a
+      # reader is one step from hunting a lock that was never there.
+      print "  not a stale lock: ${#collisions} remote-tracking refs differ only by case —"
+      print "  one path on a case-insensitive filesystem, which the prune cannot lock:"
+      for ref in "${collisions[@]:0:8}"; do print "    $ref"; done
+      (( ${#collisions} > 8 )) && print "    … and $(( ${#collisions} - 8 )) more"
+      # One command per ref on purpose: two of them in a single transaction is
+      # exactly the collision. A `for` loop calling git once per ref is fine.
+      print "  → repair, one deletion per command:"
+      print "       git -C $repo_root update-ref -d <each ref above>"
+    fi
   fi
+  [[ -n "$fetch_err" ]] && rm -f "$fetch_err"
 else
   print "Remote: not consulted (--no-fetch)"
 fi
