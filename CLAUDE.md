@@ -15,6 +15,8 @@ libexec/wts/wts-name       slug from a phrase (Claude Haiku, local fallback)
 libexec/wts/wts-keys       the key table: switcher footer and `wts keys`
 libexec/wts/wts-brief      done/next per session (Claude Haiku, cached)
 libexec/wts/wts-doc        context document library: fetch (any MCP), cache, materialize
+libexec/wts/wts-db.zsh     the state database (SQLite): schema, import, helpers; sourced by all
+libexec/wts/wts-context    Claude Code SessionStart hook: tells an agent about the other sessions
 share/wts/layouts/         built-in layouts (default.yml)
 examples/layouts/          richer layouts, not installed as built-ins
 completions/_wts           zsh completion
@@ -45,6 +47,10 @@ straight from the checkout. Scripts locate each other from their own path
   precisely a job for the machine's own connectors, whose names differ from one
   machine to the next, so the allow list is enumerated, never hardcoded.
 - Layout files stay ASCII (Ruby reads them under `LANG=C` otherwise fails).
+- State goes through `wts-db.zsh`, never a file of its own: `db_q` to write,
+  `db_ro`/`db_rows` to read, every value through `sql_str`. The tables other
+  than `notes` are written by wts only; `wts db` gives agents read access to all
+  and write access to `notes` alone.
 
 ## zsh and tmux pitfalls already hit
 
@@ -76,6 +82,16 @@ straight from the checkout. Scripts locate each other from their own path
 - Outside a tmux client, `tmux display-message -p '#S'` returns the most recently
   used session, not "none": only trust it when `$TMUX` is set.
 - Unix socket paths are capped at 104 bytes on macOS (fzf `--listen`, tmux).
+- `sqlite3`: always `-init /dev/null` (a user's `~/.sqliterc` with `.mode box`
+  changes every output), and `.timeout` on every connection, or a concurrent
+  writer fails with "database is locked". Rows with free text (prompts span
+  lines) are read with `-ascii`: `\x1f` between fields, `\x1e` after each row,
+  `read -d $'\x1e'`. `-newline ''` returns a value byte for byte.
+- Quoting in zsh: `"${v//\'/\'\'}"` keeps the backslashes (inside double quotes
+  `\'` is literal). Put the quote in a variable: `q="'"; "${v//$q/$q$q}"`.
+- A SQL string passed as an argument to sqlite3 is not scanned for dot-commands
+  past its start, but an argument that starts with `.` is one: `wts db sql` adds
+  `-safe` so `.shell` and `readfile()` stay out of reach.
 - A `TMUX_TMPDIR` that does not exist is **silently ignored** (tmux 3.4+): the
   command runs against `/tmp`, the real server. Create the folder before any
   `tmux kill-server` in a sandbox, or name the socket with `-S`. Same trap with
