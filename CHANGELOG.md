@@ -1,5 +1,70 @@
 # Changelog
 
+## 1.1.0 — 2026-09-28
+
+Teardown stops destroying the evidence. Schema 2, imported automatically on the
+first command; nothing existing changes shape or behaviour.
+
+- **`wts gc --apply` and `wts rm` now archive what they tear down**, into a new
+  `archive` table that nothing ever deletes. They used to do the opposite:
+  `registry_del` and gc's closing transaction dropped the session row, its brief
+  and its notes, so the moment a piece of work became tellable was the moment wts
+  forgot it. Kept per finished session: the phrase it started from, the branch and
+  its base, the outcome, the pull request, the commit subjects, the paths touched,
+  the diffstat, the agents' notes and the last brief. The teardown SQL is
+  otherwise unchanged — the archive only ever inserts, before the delete — so if
+  capture fails, teardown proceeds exactly as before.
+- **A four-line retrospective per finished session** (`delivered` / `resisted` /
+  `resolved` / `abandoned`), written by Haiku at `wts gc --apply` while the
+  transcript still exists. Not a convenience: Claude Code deletes transcripts
+  after 30 days by default (measured on the machine this was built on: 275
+  transcripts, none older than that), while a performance review looks six months
+  back. `resisted` and `resolved` are read mostly from the author's own
+  corrections to the agent, the only place friction is recorded. A partial answer
+  is kept rather than rejected — the opposite of `wts brief`'s rule, because the
+  source will be gone. `wts retro` writes the ones gc could not; `gc --no-retro`
+  and `WTS_NO_LLM=1` skip the call, and the facts are archived either way.
+- **`wts log`**: the whole window as one JSON document — archived sessions, live
+  ones, and completed Things 3 tasks that never had a worktree, which is where
+  meetings, mentoring and incidents live. `--since`/`--until` take an ISO date or
+  a sqlite modifier (`-6 months`), `--brief` drops the bulk, `--no-notes` drops
+  the free text. The payload carries `version: 1`; its `outcome` vocabulary
+  (`merged squashed remote-deleted removed abandoned in-progress unknown`) is now
+  a public contract, listed in CLAUDE.md beside `agent_state`.
+- **`wts task`**: the durable unit above a session. One task, one to N sessions,
+  so `wts log` can show three attempts over five weeks instead of three unrelated
+  branches. `wts task link` attaches a session, `--task` links at creation,
+  `wts task ls` is the grouped view. Read-only towards Things 3: its database is
+  opened with `-readonly`, there is no write verb, and the schema is checked
+  before use so a Things upgrade degrades with a reason instead of answering
+  something subtly wrong. `wts task new` covers a machine without Things.
+- **The links in a task's notes become context documents.** `--task` reads the
+  URLs out of the task and attaches them as pointers, so the agent opens on the
+  Notion page or the Slack thread the author already curated instead of being
+  told to go and find it. Pointers rather than fetches on purpose: one to three
+  links per task, a sonnet fetch capped at 90 s each, and a private page is
+  exactly what the sandboxed fetch cannot read and the agent in the pane can.
+- **A `*` in the SUBJECT column** marks a session that serves a task. Only a
+  sign, and the task title only when nothing else is known: `wts ls` and the
+  switcher stay one flat list, because that is the view that has to stay
+  scannable. `wts status --json` gains `task` and `task_title`.
+- **The transcript is kept**, gzipped, under `~/.local/state/wts/transcripts/`
+  (about 2–5 MB per semester), so `wts log` can report whether the raw
+  conversation is still readable — `transcript.available`, tested at export time.
+  `WTS_ARCHIVE_TRANSCRIPT=0` turns the copy off, `WTS_NO_ARCHIVE=1` the capture.
+- **Fixed: the first command in a fresh state directory exited 1 without
+  printing anything.** `db_init` ends by cleaning up the pre-1.0 cache
+  directories, and `rmdir` on a directory that never existed returns 1 — which
+  `set -e` in `bin/wts` turned into an abort, after the schema had been created.
+  A new install's very first `wts ls` said nothing at all.
+- **Fixed: two installed wts versions fought over the schema version.** The check
+  compared for equality, so an older binary wrote its own, lower version back and
+  the two migrated against each other forever, one write transaction per process
+  each way. It is `>=` now; every change to this schema is additive.
+- Privacy is documented next to the command it concerns: `wts log` prints
+  prompts, commit subjects, file paths, agent notes and your task notes on
+  stdout, and it is the most sensitive thing wts produces.
+
 ## 1.0.1 — 2026-09-28
 
 - **The `SessionStart` hook now asks for something.** `wts-context` listed the

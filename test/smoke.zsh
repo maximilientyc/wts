@@ -793,11 +793,18 @@ prompt_survives() {
 check "a multiline prompt with an apostrophe survives the import" prompt_survives
 bare_defaults() { [[ "$(qo "SELECT docs || created_at FROM sessions WHERE name = 'bare'")" == '[]2'* ]] }
 check "a sparse entry gets defaults" bare_defaults
+# registry_json gained `task` and `task_title` when the task layer landed, so the
+# output is compared on the keys the pre-1.0 file had: the promise to the jq
+# readers is that none of those may change value or disappear, not that nothing
+# may ever be added beside them.
 same_shape() {
-  diff <(jq -S .legacy "$OLD/wts/sessions.json.migrated") \
-       <(XDG_STATE_HOME="$OLD" zsh -c 'source "$1/libexec/wts/wts-db.zsh"; registry_json' _ "$ROOT" | jq -S .legacy)
+  local old="$OLD/wts/sessions.json.migrated" keys
+  keys=$(jq -c '.legacy | keys' "$old") || return 1
+  diff <(jq -S .legacy "$old") \
+       <(XDG_STATE_HOME="$OLD" zsh -c 'source "$1/libexec/wts/wts-db.zsh"; registry_json' _ "$ROOT" \
+         | jq -S --argjson k "$keys" '.legacy | with_entries(select(.key | IN($k[])))')
 }
-check "the registry reads back in the old shape" same_shape
+check "every pre-1.0 registry key reads back unchanged" same_shape
 check "a second run imports nothing more" \
   eval '[[ -z "$(XDG_STATE_HOME="$OLD" "$WTS" db path 2>&1 >/dev/null)" ]]'
 
@@ -883,5 +890,178 @@ else
   rm -f "$SANDBOX/A"
   ok "case collision skipped (case-sensitive filesystem)"
 fi
+
+# ─── Capture: archive, retro, log, tasks ─────────────────────────────────────
+# The point of the feature is that teardown stops destroying the evidence, so
+# the checks are about what survives a `wts rm`, not about what it prints.
+
+# A fresh state directory used to abort the very first command: db_init's
+# trailing rmdir returns 1 on a directory that never existed, and bin/wts runs
+# under set -e. It created the schema and then exited without printing anything.
+check "a first-ever command in a fresh state directory works" eval '
+  out=$(env XDG_STATE_HOME="$SANDBOX/fresh-state" "$WTS" ls 2>&1)
+  [[ "$out" == *"No registered session"* ]]'
+
+cd "$REPO"
+env WTS_NO_ATTACH=1 "$WTS" archsess smoke "keep this" >/dev/null
+"$WTS" rm archsess -f >/dev/null
+
+check "wts rm archives the session" eval '[[ "$(q "select count(*) from archive where session = '\''archsess'\''")" == 1 ]]'
+check "and still removes it from the registry" eval '[[ "$(q "select count(*) from sessions where name = '\''archsess'\''")" == 0 ]]'
+check "the archive keeps the context the registry held" eval '
+  [[ "$(q "select context from archive where session = '\''archsess'\''")" == "keep this" ]]'
+check "rm -f records the work as abandoned" eval '
+  [[ "$(q "select outcome from archive where session = '\''archsess'\''")" == abandoned ]]'
+check "no retrospective is written by rm" eval '
+  [[ -z "$(q "select retro_delivered from archive where session = '\''archsess'\''")" ]]'
+
+env WTS_NO_ATTACH=1 "$WTS" noarch smoke >/dev/null
+env WTS_NO_ARCHIVE=1 "$WTS" rm noarch -f >/dev/null
+check "WTS_NO_ARCHIVE keeps the capture out" eval '
+  [[ "$(q "select count(*) from archive where session = '\''noarch'\''")" == 0 ]]'
+
+# The retrospective. Same stand-in shape as the naming stubs: it reads stdin
+# first, because the real claude does and a stub that exits on a full pipe would
+# fail the pipeline rather than the call.
+RSTUBS="$SANDBOX/retro-stubs"
+mkdir -p "$RSTUBS"
+retro_with() { # <sh-body> [env=value...] — wts retro against that stand-in
+  local body="$1"; shift
+  print -r -- "#!/bin/sh
+cat >/dev/null
+$body" > "$RSTUBS/claude"
+  chmod +x "$RSTUBS/claude"
+  env PATH="$RSTUBS:$PATH" WTS_NO_LLM= "$@" "$WTS" retro --force archsess 2>&1
+}
+
+check "a four-line answer is stored field by field" eval '
+  retro_with "printf \"delivered: the bucket shipped\nresisted: a flaky spec\nresolved: pinned the clock\nabandoned: -\n\"" >/dev/null
+  [[ "$(q "select retro_delivered from archive where session = '\''archsess'\''")" == "the bucket shipped" \
+  && "$(q "select retro_resisted from archive where session = '\''archsess'\''")" == "a flaky spec" \
+  && "$(q "select retro_resolved from archive where session = '\''archsess'\''")" == "pinned the clock" ]]'
+check "bold labels are tolerated" eval '
+  retro_with "printf \"**delivered:** shipped it\n\"" >/dev/null
+  [[ "$(q "select retro_delivered from archive where session = '\''archsess'\''")" == "shipped it" ]]'
+# A transcript is deleted within 30 days, so a partial answer is worth more than
+# an error whose evidence is gone: the opposite rule from wts-brief.
+check "a partial answer is kept, not rejected" eval '
+  retro_with "printf \"delivered: only this line\n\"" >/dev/null
+  [[ "$(q "select retro_delivered from archive where session = '\''archsess'\''")" == "only this line" \
+  && "$(q "select retro_resisted from archive where session = '\''archsess'\''")" == unknown ]]'
+check "a failing claude records why, and counts nothing" eval '
+  out=$(retro_with "echo boom >&2; exit 1")
+  [[ "$out" == *"0 of 1"* \
+  && "$(q "select retro_error from archive where session = '\''archsess'\''")" == *boom* ]]'
+check "a timeout says how long it waited" eval '
+  retro_with "sleep 3" WTS_RETRO_TIMEOUT=1 >/dev/null
+  [[ "$(q "select retro_error from archive where session = '\''archsess'\''")" == *"no answer in 1s"* ]]'
+check "without a model the facts stay archived and it says so" eval '
+  out=$("$WTS" retro --force archsess 2>&1)
+  [[ "$out" == *"no model available"* && "$out" == *"facts are archived"* ]]'
+
+# `wts log` is a public contract: version, the resolved window, and one work
+# array whatever the sources.
+check "wts log emits a versioned document" eval '
+  "$WTS" log --no-things | jq -e ".version == 1 and (.work | type) == \"array\"" >/dev/null'
+check "the window accepts an ISO date and a sqlite modifier" eval '
+  "$WTS" log --no-things --since 2020-01-01 | jq -e ".range.since | startswith(\"2020-01-01\")" >/dev/null
+  "$WTS" log --no-things --since "-1 days" | jq -e ".range.since != \"\"" >/dev/null'
+check "an unreadable window is refused rather than guessed" \
+  fails_with "cannot read --since" "$WTS" log --since "not a date"
+check "the archived session is one work item with one session" eval '
+  "$WTS" log --no-things --since 2020-01-01 \
+    | jq -e "[.work[] | select(.sessions[]?.name == \"archsess\")] | length == 1" >/dev/null'
+check "--brief drops the bulk and keeps the retrospective" eval '
+  "$WTS" log --no-things --since 2020-01-01 --brief \
+    | jq -e "[.work[].sessions[]] | all(.commits == [] and .notes == {})" >/dev/null'
+check "without Things the corpus says so and keeps the wts half" eval '
+  "$WTS" log --no-things --since 2020-01-01 \
+    | jq -e ".sources.things.available == false and .sources.things.reason != \"\" and (.work | length) > 0" >/dev/null'
+check "WTS_NO_THINGS is reported as the reason" eval '
+  env WTS_NO_THINGS=1 "$WTS" log --since 2020-01-01 \
+    | jq -e ".sources.things.reason | test(\"WTS_NO_THINGS\")" >/dev/null'
+
+# The task layer. A local task, because the sandbox has no Things.
+TASK=$(env WTS_NO_THINGS=1 "$WTS" task new "Ship the audit trail")
+check "wts task new prints a local id" eval '[[ "$TASK" == local:* ]]'
+env WTS_NO_ATTACH=1 WTS_NO_THINGS=1 "$WTS" tsess smoke --task "$TASK" >/dev/null
+check "--task links the session it created" eval '
+  [[ "$(q "select task from task_links where session = '\''tsess'\''")" == "$TASK" ]]'
+# The highest-value half of the task layer: the URLs the author keeps in the task
+# become context documents, as pointers rather than fetches — a task carries one
+# to three links and paying a sonnet fetch each at creation would put minutes in
+# front of a starting agent.
+check "a task's links become context documents" eval '
+  q "update tasks set links = json('"'"'[{\"url\":\"https://notion.test/cbs\",\"host\":\"notion.test\",\"kind\":\"notion\"}]'"'"') where id = \"$TASK\"" >/dev/null
+  env WTS_NO_ATTACH=1 WTS_NO_THINGS=1 "$WTS" docfromtask smoke --task "$TASK" >/dev/null
+  grep -qF "https://notion.test/cbs" "$WT/docfromtask/.wts/context.md"'
+check "and they are recorded as pointers, not failed fetches" eval '
+  grep -qF "kind: pointer" "$WT/docfromtask/.wts/context.md"'
+# The slug comes from the URL path, not the host, so the assertion is on the list
+# being filled at all: that is what makes `wts restore` and `wts doc sync` see them.
+check "the session records them in its own document list" eval '
+  [[ "$(q "select json_array_length(docs) from sessions where name = '"'"'docfromtask'"'"'")" -ge 1 ]]'
+"$WTS" rm docfromtask -f >/dev/null
+
+check "the session carries the marker in ls" eval '
+  "$WTS" ls | grep -q "^tsess .*\* "'
+check "status --json exposes task and task_title" eval '
+  "$WTS" status --json --no-git tsess \
+    | jq -e ".[0].task == \"$TASK\" and .[0].task_title == \"Ship the audit trail\"" >/dev/null'
+# The one mistake --task can make, and it must name it rather than create a
+# worktree whose task is a layout.
+check "--task followed by a layout is named, and creates nothing" eval '
+  out=$(env WTS_NO_ATTACH=1 WTS_NO_THINGS=1 "$WTS" tbad --task smoke 2>&1) && false
+  [[ "$out" == *"is a layout, not a task"* ]] && [[ ! -e "$WT/tbad" ]]'
+check "a second session can serve the same task" eval '
+  env WTS_NO_ATTACH=1 WTS_NO_THINGS=1 "$WTS" tsess2 smoke >/dev/null
+  env WTS_NO_THINGS=1 "$WTS" task link "$TASK" tsess2 >/dev/null
+  [[ "$(q "select count(*) from task_links where task = '\''$TASK'\''")" == 2 ]]'
+check "wts task ls groups them under the task" eval '
+  out=$(env WTS_NO_THINGS=1 "$WTS" task ls)
+  [[ "$out" == *"Ship the audit trail"* && "$out" == *tsess* && "$out" == *tsess2* ]]'
+check "the task survives teardown, in the archive row" eval '
+  "$WTS" rm tsess -f >/dev/null
+  [[ "$(q "select task from archive where session = '\''tsess'\''")" == "$TASK" ]]'
+check "and the live link went with the session" eval '
+  [[ "$(q "select count(*) from task_links where session = '\''tsess'\''")" == 0 ]]'
+check "unlink detaches without removing the session" eval '
+  env WTS_NO_THINGS=1 "$WTS" task unlink tsess2 >/dev/null
+  [[ "$(q "select count(*) from task_links where session = '\''tsess2'\''")" == 0 \
+  && "$(q "select count(*) from sessions where name = '\''tsess2'\''")" == 1 ]]'
+"$WTS" rm tsess2 -f >/dev/null
+
+# gc --apply is the primary capture path: a merged branch is torn down and must
+# leave a row behind, with gc's own verdict on how the work ended.
+# The merge is pushed: gc compares against origin/<base>, not the local one, so a
+# branch merged only locally is read as squashed and the outcome would not be the
+# one under test.
+check "gc announces what it will archive, and writes nothing in a dry run" eval '
+  env WTS_NO_ATTACH=1 "$WTS" gcarch smoke >/dev/null
+  git -C "$WT/gcarch" commit -q --allow-empty -m "work"
+  git -C "$REPO" checkout -q main
+  git -C "$REPO" merge -q --no-ff -m merge feature/gcarch
+  git -C "$REPO" push -q origin main
+  out=$("$WTS" gc --no-fetch)
+  [[ "$out" == *"To archive (kept for wts log): 1 session(s)"* ]] \
+    && [[ "$(q "select count(*) from archive where session = '"'"'gcarch'"'"'")" == 0 ]]'
+check "gc --apply archives the session it tears down" eval '
+  "$WTS" gc --apply --no-fetch --no-retro >/dev/null
+  [[ "$(q "select count(*) from archive where session = '"'"'gcarch'"'"'")" == 1 ]]'
+# gc's own verdict, carried through rather than lost: whether it reads merged or
+# squashed depends on how the base moved (its own logic, tested above), but it may
+# never arrive as "unknown" — whether the work shipped is the fact a review leans
+# on hardest.
+check "and carries gc's verdict into the outcome" eval '
+  o=$(q "select outcome from archive where session = '"'"'gcarch'"'"'")
+  [[ "$o" == merged || "$o" == squashed || "$o" == remote-deleted ]]'
+check "the base it was compared against is recorded" eval '
+  [[ "$(q "select base from archive where session = '"'"'gcarch'"'"'")" == main ]]'
+check "the worktree really is gone" eval '[[ ! -e "$WT/gcarch" ]]'
+
+check "the schema is at version 2" eval '
+  [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 2 ]]'
+check "log and retro are info commands for wts-fresh" eval '
+  grep -qE "ls\|status\|brief\|restore\|db\|log\|retro\|" "$ROOT/libexec/wts/wts-fresh"'
 
 print -r -- "── $passed checks passed"

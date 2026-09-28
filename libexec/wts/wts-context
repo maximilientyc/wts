@@ -43,11 +43,32 @@ cut80() {
   print -r -- "$v"
 }
 
-IFS=$'\x1f' read -r -d $'\x1e' my_branch my_worktree my_repo \
-  < <(db_rows "SELECT branch, worktree, repo_root FROM sessions WHERE name = $(sql_str "$me")")
+IFS=$'\x1f' read -r -d $'\x1e' my_branch my_worktree my_repo my_task my_task_notes my_task_links \
+  < <(db_rows "SELECT s.branch, s.worktree, s.repo_root,
+                      coalesce(t.title, ''), coalesce(t.notes, ''),
+                      coalesce((SELECT group_concat(value, ' ') FROM json_each(t.links)
+                                WHERE json_valid(t.links)), '')
+               FROM sessions s
+               LEFT JOIN task_links l ON l.session = s.name
+               LEFT JOIN tasks t ON t.id = l.task
+               WHERE s.name = $(sql_str "$me")")
 
 print -r -- "# wts: you are in session \`$me\` (branch ${my_branch:--}, worktree $my_worktree)"
 print -r -- ""
+
+# The task this session serves, when there is one. Worth the four lines: the
+# notes are where the author keeps the Notion pages, the meeting minutes and the
+# Slack threads for this piece of work, and an agent that knows them does not
+# have to be told to go and look for them. DB-only, like everything in this hook.
+if [[ -n "${my_task:-}" ]]; then
+  print -r -- "You are working on the task: **$my_task**"
+  if [[ -n "${my_task_notes:-}" ]]; then
+    print -r -- "Its notes (the author's own, verbatim):"
+    print -r -- "${my_task_notes//[[:cntrl:]]/ }" | sed 's/^/  /'
+  fi
+  print -r -- "Other sessions may serve the same task: \`wts task show\` lists them."
+  print -r -- ""
+fi
 print -r -- "This machine runs several Claude Code agents in parallel, one per wts session"
 print -r -- "(a git worktree + a tmux session each). Their shared state is a SQLite"
 print -r -- "database: $WTS_DB"

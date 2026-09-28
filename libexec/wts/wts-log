@@ -1,0 +1,331 @@
+#!/usr/bin/env zsh
+# wts-log — the work journal, as one JSON document.
+#
+# Usage: wts log [--since <when>] [--until <when>] [--task <id>] [--brief]
+#                [--no-things] [--no-notes]
+#
+# What it is for: a performance self-assessment looks six months back, and by
+# then the evidence is gone — the branch is deleted, the Claude transcript reaped
+# after 30 days, and the task title never said how the work actually went. This
+# prints what wts captured at the moment each piece of work finished, so the
+# writing can be done from evidence instead of from memory.
+#
+# Deliberately NOT a report: it emits facts and stops. The reader is meant to be
+# an agent holding the career path or the review form beside it.
+#
+# One object, one `work` array, task-centric — a task is the durable identity and
+# a session is one attempt at it, so nesting the sessions under the work is what
+# lets a reader see "three attempts over five weeks" instead of three unrelated
+# branches. A session belonging to no task still becomes a work item of its own,
+# so the shape is uniform whether or not the task layer was ever used. A
+# completed task that never had a worktree is a work item with no sessions: for
+# meetings, mentoring, hiring and incidents that is the whole record, and leaving
+# it out is what makes a code-only corpus misrepresent a career.
+#
+# --since/--until take an ISO date or any SQLite date modifier ("-6 months",
+# "start of year"). Not `date -v`/`date -d`: the `date` in PATH may be GNU
+# coreutils' or BSD's and they share no options, while sqlite3 is already a hard
+# dependency here. Default window: the last 180 days.
+#
+# PRIVACY: this is the most sensitive thing wts prints. Prompts, commit subjects,
+# file paths, the agents' notes and your own task notes all come out on stdout.
+# --no-notes drops the free text, --brief drops the bulk, and WTS_NO_ARCHIVE=1
+# keeps wts from recording any of it in the first place.
+
+set -uo pipefail
+
+WTS_BIN="${0:A:h}"
+source "$WTS_BIN/wts-db.zsh"
+
+command -v jq >/dev/null 2>&1 || { print -u2 "wts log: jq is required"; exit 1 }
+db_available || { print -u2 "wts log: sqlite3 is required"; exit 1 }
+
+SINCE="-180 days"
+UNTIL="now"
+TASK=""
+BRIEF=false
+NOTES=true
+THINGS=true
+expect=""
+
+for a in "$@"; do
+  if [[ -n "$expect" ]]; then
+    case "$expect" in
+      since) SINCE="$a" ;;
+      until) UNTIL="$a" ;;
+      task)  TASK="$a" ;;
+    esac
+    expect=""
+    continue
+  fi
+  case "$a" in
+    --since)     expect=since ;;
+    --since=*)   SINCE="${a#*=}" ;;
+    --until)     expect=until ;;
+    --until=*)   UNTIL="${a#*=}" ;;
+    --task)      expect=task ;;
+    --task=*)    TASK="${a#*=}" ;;
+    --brief)     BRIEF=true ;;
+    --no-notes)  NOTES=false ;;
+    --no-things) THINGS=false ;;
+    --json)      ;;  # accepted and ignored: there is no other format, and the
+                     # habit comes from `wts status --json`
+    *) print -u2 -r -- "wts log: unknown option $a"; exit 2 ;;
+  esac
+done
+[[ -n "$expect" ]] && { print -u2 "wts log: --$expect needs a value"; exit 2 }
+
+db_init 2>/dev/null
+
+# Window resolution through sqlite, in one pass. Both forms are accepted because
+# sqlite needs a time value before any modifier: an ISO date parses on its own,
+# while "-6 months" only means anything applied to 'now', so each is tried in
+# that order. Neither working yields NULL, and that is worth refusing out loud —
+# silently exporting the wrong window is how a review ends up missing a quarter.
+typeset since_iso="" until_iso=""
+IFS=$'\x1f' read -r -d $'\x1e' since_iso until_iso < <(db_rows "
+  SELECT coalesce(strftime('%Y-%m-%dT%H:%M:%SZ', $(sql_str "$SINCE")),
+                  strftime('%Y-%m-%dT%H:%M:%SZ', 'now', $(sql_str "$SINCE")), ''),
+         coalesce(strftime('%Y-%m-%dT%H:%M:%SZ', $(sql_str "$UNTIL")),
+                  strftime('%Y-%m-%dT%H:%M:%SZ', 'now', $(sql_str "$UNTIL")), '')" 2>/dev/null)
+if [[ -z "$since_iso" ]]; then
+  print -u2 -r -- "wts log: cannot read --since '$SINCE' (try 2026-04-01, or '-6 months')"
+  exit 2
+fi
+if [[ -z "$until_iso" ]]; then
+  print -u2 -r -- "wts log: cannot read --until '$UNTIL'"
+  exit 2
+fi
+
+task_filter=""
+[[ -n "$TASK" ]] && task_filter="AND task = $(sql_str "$TASK")"
+
+# The JSON is built in SQL, not in the shell: prompts, commit subjects and briefs
+# are free text spanning lines, and json_object escapes them once and correctly.
+# commits and files stay strings here and become arrays in jq, which has split().
+archived=$(db_ro "
+  SELECT coalesce(json_group_array(json_object(
+    'work_id', CASE WHEN task != '' THEN task
+                    ELSE 'wts:' || session || '@' || created_at END,
+    'task', task,
+    'name', session,
+    'repo_root', repo_root,
+    'branch', branch,
+    'base', base,
+    'state', 'archived',
+    'created_at', created_at,
+    'finished_at', finished_at,
+    'prompt', prompt,
+    'context', context,
+    'title', title,
+    'docs', json(docs),
+    'outcome', outcome,
+    'pr_url', pr_url,
+    'diff', json_object('added', added, 'removed', removed,
+                        'commits', commit_count, 'files', file_count),
+    'commits_raw', commits,
+    'files_raw', files,
+    'brief', brief,
+    'notes', json(notes),
+    'retro', json_object('delivered', retro_delivered,
+                         'resisted', retro_resisted,
+                         'resolved', retro_resolved,
+                         'abandoned', retro_abandoned,
+                         'model', retro_model,
+                         'error', retro_error),
+    'transcript', json_object('path', transcript,
+                              'session_id', claude_session,
+                              'bytes', transcript_bytes))), json('[]'))
+  FROM (SELECT * FROM archive
+        WHERE finished_at >= $(sql_str "$since_iso")
+          AND finished_at <= $(sql_str "$until_iso")
+          $task_filter
+        ORDER BY finished_at)" 2>/dev/null)
+[[ -n "$archived" ]] || archived='[]'
+
+# Live sessions: work in flight when the review is written is still work. Not
+# filtered by the start of the window — a session opened last year and still
+# running is current, not historical — but never past its end.
+#
+# The NOT EXISTS excludes a session that is already archived under the same
+# created_at, which happens in the gap between `wts-retro store` and the DELETE
+# that follows it, or if that DELETE failed. It matches on created_at and not on
+# the name alone, because a name is reused: an archived `auth-form` and a live
+# `auth-form` created later are two different pieces of work and both belong here.
+live_filter=""
+[[ -n "$TASK" ]] && live_filter="AND coalesce((SELECT task FROM task_links WHERE session = s.name), '') = $(sql_str "$TASK")"
+live=$(db_ro "
+  SELECT coalesce(json_group_array(json_object(
+    'work_id', CASE WHEN t.task IS NOT NULL AND t.task != '' THEN t.task
+                    ELSE 'wts:' || s.name || '@' || s.created_at END,
+    'task', coalesce(t.task, ''),
+    'name', s.name,
+    'repo_root', s.repo_root,
+    'branch', s.branch,
+    'base', '',
+    'state', 'live',
+    'created_at', s.created_at,
+    'finished_at', null,
+    'prompt', s.prompt,
+    'context', s.context,
+    'title', '',
+    'docs', json(s.docs),
+    'outcome', 'in-progress',
+    'pr_url', '',
+    'diff', json_object('added', 0, 'removed', 0, 'commits', 0, 'files', 0),
+    'commits_raw', '',
+    'files_raw', '',
+    'brief', coalesce((SELECT body FROM briefs WHERE session = s.name), ''),
+    'notes', coalesce((SELECT json_group_object(key, value) FROM notes
+                       WHERE session = s.name), json('{}')),
+    'retro', json_object('delivered', '', 'resisted', '', 'resolved', '',
+                         'abandoned', '', 'model', '', 'error', ''),
+    'transcript', json_object('path', '', 'session_id', '', 'bytes', 0))), json('[]'))
+  FROM sessions s LEFT JOIN task_links t ON t.session = s.name
+  WHERE s.created_at <= $(sql_str "$until_iso")
+    AND NOT EXISTS (SELECT 1 FROM archive x
+                    WHERE x.session = s.name AND x.created_at = s.created_at)
+    $live_filter" 2>/dev/null)
+[[ -n "$live" ]] || live='[]'
+
+# The task snapshots wts keeps, so an archived session can still be named when
+# Things is absent, on another machine, or the task since edited.
+snapshots=$(db_ro "
+  SELECT coalesce(json_group_array(json_object(
+    'id', id, 'source', source, 'title', title, 'notes', notes,
+    'links', json(links), 'status', status, 'area', area,
+    'created_at', created_at, 'completed_at', completed_at)), json('[]'))
+  FROM tasks" 2>/dev/null)
+[[ -n "$snapshots" ]] || snapshots='[]'
+
+# Completed tasks that never had a worktree: read live from Things, because a
+# mirror of 1500 rows would need an incremental sync, a deletion story and a
+# conflict story to answer a query that costs 20 ms. Absent Things, the snapshots
+# above are the fallback and the corpus says so rather than pretending.
+things='[]'
+things_ok=false
+things_reason="not requested (--no-things)"
+things_db=""
+if $THINGS; then
+  things_reason="wts-things helper not installed"
+  if [[ -x "$WTS_BIN/wts-things" ]]; then
+    things_db=$("$WTS_BIN/wts-things" db 2>/dev/null) || things_db=""
+    if [[ -n "$things_db" ]]; then
+      things=$("$WTS_BIN/wts-things" tasks --status completed \
+                 --since "$since_iso" --until "$until_iso" 2>/dev/null) || things='[]'
+      [[ -n "$things" ]] || things='[]'
+      if print -r -- "$things" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        things_ok=true
+        things_reason=""
+      else
+        things='[]'
+        things_reason="Things answered something unreadable"
+      fi
+    else
+      things_reason=$("$WTS_BIN/wts-things" db 2>&1 >/dev/null | head -1)
+      [[ -n "$things_reason" ]] || things_reason="Things database not found on this machine"
+    fi
+  fi
+fi
+
+# Which kept transcripts are still on disk, tested now rather than promised: the
+# 30-day reaping means a pointer from five months ago is usually dead, and a
+# reader has to know whether drilling in is worth trying.
+typeset -a present
+while IFS= read -r p; do
+  [[ -n "$p" && -f "$p" ]] && present+=("$p")
+done < <(print -r -- "$archived" | jq -r '.[].transcript.path | select(. != "")' 2>/dev/null)
+
+jq -n \
+  --argjson archived "$archived" \
+  --argjson live "$live" \
+  --argjson snapshots "$snapshots" \
+  --argjson things "$things" \
+  --argjson brief "$BRIEF" \
+  --argjson notes "$NOTES" \
+  --argjson things_ok "$things_ok" \
+  --arg things_reason "$things_reason" \
+  --arg things_db "$things_db" \
+  --arg db "$WTS_DB" \
+  --arg since "$since_iso" \
+  --arg until "$until_iso" \
+  --arg task "$TASK" \
+  --args '
+  # One line per commit / per path. Stored as text because that is how git hands
+  # them over; split here so the consumer never has to.
+  def lines: if . == "" then [] else split("\n") | map(select(. != "")) end;
+
+  def session:
+    . as $s
+    | {
+        name, repo: ($s.repo_root | split("/") | last),
+        branch, base, state, created_at, finished_at,
+        prompt, context, title, docs, outcome, pr_url, diff, retro,
+        transcript: ($s.transcript + {available:
+          ($s.transcript.path != ""
+           and (($ARGS.positional | index($s.transcript.path)) != null))}),
+        brief: (if $brief then "" else $s.brief end),
+        commits: (if $brief then [] else ($s.commits_raw | lines) end),
+        files: (if $brief then [] else ($s.files_raw | lines) end),
+        notes: (if $notes and ($brief | not) then $s.notes else {} end),
+      };
+
+  # Every task wts knows about: the live Things rows win over the snapshots,
+  # because the snapshot is a fallback and not a cache to be trusted.
+  ( ($snapshots | map({key: .id, value: .})) + ($things | map({key: .id, value: .}))
+    | from_entries ) as $tasks
+
+  | ($archived + $live) as $all
+  # Work with sessions, grouped by the task they serve.
+  | [ $all | group_by(.work_id)[]
+      | . as $g
+      | ($g[0].work_id) as $id
+      | ($tasks[$id]) as $t
+      | {
+          id: $id,
+          source: (if $t then $t.source else "wts" end),
+          # With no task, the best name for the work is whatever the agent
+          # titled the conversation, then the phrase it was started with, then
+          # the session name — never the synthetic id, which says nothing.
+          title: (if $t then $t.title
+                  else ([$g[].title, $g[].prompt, $g[0].name]
+                        | map(select(. != null and . != "")) | (.[0] // $id)) end),
+          notes: (if ($t and $notes and ($brief | not)) then $t.notes else "" end),
+          links: (if ($t and $notes) then $t.links else [] end),
+          status: (if $t then $t.status
+                   elif any(.[]; .state == "live") then "in progress"
+                   else "completed" end),
+          completed_at: (if $t then $t.completed_at
+                         else ([.[] | .finished_at | select(. != null)] | max // "") end),
+          sessions: [.[] | session] | sort_by(.created_at),
+        } ]
+  as $with_sessions
+
+  # Completed tasks that never had a session: the non-code half of the record.
+  | ($with_sessions | map(.id)) as $seen
+  | [ $things[]
+      # `IN` and not `$seen | index(.id)`: index() evaluates its argument against
+      # its own input, so `.id` there would be read off $seen, the array.
+      | select((.id | IN($seen[])) | not)
+      | select($task == "" or .id == $task)
+      | {
+          id: .id, source: .source, title: .title,
+          notes: (if ($notes and ($brief | not)) then .notes else "" end),
+          links: (if $notes then .links else [] end),
+          status: .status, completed_at: .completed_at, sessions: [],
+        } ]
+  as $taskonly
+
+  | {
+      version: 1,
+      generated_at: (now | todateiso8601),
+      range: {since: $since, until: $until},
+      sources: {
+        wts: {db: $db,
+              archived: ($archived | length),
+              live: ($live | length)},
+        things: {available: $things_ok, db: $things_db,
+                 tasks: ($things | length), reason: $things_reason},
+      },
+      work: (($with_sessions + $taskonly) | sort_by(.completed_at, .id)),
+    }' "${present[@]}"

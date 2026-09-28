@@ -1,0 +1,460 @@
+#!/usr/bin/env zsh
+# wts-retro — what a finished session delivered, and what it cost.
+#
+# Usage: wts-retro collect <session> <worktree> <branch> <base> <outcome> [pr]
+#        wts-retro store   <session>            (the record on stdin)
+#        wts-retro write   [session...]         (normally through `wts retro`)
+#
+# Three verbs because teardown order is not negotiable. `collect` reads the
+# worktree and the branch, which wts-gc and `wts rm` are about to delete.
+# `store` writes the archive row, and must only run once the teardown actually
+# succeeded, or the archive would claim work ended that is still there. `write`
+# needs nothing but the archive row and the transcript, which no teardown path
+# deletes — so it runs last, after everything destructive has finished, and a
+# hang or a Ctrl-C there costs only text that `wts retro` writes later.
+#
+# Why a retrospective at all, when the transcript exists: Claude Code deletes
+# transcripts after 30 days by default (measured: 0 of 275 files older than
+# that), while a performance review looks six months back. The four lines this
+# writes are the durable trace, not a convenience — which is why `write` accepts
+# a partial answer where wts-brief rejects one, and why the git facts are stored
+# in the row beside the retro rather than only summarized.
+#
+# Variables: WTS_MODEL (haiku), WTS_RETRO_TIMEOUT (60 s),
+#            WTS_RETRO_JOBS (3 concurrent calls), WTS_NO_LLM=1 (no call),
+#            WTS_ARCHIVE_TRANSCRIPT=0 (do not keep a copy of the transcript)
+
+# No `set -e`: git, jq and gzip legitimately fail (a worktree without commits, a
+# reaped transcript) and one unreadable session must not cost the others their
+# archive row.
+set -uo pipefail
+
+# Same reason as wts-brief and wts-status: every git call here is a read, but
+# `status --porcelain` and friends refresh the index and write it back under
+# <gitdir>/index.lock. gc calls this against a worktree whose agent died
+# seconds ago.
+export GIT_OPTIONAL_LOCKS=0
+
+# At top level: inside a function $0 is the function name (FUNCTION_ARGZERO).
+WTS_BIN="${0:A:h}"
+source "$WTS_BIN/wts-db.zsh"
+
+MODEL="${WTS_MODEL:-haiku}"
+TIMEOUT="${WTS_RETRO_TIMEOUT:-60}"
+JOBS="${WTS_RETRO_JOBS:-3}"
+# Keeps the model call bounded, and a review agent reads ~100 of these at once.
+FACTS_MAX=20000
+
+# zstat rather than stat: the `stat` in PATH may be GNU coreutils', whose
+# options have nothing in common with the macOS one.
+zmodload -F zsh/stat b:zstat 2>/dev/null
+
+SYSTEM_PROMPT="You write a short retrospective of a finished development task, \
+for its author, who will reuse it in six months to write a performance \
+self-assessment. You are given the facts of the session: the task as it was \
+asked, the commits, the diffstat, the files touched, whether it shipped, and \
+the exchange between the author and the coding agent. Answer in English, \
+exactly four lines and nothing else:
+delivered: <what shipped, concretely, in domain terms, 160 characters at most>
+resisted: <what was hard or went wrong: a wrong assumption, a constraint found late, a flaky test. Write 'nothing notable' if the session was plain. 140 at most>
+resolved: <how it was overcome: the decision or technique that unblocked it. Write '-' if nothing resisted. 140 at most>
+abandoned: <what was dropped, deferred or decided against. Write '-' unless something was explicitly dropped. 100 at most>
+Write facts, not praise, and never invent: if the facts do not say, write \
+'unknown'. The author's own corrections to the agent are the best evidence of \
+what resisted."
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+# Same rule as `claude_project_dir` in wts and wts-brief: every non-alphanumeric
+# becomes "-".
+claude_project_dir() {
+  print -r -- "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/${1//[^a-zA-Z0-9]/-}"
+}
+
+# oneline <text> — on one line, whitespace squeezed.
+oneline() {
+  print -r -- "$1" | tr -s '\n\t\r ' ' ' | sed -E 's/^ //; s/ $//'
+}
+
+# num <value> — a decimal integer, always, because these go into SQL unquoted.
+num() {
+  local v="${1//[^0-9]/}"
+  print -r -- "${v:-0}"
+}
+
+# Headless call: the isolation recipe of wts-brief's ask_claude, for the same
+# reasons — `cd` out of every worktree so wts-status cannot attribute a phantom
+# agent to one, and stderr to a file rather than /dev/null, because a rejected
+# model id and a timeout used to leave the same undiagnosable silence.
+# ask_claude <errfile>
+ask_claude() {
+  (
+    cd "$WTS_STATE_DIR" 2>/dev/null || cd /
+    perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" \
+      claude -p --model "$MODEL" --safe-mode --strict-mcp-config \
+        --no-session-persistence --settings '{"disableAllHooks":true}' \
+        --tools "" --system-prompt "$SYSTEM_PROMPT"
+  ) 2>"$1"
+}
+
+# why <errfile> <exit-code> — why that session has no retro, on one line.
+# Same diagnosis table as wts-brief's why().
+why() {
+  local errfile="$1" code="$2" msg="" l
+  [[ -s "$errfile" ]] && msg=$(oneline "$(<"$errfile")")
+  if (( code == 142 )); then              # perl's alarm: 128 + SIGALRM
+    l="no answer in ${TIMEOUT}s"
+  elif [[ -n "$msg" ]]; then
+    # Where claude wrote its own diagnosis. Status 0 included: an unrecognized
+    # model is answered in prose, not with a failure.
+    l="claude: $msg"
+  elif (( code != 0 )); then
+    l="claude exited with status $code"
+  else
+    l="unexpected answer"
+  fi
+  (( ${#l} > 200 )) && l="${l[1,199]}…"
+  print -r -- "$l"
+}
+
+# read_transcript <path> — plain or gzipped, nothing on failure.
+read_transcript() {
+  [[ -n "$1" && -f "$1" ]] || return 0
+  if [[ "$1" == *.gz ]]; then
+    gzip -dc -- "$1" 2>/dev/null
+  else
+    cat -- "$1" 2>/dev/null
+  fi
+}
+
+# field <label> <answer> <max> — one retro line, unwrapped and capped. Same
+# tolerant shape as wts-brief: models like to bold their own labels.
+field() {
+  local label="$1" out="$2" l
+  integer max="$3"
+  l=$(print -r -- "$out" | grep -m1 -iE "^[[:space:]*_]*${label}[[:space:]*_]*:" \
+      | sed -E 's/^[^:]*:[[:space:]*_]*//; s/[*_[:space:]]+$//')
+  (( ${#l} > max )) && l="${l[1,max-1]}…"
+  print -r -- "$l"
+}
+
+# ─── collect ─────────────────────────────────────────────────────────────────
+# Prints one \x1f-separated record terminated by \x1e. Not one field per line:
+# commit subjects and file lists span lines, and \x1f/\x1e are the only
+# separators that survive free text (the reason db_rows uses them too).
+
+cmd_collect() {
+  local session="$1" worktree="$2" branch="$3" base="$4" outcome="$5" pr="${6:-}"
+  local subdir="" created=""
+
+  IFS=$'\x1f' read -r -d $'\x1e' subdir created < <(db_rows "
+    SELECT subdir, coalesce(strftime('%s', created_at), 0)
+    FROM sessions WHERE name = $(sql_str "$session")" 2>/dev/null)
+  created=$(num "$created")
+
+  # --- git ------------------------------------------------------------------
+  # The branch's own commits: exclude the local base AND origin/<base>,
+  # otherwise a stale local base passes upstream commits off as the branch's.
+  local -a nots
+  local r base_ref="$base" commits="" files="" shortstat=""
+  local added=0 removed=0 commit_count=0 file_count=0
+  if [[ -n "$base" ]]; then
+    for r in "$base" "origin/$base"; do
+      git -C "$worktree" rev-parse --verify --quiet "$r^{commit}" >/dev/null 2>&1 && nots+=("$r")
+    done
+    git -C "$worktree" show-ref --verify --quiet "refs/remotes/origin/$base" \
+      && base_ref="origin/$base"
+  fi
+  if (( ${#nots} )); then
+    commits=$(git -C "$worktree" log --oneline -n 20 HEAD --not "${nots[@]}" 2>/dev/null)
+    commit_count=$(git -C "$worktree" rev-list --count HEAD --not "${nots[@]}" 2>/dev/null)
+    shortstat=$(git -C "$worktree" diff --shortstat "$base_ref...HEAD" 2>/dev/null)
+    # Which parts of the codebase moved: a fact a review can use, and one a task
+    # title never carries. The list is capped, the count is not.
+    files=$(git -C "$worktree" diff --name-only "$base_ref...HEAD" 2>/dev/null)
+    file_count=$(print -r -- "$files" | sed '/^$/d' | wc -l)
+    files=$(print -r -- "$files" | head -40)
+  fi
+  [[ "$shortstat" =~ '([0-9]+) insertion' ]] && added=${match[1]}
+  [[ "$shortstat" =~ '([0-9]+) deletion' ]] && removed=${match[1]}
+
+  # --- transcript -----------------------------------------------------------
+  # The most recent one of the worktree or its subdirectory, never older than
+  # the session: an older file belongs to a previous incarnation of the same
+  # name (wts rm, then wts <name> again), whose work is unrelated.
+  local -a dirs
+  local d f tr="" sid="" bytes=0 mtime=0
+  integer m best=0
+  dirs=("$(claude_project_dir "$worktree")")
+  [[ -n "$subdir" ]] && dirs+=("$(claude_project_dir "$worktree/$subdir")")
+  for d in "${dirs[@]}"; do
+    for f in "$d"/*.jsonl(N); do
+      m=$(zstat +mtime "$f" 2>/dev/null) || continue
+      (( m >= created && m > best )) && { best=$m; tr="$f" }
+    done
+  done
+  if [[ -n "$tr" ]]; then
+    # The basename IS the Claude session id. Worth taking here: at teardown the
+    # agent is already dead, and that id lives nowhere else on disk.
+    sid="${tr:t:r}"
+    bytes=$(num "$(zstat +size "$tr" 2>/dev/null)")
+    mtime=$best
+  fi
+
+  local title=""
+  if [[ -n "$tr" ]] && command -v jq >/dev/null 2>&1; then
+    local recs
+    recs=$(grep -F -e '"type":"ai-title"' -e '"type":"pr-link"' "$tr" 2>/dev/null)
+    title=$(print -r -- "$recs" | grep -F '"type":"ai-title"' | tail -n 1 \
+            | jq -r '.aiTitle // empty' 2>/dev/null)
+    if [[ -z "$pr" ]]; then
+      pr=$(print -r -- "$recs" | grep -F '"type":"pr-link"' | tail -n 1 \
+           | jq -r '.prUrl // empty' 2>/dev/null)
+    fi
+  fi
+
+  print -rn -- "$base"$'\x1f'"$outcome"$'\x1f'"$pr"$'\x1f'"$title"$'\x1f'"$commits"$'\x1f'"$files"$'\x1f'"$(num "$added")"$'\x1f'"$(num "$removed")"$'\x1f'"$(num "$commit_count")"$'\x1f'"$(num "$file_count")"$'\x1f'"$tr"$'\x1f'"$sid"$'\x1f'"$bytes"$'\x1f'"$mtime"$'\x1e'
+}
+
+# ─── store ───────────────────────────────────────────────────────────────────
+
+cmd_store() {
+  local session="$1"
+  local base outcome pr title commits files tr sid
+  local added removed commit_count file_count bytes mtime
+  IFS=$'\x1f' read -r -d $'\x1e' base outcome pr title commits files \
+    added removed commit_count file_count tr sid bytes mtime || return 1
+  # These six go into SQL unquoted.
+  added=$(num "$added"); removed=$(num "$removed")
+  commit_count=$(num "$commit_count"); file_count=$(num "$file_count")
+  bytes=$(num "$bytes"); mtime=$(num "$mtime")
+
+  db_init 2>/dev/null || return 1
+  db_has_session "$session" || {
+    print -u2 -r -- "⚠ wts-retro: $session is not registered, nothing archived"
+    return 1
+  }
+
+  # A copy of the transcript, because the pointer alone is a 30-day guarantee.
+  # Measured: 495 KB on average and ~10x on JSONL, so a few MB per semester.
+  local kept="$tr"
+  if [[ -n "$tr" && -f "$tr" && "${WTS_ARCHIVE_TRANSCRIPT:-1}" != 0 ]]; then
+    local dest="$WTS_STATE_DIR/transcripts/${session}-${sid}.jsonl.gz"
+    if mkdir -p "${dest:h}" 2>/dev/null && gzip -c -- "$tr" > "$dest.tmp" 2>/dev/null; then
+      mv -f "$dest.tmp" "$dest" 2>/dev/null && kept="$dest"
+    fi
+    rm -f "$dest.tmp" 2>/dev/null
+  fi
+
+  # The registry half never passes through the shell: a multi-line brief or a
+  # note full of quotes would otherwise have to survive sql_str on the way out
+  # and on the way back in.
+  db_q "INSERT OR IGNORE INTO archive
+    (session, task, repo_root, branch, base, subdir, prompt, context, docs,
+     brief, notes, outcome, pr_url, title, commits, files,
+     added, removed, commit_count, file_count,
+     transcript, claude_session, transcript_bytes, transcript_mtime,
+     created_at, finished_at)
+    SELECT s.name,
+           coalesce((SELECT task FROM task_links WHERE session = s.name), ''),
+           s.repo_root, s.branch, $(sql_str "$base"), s.subdir, s.prompt,
+           s.context, s.docs,
+           coalesce((SELECT body FROM briefs WHERE session = s.name), ''),
+           coalesce((SELECT json_group_object(key, value) FROM notes
+                     WHERE session = s.name), '{}'),
+           $(sql_str "$outcome"), $(sql_str "$pr"), $(sql_str "$title"),
+           $(sql_str "$commits"), $(sql_str "$files"),
+           $added, $removed, $commit_count, $file_count,
+           $(sql_str "$kept"), $(sql_str "$sid"), $bytes, $mtime,
+           s.created_at, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+    FROM sessions s WHERE s.name = $(sql_str "$session")" >/dev/null 2>&1
+}
+
+# ─── write ───────────────────────────────────────────────────────────────────
+
+# facts <idx> — rebuilds what the model sees from the archive row and the kept
+# transcript. Deliberately not stored at collect time: the row already holds
+# every git fact, so a retro can be written, or rewritten, at any later date.
+facts() {
+  local idx="$1"
+  local session branch base outcome pr title prompt context commits files brief notes tr
+  local added removed commit_count file_count
+  IFS=$'\x1f' read -r -d $'\x1e' session branch base outcome pr title prompt \
+    context commits files brief notes tr added removed commit_count file_count \
+    < <(db_rows "SELECT session, branch, base, outcome, pr_url, title, prompt,
+                        context, commits, files, brief, notes, transcript,
+                        added, removed, commit_count, file_count
+                 FROM archive WHERE id = $(sql_str "${ids[$idx]}")" 2>/dev/null)
+
+  local users="" texts="" span=""
+  if [[ -n "$tr" ]] && command -v jq >/dev/null 2>&1; then
+    # One pass over the whole transcript, where wts-brief tails it: this runs
+    # once per finished session and not on a hot path, and the author's own
+    # messages — the best evidence of what resisted — are spread over all of it.
+    # \u001f between the three parts and \u001e at the end, because each one
+    # contains newlines and `read` must be told where a field stops.
+    IFS=$'\x1f' read -r -d $'\x1e' users texts span < <(read_transcript "$tr" | jq -Rrn '
+      [inputs | fromjson?] as $r
+      | ([$r[] | select(.type == "user" and (.isSidechain | not))
+          | .message.content | select(type == "string")
+          | select(startswith("<") | not)]) as $u
+      | ([$r[] | select(.type == "assistant" and (.isSidechain | not))
+          | .message.content[]? | select(.type == "text") | .text]) as $a
+      | ([$r[] | .timestamp // empty]) as $t
+      | [ ($u[1:13] | map(.[0:200] | gsub("\\s+"; " ")) | join("\n- ")),
+          ($a | join("\n\n") | .[-2000:]),
+          "\($u | length) message(s) from the author, \($t | length) record(s)"
+            + (if ($t | length) > 1 then ", from \($t[0]) to \($t[-1])" else "" end)
+        ] | join("\u001f") + "\u001e"' 2>/dev/null)
+  fi
+
+  {
+    print -r -- "Session: $session (branch $branch, base ${base:-unknown})"
+    print -r -- "Outcome: $outcome"
+    [[ -n "$pr" ]] && print -r -- "Pull request: $pr"
+    print -r -- "Size: $commit_count commit(s), $file_count file(s), +$added/-$removed"
+    [[ -n "$title" ]] && print -r -- "Conversation title: $title"
+    [[ -n "$prompt" ]] && print -r -- "Task as asked: ${prompt[1,600]}"
+    [[ -n "$context" ]] && print -r -- "Context given: $context"
+    [[ -n "$commits" ]] && print -r -- $'Commits:\n'"$commits"
+    [[ -n "$files" ]] && print -r -- $'Files touched:\n'"$files"
+    [[ -n "$brief" ]] && print -r -- $'Last check-in:\n'"$brief"
+    [[ -n "$notes" && "$notes" != '{}' ]] \
+      && print -r -- "Decisions recorded for the other agents: $notes"
+    [[ -n "$span" ]] && print -r -- "Conversation: $span"
+    [[ -n "$users" ]] && print -r -- $'Author\'s own messages after the first:\n- '"$users"
+    [[ -n "$texts" ]] && print -r -- $'Last agent messages:\n'"$texts"
+  } | head -c "$FACTS_MAX"
+}
+
+# retro_one <idx> — asks, validates, stores. Never fails the run.
+retro_one() {
+  local idx="$1" out code delivered resisted resolved abandoned err
+  # Two statements: `local` declares every name before it assigns, so an `err`
+  # built from `$idx` on the same line reads it while it is still unset, and
+  # `set -u` turns that into a failure.
+  err="$tmpdir/$idx.err"
+  out=$(ask_claude "$err" < "$tmpdir/$idx.facts")
+  code=$?
+  delivered=$(field delivered "$out" 160)
+  resisted=$(field resisted "$out" 140)
+  resolved=$(field resolved "$out" 140)
+  abandoned=$(field abandoned "$out" 100)
+
+  # `delivered` alone is required, where wts-brief demands both of its lines.
+  # The difference is deliberate: wts-brief can retry a second later against
+  # facts that are still there, while the transcript behind this one is deleted
+  # within 30 days. A three-line answer beats an error whose source is gone.
+  if [[ -z "$delivered" ]]; then
+    db_q "UPDATE archive SET retro_error = $(sql_str "$(why "$err" "$code")"),
+            retro_model = $(sql_str "$MODEL"), retro_at = unixepoch()
+          WHERE id = $(sql_str "${ids[$idx]}")" >/dev/null 2>&1
+    return 1
+  fi
+  [[ -n "$resisted" ]] || resisted="unknown"
+  [[ -n "$resolved" ]] || resolved="-"
+  [[ -n "$abandoned" ]] || abandoned="-"
+  # Parallel children write here at once: the database serializes them.
+  db_q "UPDATE archive
+           SET retro_delivered = $(sql_str "$delivered"),
+               retro_resisted  = $(sql_str "$resisted"),
+               retro_resolved  = $(sql_str "$resolved"),
+               retro_abandoned = $(sql_str "$abandoned"),
+               retro_model     = $(sql_str "$MODEL"),
+               retro_error     = '',
+               retro_at        = unixepoch()
+         WHERE id = $(sql_str "${ids[$idx]}")" >/dev/null 2>&1
+}
+
+cmd_write() {
+  local force=false a expect_jobs=false
+  typeset -a want
+  for a in "$@"; do
+    if $expect_jobs; then JOBS="$a"; expect_jobs=false; continue; fi
+    case "$a" in
+      --force)  force=true ;;
+      --jobs)   expect_jobs=true ;;
+      --jobs=*) JOBS="${a#*=}" ;;
+      -*) print -u2 -r -- "wts retro: unknown option $a"; return 2 ;;
+      *) want+=("$a") ;;
+    esac
+  done
+  JOBS=$(num "$JOBS"); (( JOBS > 0 )) || JOBS=1
+
+  db_init 2>/dev/null || return 1
+
+  local filter="retro_delivered = ''"
+  $force && filter="1 = 1"
+  (( ${#want} )) && filter="$filter AND session IN $(sql_list "${want[@]}")"
+
+  typeset -ga ids
+  ids=()
+  local id
+  while IFS=$'\x1f' read -r -d $'\x1e' id; do
+    [[ -n "$id" ]] && ids+=("$id")
+  done < <(db_rows "SELECT id FROM archive WHERE $filter ORDER BY finished_at" 2>/dev/null)
+
+  if (( ${#ids} == 0 )); then
+    print -r -- "No retrospective to write."
+    return 0
+  fi
+  if [[ -n "${WTS_NO_LLM:-}" ]] || ! command -v claude >/dev/null 2>&1; then
+    print -u2 -r -- "⚠ ${#ids} retrospective(s) pending, no model available (WTS_NO_LLM, or no claude)"
+    print -u2 -r -- "  The facts are archived: run wts retro again when one is."
+    return 0
+  fi
+  command -v jq >/dev/null 2>&1 \
+    || print -u2 -r -- "⚠ jq not found: the retro will miss the conversation"
+
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/wts-retro.XXXXXX") || return 1
+  trap 'rm -rf "$tmpdir"' EXIT
+
+  integer i
+  for (( i = 1; i <= ${#ids}; i++ )); do
+    facts "$i" > "$tmpdir/$i.facts"
+  done
+
+  print -u2 -r -- "→ writing ${#ids} retrospective(s) with Claude…"
+  # Batches of $JOBS: zsh has no `wait -n`, and every `claude` is heavy.
+  integer n=0
+  for (( i = 1; i <= ${#ids}; i++ )); do
+    retro_one "$i" &
+    (( ++n % JOBS == 0 )) && wait
+  done
+  wait
+
+  # retro_error is part of the test, not just retro_delivered: under --force a
+  # row that already had a retro keeps its text when the rewrite fails, and
+  # counting it as written would report a success this run did not have.
+  local okc
+  okc=$(db_ro "SELECT count(*) FROM archive
+               WHERE id IN $(sql_list "${ids[@]}")
+                 AND retro_delivered != '' AND retro_error = ''" 2>/dev/null)
+  print -r -- "✓ $(num "$okc") of ${#ids} retrospective(s) written"
+}
+
+# ─── Dispatch ────────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+  collect)
+    shift
+    (( $# >= 5 )) || {
+      print -u2 "usage: wts-retro collect <session> <worktree> <branch> <base> <outcome> [pr]"
+      exit 2
+    }
+    cmd_collect "$@"
+    ;;
+  store)
+    shift
+    (( $# == 1 )) || { print -u2 "usage: wts-retro store <session>   (record on stdin)"; exit 2 }
+    cmd_store "$1"
+    ;;
+  write)
+    shift
+    cmd_write "$@"
+    ;;
+  *)
+    print -u2 "usage: wts-retro collect|store|write …"
+    exit 2
+    ;;
+esac

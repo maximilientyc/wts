@@ -211,6 +211,39 @@ _wts_brief_targets() {
   _wts_offer sessions "session to summarize" "no registered session" "${cands[@]}"
 }
 
+# Archived sessions still waiting for a retrospective. Straight from the state
+# database, like _wts_registry and for the same reason: a completion has no path
+# to libexec/wts-db.zsh. Sessions still in the registry are not offered here —
+# `wts retro` works on finished work.
+_wts_retro_targets() {
+  local f="${XDG_STATE_HOME:-$HOME/.local/state}/wts/wts.db" name outcome
+  local -a cands typed=(${words[3,CURRENT-1]})
+  [[ -s $f ]] && (( ${+commands[sqlite3]} )) || return 0
+  while IFS=$'\x1f' read -r -d $'\x1e' name outcome; do
+    [[ -n $name ]] || continue
+    (( ${typed[(Ie)$name]} )) && continue
+    cands+=("${name//:/\\:}:${outcome:-archived}")
+  done < <(sqlite3 -init /dev/null -readonly -ascii "$f" \
+             "SELECT session, outcome FROM archive WHERE retro_delivered = ''
+              ORDER BY finished_at DESC LIMIT 50" 2>/dev/null)
+  _wts_offer sessions "archived session" "no retrospective pending" "${cands[@]}"
+}
+
+# Tasks wts knows, then sessions: `wts task link <task> <session>` takes both.
+_wts_tasks_or_sessions() {
+  local f="${XDG_STATE_HOME:-$HOME/.local/state}/wts/wts.db" id title
+  local -a cands
+  [[ -s $f ]] && (( ${+commands[sqlite3]} )) || return 0
+  while IFS=$'\x1f' read -r -d $'\x1e' id title; do
+    [[ -n $id ]] && cands+=("${id//:/\\:}:${title}")
+  done < <(sqlite3 -init /dev/null -readonly -ascii "$f" \
+             'SELECT id, title FROM tasks ORDER BY synced_at DESC LIMIT 50' 2>/dev/null)
+  local -A reg
+  _wts_registry
+  for id in ${(ko)reg}; do cands+=("${id//:/\\:}:session") done
+  _wts_offer tasks "task or session" "no task yet" "${cands[@]}"
+}
+
 _wts() {
   local -a before=(${words[3,CURRENT-1]}) opts
 
@@ -227,6 +260,9 @@ _wts() {
       "doc:context documents attached to a session" \
       "db:the state database: queries, and notes the agents share" \
       "gc:clean up dead worktrees and branches" \
+      "log:the work journal as JSON (finished sessions, outcomes, retros)" \
+      "retro:write the retrospectives gc could not" \
+      "task:the work above a session (a Things 3 task)" \
       "layouts:list available layouts" \
       "keys:switcher keys and tmux bindings" \
       "setup:print integration snippets (tmux, git, claude)" \
@@ -318,7 +354,37 @@ _wts() {
         opts+=("--apply:do it (otherwise a dry run)" "--dry-run:dry run, the default")
       (( ${before[(Ie)--no-fetch]} )) ||
         opts+=("--no-fetch:do not contact the remote (offline)")
+      (( ${before[(Ie)--no-retro]} )) ||
+        opts+=("--no-retro:archive without asking Claude for a retrospective")
       _wts_offer flags option "no more options" "${opts[@]}" ;;
+
+    log)
+      (( ${before[(Ie)--since]} )) || opts+=("--since:start of the window (2026-04-01, or -6 months)")
+      (( ${before[(Ie)--until]} )) || opts+=("--until:end of the window (default: now)")
+      (( ${before[(Ie)--task]} ))  || opts+=("--task:one task only")
+      (( ${before[(Ie)--brief]} )) || opts+=("--brief:drop commits, files and notes")
+      (( ${before[(Ie)--no-notes]} )) || opts+=("--no-notes:drop the free text (leaving the machine)")
+      (( ${before[(Ie)--no-things]} )) || opts+=("--no-things:wts sessions only, no Things tasks")
+      _wts_offer flags option "no more options" "${opts[@]}" ;;
+
+    task)
+      if (( CURRENT == 3 )); then
+        _wts_offer verbs "task verb" "" \
+          "ls:tasks and their sessions" \
+          "show:one task, its notes and its links" \
+          "link:attach a session to a task" \
+          "unlink:detach the session" \
+          "new:a local task, without Things"
+      else
+        _wts_tasks_or_sessions
+      fi ;;
+
+    retro)
+      if [[ $PREFIX == -* ]]; then
+        _wts_offer options option "" "--force:rewrite retrospectives that already exist"
+      else
+        _wts_retro_targets
+      fi ;;
 
     status)
       if (( CURRENT == 3 )); then

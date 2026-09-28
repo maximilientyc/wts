@@ -328,16 +328,31 @@ all=$(printf '%s\n' "${objects[@]}" | jq -s "$SORT_KEY")
 # Starting phrase (`wts "<phrase>"`): merged here from the registry, not in the
 # main pass, whose "one field per line" stream would be shifted by a multiline
 # phrase.
+# The task this session serves rides along for the same reason: one more field
+# off the registry, and the collection loop above stays untouched.
 if merged=$(print -r -- "$all" | jq --slurpfile reg <(print -r -- "$REGISTRY") \
-      'map(. + {prompt: ($reg[0][.name].prompt // "")})' 2>/dev/null); then
+      'map(. + {prompt: ($reg[0][.name].prompt // ""),
+                task: ($reg[0][.name].task // ""),
+                task_title: ($reg[0][.name].task_title // "")})' 2>/dev/null); then
   all="$merged"
 fi
 
 # SUBJECT: the name Claude gave the conversation, otherwise the starting phrase
 # (restored session, agent not relaunched yet), otherwise the context. `//` is
 # not enough: jq lets an empty string through.
-SUBJECT='def subject: [.agent_name, .prompt, .context]
-  | map(select(type == "string" and . != "")) | (.[0] // "")
+#
+# A leading "* " marks a session that serves a task. Only a sign, not the task
+# title: at 50 shared characters the title would evict the conversation name,
+# which is the more useful of the two day to day — the grouped view is
+# `wts task ls`. ASCII, because macOS `column -t` counts bytes, and truncated
+# AFTER the sign is prepended, or a linked row would be two columns wider than
+# the others and both the switcher layout and the header-width test would break.
+# The task title is the last resort, not a competitor: it only shows when the
+# agent, the phrase and the context are all empty, where the alternative is a
+# cell holding nothing but the sign, which reads as a rendering fault.
+SUBJECT='def subject: (if (.task_title // "") != "" then "* " else "" end)
+  + ([.agent_name, .prompt, .context, .task_title]
+     | map(select(type == "string" and . != "")) | (.[0] // ""))
   | gsub("[\\t\\n\\r]"; " ")
   | if length > 50 then .[0:49] + "…" else . end;'
 

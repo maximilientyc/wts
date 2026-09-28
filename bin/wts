@@ -12,7 +12,10 @@
 #        wts stop <name>
 #        wts pr [name]
 #        wts rm <name> [-f]
-#        wts gc [--apply] [--no-fetch]
+#        wts gc [--apply] [--no-fetch] [--no-retro]
+#        wts log [--since <when>] [--until <when>] [--brief] [--no-notes]
+#        wts retro [name...] [--force]
+#        wts task ls | show <id> | link [<id>] [session] | unlink | new "<title>"
 #        wts layouts
 #        wts keys
 #        wts setup tmux | git | claude [--install]
@@ -43,7 +46,15 @@
 #                markdown file) attached to a session with --doc
 #   gc         : clean up from the remote: worktrees and branches whose PR is
 #                merged (squash included) or whose remote branch is gone,
-#                plus any stale index.lock blocking writes in a worktree
+#                plus any stale index.lock blocking writes in a worktree.
+#                --apply also archives what it tears down, for `wts log`
+#   log        : the work journal as JSON: every finished session with its
+#                outcome, its diff, its retrospective and a pointer to its
+#                transcript, for the six-month look back a review needs
+#   retro      : write the retrospectives gc could not (no model, a timeout);
+#                reads the archive, never the worktree, so it works any time
+#   task       : the work above a session — a Things 3 task, or a local one.
+#                One task, one to N sessions; `--task` links at creation
 #   layouts    : list available layouts (yours shadow the built-in ones)
 #   keys       : switcher keys and tmux bindings (the popup shows them too)
 #   setup tmux : print the tmux.conf snippet (switcher popup, `wts` command)
@@ -67,10 +78,13 @@
 #   wts rm auth-form -f
 #   wts doc add https://notion.so/Payments-abc123
 #   wts auth-form "limit the rate per key" --doc payments-architecture
+#   wts log --since '-6 months' > work.json
+#   wts retro
+#   wts audit-trail "make the ledger auditable" --task
 
 set -euo pipefail
 
-WTS_VERSION="1.0.1"
+WTS_VERSION="1.1.0"
 
 # ─── Install layout ──────────────────────────────────────────────────────────
 # Homebrew, `make install` and a git checkout all share the same tree:
@@ -127,8 +141,10 @@ registry_put() {
   fi
 }
 
-# Forget sessions, with what the database keeps about them: their brief and
-# the notes their agent left.
+# Forget sessions, with what the database keeps about them: their brief, the
+# notes their agent left, and the task they served. The archive row is NOT
+# touched — it is the one thing meant to outlive the session, and it carries the
+# task itself, so the durable link survives while the live one goes.
 registry_del() {
   registry_available || return 0
   [[ -s "$WTS_DB" ]] || return 0
@@ -138,6 +154,7 @@ registry_del() {
         DELETE FROM sessions WHERE name IN $in;
         DELETE FROM briefs WHERE session IN $in;
         DELETE FROM notes WHERE session IN $in;
+        DELETE FROM task_links WHERE session IN $in;
         COMMIT;" >/dev/null 2>&1 || true
 }
 
@@ -328,21 +345,38 @@ usage() {
 # attach the wrong document to a fresh agent.
 # `wts new` re-invokes wts with two positionals only and cannot pass an option
 # through, so it hands its own documents over in $WTS_DOC_ARGS (\x1f-separated:
-# a value can be a URL with anything in it).
+# a value can be a URL with anything in it), and its task in $WTS_TASK_ARG.
+#
+# --task rides in the same pass, and not in a second one: this is already "the
+# pass that removes options", it already implements the bare-flag-at-the-end
+# convention, and two scans would only double the chance of the two disagreeing.
 typeset -ga DOC_REQ DOC_REST
+typeset -g TASK_REQ TASK_ASKED
 strip_doc_args() {
   DOC_REQ=(${(@ps:\x1f:)${WTS_DOC_ARGS:-}})
   DOC_REQ=("${(@)DOC_REQ:#}")
   DOC_REST=()
+  TASK_REQ="${WTS_TASK_ARG:-}"
+  TASK_ASKED=false
+  [[ -n "$TASK_REQ" ]] && TASK_ASKED=true
   while (( $# )); do
     case "$1" in
-      --doc=*) DOC_REQ+=("${1#--doc=}") ;;
-      --doc)   if (( $# == 1 )); then
-                 DOC_REQ+=("")
-               else
-                 DOC_REQ+=("${2:-}"); shift
-               fi ;;
-      *)       DOC_REST+=("$1") ;;
+      --doc=*)  DOC_REQ+=("${1#--doc=}") ;;
+      --doc)    if (( $# == 1 )); then
+                  DOC_REQ+=("")
+                else
+                  DOC_REQ+=("${2:-}"); shift
+                fi ;;
+      --task=*) TASK_REQ="${1#--task=}"; TASK_ASKED=true ;;
+      --task)   TASK_ASKED=true
+                # Same rule as --doc, and for the same reason: it always
+                # consumes the next argument rather than guessing, so
+                # `--task <layout>` is a mistake wts can name instead of a
+                # layout silently becoming a task.
+                if (( $# > 1 )); then
+                  TASK_REQ="${2:-}"; shift
+                fi ;;
+      *)        DOC_REST+=("$1") ;;
     esac
     shift
   done
@@ -799,6 +833,36 @@ if [[ "$1" == "rm" ]]; then
   if [[ -d "$worktree_path" ]]; then
     BRANCH=$(git -C "$worktree_path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 
+    # Collect the archive facts while the worktree is still here: below, it is
+    # removed before the conversations are even reported, so anywhere that reads
+    # more natural is a directory that no longer exists. No model call on this
+    # path — `wts rm` is synchronous with a human waiting for their prompt, and
+    # is often used on work that is being abandoned. `wts retro` writes the text
+    # later; three git reads and one INSERT is what nobody notices.
+    # Every step here is guarded: this file runs under `set -e`, a missing
+    # origin/HEAD is normal in a fresh repository, and losing `wts rm` to a
+    # failed archive would be a poor trade.
+    RETRO_FACTS=""
+    if [[ -z "${WTS_NO_ARCHIVE:-}" && -x "$WTS_LIBEXEC/wts-retro" ]]; then
+      base_for_retro="${WTS_BASE_BRANCH:-}"
+      if [[ -z "$base_for_retro" ]]; then
+        base_for_retro=$(git -C "$repo_root" symbolic-ref --quiet --short \
+                           refs/remotes/origin/HEAD 2>/dev/null || true)
+        base_for_retro="${base_for_retro#origin/}"
+      fi
+      # -f is the caller saying they know the branch did not land.
+      if [[ "$FORCE" == true ]]; then
+        retro_outcome=abandoned
+      else
+        retro_outcome=removed
+      fi
+      RETRO_FACTS=$(mktemp "${TMPDIR:-/tmp}/wts-rm-retro.XXXXXX" 2>/dev/null || true)
+      if [[ -n "$RETRO_FACTS" ]]; then
+        "$WTS_LIBEXEC/wts-retro" collect "$SESSION" "$worktree_path" "$BRANCH" \
+          "$base_for_retro" "$retro_outcome" > "$RETRO_FACTS" 2>/dev/null || true
+      fi
+    fi
+
     # .wts/ is git-ignored, and `git worktree remove` leaves ignored files
     # behind: without this, every session that had a document would leave a
     # husk folder for `wts gc` to find. Never a symlink, never anything else.
@@ -845,7 +909,19 @@ if [[ "$1" == "rm" ]]; then
     fi
   fi
 
-  # 5. Remove from the registry
+  # 5. Archive, then remove from the registry. In that order: the archive row is
+  # built from the registry row, the brief and the notes, which the next line
+  # deletes. This is the index `wts rm` used to destroy.
+  if [[ -n "${RETRO_FACTS:-}" && -s "$RETRO_FACTS" ]]; then
+    if "$WTS_LIBEXEC/wts-retro" store "$SESSION" < "$RETRO_FACTS" 2>/dev/null; then
+      echo "→ archived (wts log) — retrospective pending: wts retro"
+    else
+      echo "⚠ not archived"
+    fi
+  fi
+  if [[ -n "${RETRO_FACTS:-}" ]]; then
+    rm -f "$RETRO_FACTS"
+  fi
   registry_del "$SESSION"
 
   exit 0
@@ -860,6 +936,46 @@ if [[ "$1" == "gc" ]]; then
     exit 1
   fi
   exec "$WTS_LIBEXEC/wts-gc" "$@"
+fi
+
+# ─── Subcommands: log, retro ─────────────────────────────────────────────────
+# The work journal. Both read the `archive` table, which no teardown deletes, so
+# both are repository-independent: the database is global and an archived session
+# outlives the checkout it came from.
+
+if [[ "$1" == "log" ]]; then
+  shift
+  if [[ ! -x "$WTS_LIBEXEC/wts-log" ]]; then
+    echo "wts: $WTS_LIBEXEC/wts-log not found" >&2
+    exit 1
+  fi
+  registry_init
+  exec "$WTS_LIBEXEC/wts-log" "$@"
+fi
+
+if [[ "$1" == "retro" ]]; then
+  shift
+  if [[ ! -x "$WTS_LIBEXEC/wts-retro" ]]; then
+    echo "wts: $WTS_LIBEXEC/wts-retro not found" >&2
+    exit 1
+  fi
+  registry_init
+  exec "$WTS_LIBEXEC/wts-retro" write "$@"
+fi
+
+# The task layer. No typo tolerance on the arguments here, deliberately:
+# `registry_resolve_name` matches on substrings, and `wts task link "rate
+# limiting"` is a search phrase for Things, not an approximate session name — it
+# would happily turn one into the other. Session names are matched exactly, in
+# wts-task.
+if [[ "$1" == "task" ]]; then
+  shift
+  if [[ ! -x "$WTS_LIBEXEC/wts-task" ]]; then
+    echo "wts: $WTS_LIBEXEC/wts-task not found" >&2
+    exit 1
+  fi
+  registry_init
+  exec "$WTS_LIBEXEC/wts-task" "$@"
 fi
 
 # ─── Subcommand: doc ─────────────────────────────────────────────────────────
@@ -1216,6 +1332,35 @@ if ! git -C "$repo_root" rev-parse --verify --quiet "$BASE_BRANCH" >/dev/null; t
   exit 1
 fi
 
+# ─── Task (--task) ───────────────────────────────────────────────────────────
+# Before the documents, for the same reason they come before the naming call: a
+# task that cannot be resolved must fail while nothing exists yet, and its picker
+# must open before any wait rather than behind one. Resolved to an id here; the
+# link is written after registry_put, since it references the session row.
+
+typeset -g TASK_ID
+TASK_ID=""
+if [[ "${TASK_ASKED:-false}" == true ]]; then
+  if [[ ! -x "$WTS_LIBEXEC/wts-task" ]]; then
+    echo "wts: $WTS_LIBEXEC/wts-task not found" >&2
+    exit 1
+  fi
+  if ! TASK_ID=$("$WTS_LIBEXEC/wts-task" resolve "$TASK_REQ"); then
+    # `--task` always takes the next argument, so a layout typed after it is read
+    # as a task. The same mistake as with --doc, and worth naming as precisely.
+    if [[ -n "$TASK_REQ" ]] && layout_file "$TASK_REQ" >/dev/null 2>&1; then
+      echo "wts: '--task $TASK_REQ' — '$TASK_REQ' is a layout, not a task." >&2
+      echo "     layout then task:  wts ${NAME:-<name>} $TASK_REQ --task <id>" >&2
+      echo "     task then layout:  wts ${NAME:-<name>} --task=<id> $TASK_REQ" >&2
+    fi
+    exit 1
+  fi
+  if [[ -z "$TASK_ID" ]]; then
+    echo "wts: no task chosen" >&2
+    exit 1
+  fi
+fi
+
 # ─── Documents (--doc) ───────────────────────────────────────────────────────
 # Resolved here, after the layout, the repository and the base branch have been
 # validated and before the naming call: an unknown document must fail while
@@ -1248,6 +1393,35 @@ if (( ${#DOC_REQ} )); then
     fi
     DOC_SLUGS+=("$_slug")
   done
+fi
+
+# The URLs the task carries in its notes — the Notion page, the meeting minutes,
+# the Slack thread — become context documents too, after the explicit --doc ones:
+# they are the material the agent would otherwise be told to go and find.
+#
+# WTS_NO_LLM for these, deliberately: wts-doc then records each one as a POINTER
+# instead of fetching it. A task carries one to three links, the fetch model is
+# sonnet with a 90 s cap, and paying that at creation would put minutes in front
+# of a starting agent. A pointer is also simply likelier to work — a Slack
+# permalink or a private Notion page is exactly what the sandboxed fetch cannot
+# read and the agent in the pane can. `wts doc sync` fetches them later.
+if [[ -n "${TASK_ID:-}" && -x "$WTS_LIBEXEC/wts-doc" ]]; then
+  integer _task_docs=0
+  while IFS= read -r _url; do
+    [[ -n "$_url" ]] || continue
+    if _slug=$(WTS_NO_LLM=1 "$WTS_LIBEXEC/wts-doc" resolve "$_url" 2>/dev/null); then
+      # A document already attached by --doc must not be listed twice. (Ie) and
+      # not (r): the reverse subscript yields nothing on an empty array, which
+      # `set -u` reports as an unset parameter.
+      if [[ -n "$_slug" ]] && (( ${DOC_SLUGS[(Ie)$_slug]} == 0 )); then
+        DOC_SLUGS+=("$_slug")
+        (( ++_task_docs ))
+      fi
+    fi
+  done < <("$WTS_LIBEXEC/wts-task" links "$TASK_ID" 2>/dev/null)
+  if (( _task_docs )); then
+    echo "→ task: $_task_docs link(s) from its notes attached as context"
+  fi
 fi
 
 # ─── Session name ────────────────────────────────────────────────────────────
@@ -1383,6 +1557,16 @@ if (( ${#DOC_SLUGS} )); then
 fi
 registry_put "$SESSION" "$PROFILE" "$repo_root" "$worktree_path" "$BRANCH" \
   "${WTS_SUBDIR:-}" "$CONTEXT" "$PROMPT" "$DOCS_JSON"
+
+# After registry_put: task_links references the session row. Idempotent, so an
+# `wts <name> --task <id>` re-run on a live session just repoints the link.
+if [[ -n "${TASK_ID:-}" ]]; then
+  if "$WTS_LIBEXEC/wts-task" link "$TASK_ID" "$SESSION" >/dev/null 2>&1; then
+    echo "→ task: $("$WTS_LIBEXEC/wts-task" title "$TASK_ID" 2>/dev/null)"
+  else
+    echo "⚠ task $TASK_ID not linked" >&2
+  fi
+fi
 
 # `wts new` reads the chosen name back here (it may have been proposed, then
 # suffixed).
