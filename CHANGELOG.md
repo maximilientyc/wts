@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.4.0 — 2026-09-28
+
+A task had a beginning and no end. One created in wts (`ctrl-t`, `wts task new`)
+stayed open for good: nothing refreshed it and no verb closed it, so it sat among
+the tasks to start — and came back there each time a session on it was removed,
+merged work included.
+
+- **`wts task done [<id>]` closes a local task.** It leaves the switcher's task
+  rows for good; its notes, documents and archived sessions stay, so `wts task
+  ls` and `wts log` still show the work. With no id, the task of the session you
+  are in.
+- **`ctrl-d` on a task row does the same**, after a y/N prompt. On a session row
+  it is still `wts rm`.
+- **A Things task is refused, not closed**: it is completed in Things, and leaves
+  the list at the next `wts task ls`. wts never writes to Things, and a status
+  set here would be overwritten by the next refresh anyway.
+
 ## 1.3.2 — 2026-09-28
 
 1.3.1 took the macOS privacy dialog off the switcher; this takes it off the rest.

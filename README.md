@@ -129,6 +129,7 @@ wts log [--since <when>] [--until <when>] [--task <id>] [--brief] [--no-notes]
 wts retro [name...] [--force]
 wts task ls | show <id> | link [<id>] [name] | unlink [name] | new "<title>"
 wts task add [<id>] | note [<id>] "<text>" | edit [<id>] | doc [<id>] [<url|slug>]
+wts task done [<id>]
 wts layouts
 wts keys
 wts db path | schema | sql "<SELECT ...>" | notes [--all] | get | set | del
@@ -364,6 +365,10 @@ On a task row:
   fastest way to put something where the next session on this task will find it.
 - **`ctrl-e` attaches a document to the task** rather than to a session, so every
   later attempt at it inherits the document.
+- **`ctrl-d` closes it**, after a y/N prompt (`wts task done`): the task leaves
+  the list for good, its notes, documents and past sessions stay. Only a task wts
+  holds by itself — a Things task is completed in Things, and leaves the list at
+  the next `wts task ls`, the one command that reads Things again.
 
 
 ![ctrl-t typing a task into the switcher, the new row selected with its preview, enter on it offering a new session from a prompt or a branch name or attaching it to a session, a session created from the branch name feature/migration-guide, and a second task attached to an existing session](docs/new-task.gif)
@@ -634,7 +639,12 @@ wts task note "the spec moved to the new Notion page"   # from inside a worktree
 wts task edit                       # longer context, in $EDITOR
 wts task doc api-spec               # a document every session on this task gets
 wts audit-trail --task <id>         # a session that opens on all of the above
+wts task done                       # a local task is finished: off the list
 ```
+
+A task stays on the list, and comes back after each session on it is removed,
+until it is closed: in Things for a Things task, with `wts task done` (or
+`ctrl-d` on its row) for one wts holds by itself.
 
 `note`, `edit` and `doc` default to the task of the session you are in, so
 inside a worktree they need no id. What they write is wts's own: Things stays

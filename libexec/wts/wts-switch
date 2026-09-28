@@ -13,6 +13,7 @@
 #   esc      leave reply mode, or close the popup
 #   ctrl-r   reload the list by hand
 #   ctrl-d   delete the session (wts rm) and reload
+#            on a local task: mark it done (wts task done), after a y/N prompt
 #   ctrl-x   kill the tmux session only (wts stop), after a y/N prompt
 #   ctrl-o   open the session's pull request on GitHub (wts pr, needs gh)
 #   ctrl-e   attach a context document to the session, or to the task
@@ -64,7 +65,8 @@ typeset -g current=""
 # That is the same "not a session" signal the header row already uses, so every
 # bind that takes {3} — ctrl-x, ctrl-o, ctrl-e, tab — is a no-op on a task
 # without being told about tasks at all, and `wts status --fzf` keeps its shape.
-# ctrl-d was the one exception and is now behind --rm; see there.
+# ctrl-d was the one exception and is now behind --rm, which reads {2} to
+# close a task; see there.
 #
 # The producers collect rows with add_row and `emit` lays the table out in one
 # go, every line exactly as wide as the list. The widths come from the rows
@@ -820,9 +822,17 @@ open_pr() { # $1 = session name
 # picker offering to delete any of them. The header row already produced an empty
 # {3}, but --header-lines makes it unselectable; a task row is selectable.
 # So the guard every other verb has, in the same shape.
-remove_session() { # $1 = session name
-  local name="$1"
-  [[ -n "$name" ]] || return 0   # a task row, or an empty list
+#
+# On a task row it now does something after all, through the target in {2}
+# rather than the empty name: it closes the task (wts task done), which is the
+# only way out of the list a local task has. The name stays the only thing that
+# can reach `wts rm`.
+remove_session() { # $1 = session name, $2 = preview target
+  local name="$1" target="${2:-}"
+  if [[ -z "$name" ]]; then
+    [[ "$target" == task:* ]] && close_task "${target#task:}"
+    return 0   # otherwise the header, or an empty list
+  fi
   print -n '\e[2J\e[H'
   if [[ -z "$WTS_CMD" ]]; then
     print -r -- "wts: wts not found next to this helper nor in PATH — any key"
@@ -830,6 +840,35 @@ remove_session() { # $1 = session name
     return 0
   fi
   "$WTS_CMD" rm "$name" || { print -n "press any key"; wait_key }
+  return 0
+}
+
+# ctrl-d on a task. A Things task is only explained, not closed: it is completed
+# in Things, and `wts task done` would refuse it anyway — asking y/N first for a
+# refusal is what kill_session avoids too. The source is read here for that
+# reason, from wts's own database; Things itself is not opened.
+close_task() { # $1 = task id
+  local id="$1" src title
+  [[ -n "$id" ]] || return 0
+  print -n '\e[2J\e[H'
+  if [[ -z "$WTS_CMD" ]]; then
+    print -r -- "wts: wts not found next to this helper nor in PATH — any key"
+    wait_key
+    return 0
+  fi
+  src=$(db_ro "SELECT source FROM tasks WHERE id = $(sql_str "$id")" 2>/dev/null)
+  title=$(task_label "$id")
+  if [[ "$src" != local ]]; then
+    print -r -- "“$title” is a Things task: complete it in Things, and it leaves this list at the next 'wts task ls' — any key"
+    wait_key
+    return 0
+  fi
+  if ! read -q "?Mark task “$title” done? It leaves this list; its notes and history are kept. [y/N] "; then
+    print
+    return 0
+  fi
+  print
+  "$WTS_CMD" task done "$id" >/dev/null || { print -n "press any key"; wait_key }
   return 0
 }
 
@@ -1143,7 +1182,7 @@ if [[ "${1:-}" == "--pr" ]]; then
 fi
 
 if [[ "${1:-}" == "--rm" ]]; then
-  remove_session "${2:-}"
+  remove_session "${2:-}" "${3:-}"
   exit 0
 fi
 
@@ -1332,7 +1371,7 @@ kill_bind=()
 if [[ -n "$WTS_CMD" ]]; then
   # Through --rm and not `wts rm {3}` directly: see remove_session for why an
   # empty {3} must never reach `wts rm`.
-  delete_bind=(--bind="ctrl-d:execute('$self' --rm {3})+reload('$self' --list)")
+  delete_bind=(--bind="ctrl-d:execute('$self' --rm {3} {2})+reload('$self' --list)")
   kill_bind=(--bind="ctrl-x:execute('$self' --kill {3} {1})+reload('$self' --list)")
 fi
 

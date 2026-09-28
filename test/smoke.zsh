@@ -1207,10 +1207,11 @@ unset WTS_SWITCH_REPLY
 # The bind that had to move: `wts rm ""` matches every session by substring and
 # opens a picker offering to delete any of them, and a task row hands it "".
 check "ctrl-d goes through --rm, not straight to wts rm" \
-  grep -qF "ctrl-d:execute('\$self' --rm {3})" "$SWITCH"
-check "--rm on a task row does nothing at all" eval '
-  "$SWITCH" --rm "" >/dev/null 2>&1
-  [[ "$(q "select count(*) from sessions")" == "$(q "select count(*) from sessions")" ]]'
+  grep -qF "ctrl-d:execute('\$self' --rm {3} {2})" "$SWITCH"
+check "--rm on a row that is neither a session nor a task does nothing at all" eval '
+  n=$(q "select count(*) from sessions")
+  "$SWITCH" --rm "" "" >/dev/null 2>&1 </dev/null
+  [[ "$(q "select count(*) from sessions")" == "$n" ]]'
 # ctrl-t: a task created from the popup. The mode is reply mode's machinery,
 # pinned on `newtask:`; enter creates a local task and hands `load` its id.
 export WTS_SWITCH_REPLY="$SANDBOX/reply-new" WTS_SWITCH_FOCUS="$SANDBOX/focus"
@@ -1266,6 +1267,30 @@ check "attaching links the task to the session" eval '
 refute "and the task leaves the task rows, it is on its session now" eval '
   "$SWITCH" --list | cut -f2 | grep -qxF "task:$NEWTASK"'
 "$WTS" rm tattach -f >/dev/null
+
+# The way out of the list. Without it a local task stayed open for good, and came
+# back after every session on it was removed — which is what happens just above.
+check "a task whose session was removed is back among the task rows" eval '
+  "$SWITCH" --list | cut -f2 | grep -qxF "task:$NEWTASK"'
+check "task done closes a local task" eval '
+  tt done "$NEWTASK" >/dev/null
+  [[ "$(q "select status from tasks where id = '\''$NEWTASK'\''")" == completed ]] \
+  && [[ -n "$(q "select completed_at from tasks where id = '\''$NEWTASK'\''")" ]]'
+refute "and it leaves the task rows for good" eval '
+  "$SWITCH" --list | cut -f2 | grep -qxF "task:$NEWTASK"'
+check "its history stays: the archived session still names it" eval '
+  [[ "$(q "select count(*) from archive where task = '\''$NEWTASK'\''")" -ge 1 ]]'
+check "done twice is not an error" eval '
+  [[ "$(tt done "$NEWTASK")" == *"already done"* ]]'
+check "a Things task is refused, and left open" eval '
+  q "insert into tasks (id, source, title, status, synced_at) values ('\''THINGSdone0123456789ab'\'', '\''things'\'', '\''From Things'\'', '\''open'\'', '\''x'\'')"
+  out=$(tt done THINGSdone0123456789ab 2>&1) && false
+  [[ "$out" == *"complete it in Things"* ]] \
+  && [[ "$(q "select status from tasks where id = '\''THINGSdone0123456789ab'\''")" == open ]]'
+q "delete from tasks where id = 'THINGSdone0123456789ab'"
+check "done with no id outside a session says why" eval '
+  out=$(cd "$SANDBOX" && tt done 2>&1) && false
+  [[ "$out" == *"not inside a wts session"* ]]'
 
 # gc --apply is the primary capture path: a merged branch is torn down and must
 # leave a row behind, with gc's own verdict on how the work ended.

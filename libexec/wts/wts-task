@@ -10,6 +10,7 @@
 #        wts task note [<id>] "<text>" | [<id>] --clear
 #        wts task edit [<id>]
 #        wts task doc [<id>] [<url|path|slug>] | [<id>] --rm <slug>
+#        wts task done [<id>]
 #
 # A task lives for months and gets one to N sessions; a session lives for days
 # and dies at the merge. So the task is the durable identity and the session is
@@ -626,6 +627,47 @@ cmd_doc() {
   fi
 }
 
+# ─── done ────────────────────────────────────────────────────────────────────
+
+# Close a task wts holds on its own. Nothing else ever did: a local task has no
+# Things behind it to complete, so it stayed `open` for good — in the switcher,
+# and back in it after every `wts rm` of a session that served it, merged or not.
+#
+# Local only. A Things task is closed in Things: snapshot() is last writer wins
+# and nothing is written back, so a status set here would be undone by the next
+# `wts task ls` — and wts would disagree with Things until then. The check reads
+# the row's source rather than the `local:` prefix, which is only a convention.
+#
+# Notes, documents, the archive and a live link are left alone: the task leaves
+# the list of work to start, not the history of what was done on it.
+cmd_done() {
+  local id src st title
+  db_init 2>/dev/null
+  take_task_arg "$@" || return 1
+  id="$REPLY_TASK"
+  IFS=$'\x1f' read -r -d $'\x1e' src st title < <(db_rows "
+    SELECT source, status, title FROM tasks WHERE id = $(sql_str "$id")" 2>/dev/null)
+  if [[ -z "${src:-}" ]]; then
+    print -u2 -r -- "wts task done: $id is not a task wts holds"
+    return 1
+  fi
+  if [[ "$src" != local ]]; then
+    print -u2 -r -- "wts task done: “${title:-$id}” is a Things task — complete it in Things; wts sees it at the next wts task ls"
+    return 1
+  fi
+  if [[ "$st" == completed ]]; then
+    print -r -- "→ “${title:-$id}” is already done"
+    return 0
+  fi
+  db_q "UPDATE tasks SET status = 'completed',
+                         completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+         WHERE id = $(sql_str "$id") AND source = 'local'" >/dev/null 2>&1 || {
+    print -u2 -r -- "wts task done: could not write the task"
+    return 1
+  }
+  print -r -- "✓ “${title:-$id}” — done"
+}
+
 # ─── Dispatch ────────────────────────────────────────────────────────────────
 
 case "${1:-ls}" in
@@ -638,6 +680,7 @@ case "${1:-ls}" in
   note)   shift; cmd_note "$@" ;;
   edit)   shift; cmd_edit "$@" ;;
   doc)    shift; cmd_doc "$@" ;;
+  done)   shift; cmd_done "$@" ;;
   # Not a user-facing verb: how `wts <name> --task …` turns what was typed into
   # an id, before it creates anything. Prints the id, or fails having said why.
   resolve)
@@ -672,5 +715,5 @@ case "${1:-ls}" in
     db_ro "SELECT slug FROM task_docs WHERE task = $(sql_str "${1:-}")
            ORDER BY added_at" 2>/dev/null
     ;;
-  *) print -u2 "usage: wts task ls|show|link|unlink|new|add|note|edit|doc …"; exit 2 ;;
+  *) print -u2 "usage: wts task ls|show|link|unlink|new|add|note|edit|doc|done …"; exit 2 ;;
 esac
