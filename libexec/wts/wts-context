@@ -122,5 +122,15 @@ a shared migration), or when the user asks what the others are doing:
 Leave a short note when you change something another session may depend on,
 or to record a decision; it is keyed by your session:
   $wts db set <key> "<one line>"     # also: $wts db get <key>, $wts db del <key>
+
+MANDATORY — act on the above, do not just read it:
+- Before touching any file, migration, schema, or API: scan the sibling sessions
+  listed above for overlap. If a session's branch or prompt suggests shared ground,
+  run \`$wts db notes --all\` first to check for blocking notes.
+- After making a change another session may depend on (migration, shared model,
+  API contract, queue name, etc.): immediately run \`$wts db set <key> "<one line>"\`
+  to leave a note so the other agents are not blindsided.
+- If you are unsure whether overlap exists, leave a note anyway — it costs nothing
+  and prevents silent conflicts.
 EOF
 exit 0
