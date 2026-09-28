@@ -2,7 +2,8 @@
 # wts-keys — the one table of wts keys, read by the switcher's footer and by
 # `wts keys`.
 #
-#   --footer [collapsed|expanded|reply]   what the switcher prints under its list
+#   --footer [collapsed|expanded|reply|note|newtask]
+#                                         what the switcher prints under its list
 #   (no argument)                         the aide-memoire `wts keys` prints
 #
 # One table, two consumers: a footer that disagreed with `wts keys` would be
@@ -27,13 +28,13 @@ SEP=$'\x1f'
 # footer has on a half-popup list.
 typeset -ga KEYS
 KEYS=(
-  "enter${SEP}switch${SEP}switch, or start the task"
+  "enter${SEP}switch${SEP}switch, or choose for the task"
   "tab${SEP}reply${SEP}reply to the agent, or note a task"
   "^x${SEP}stop${SEP}stop the session, keep the worktree"
   "^d${SEP}rm${SEP}remove session, worktree and branch"
   "^o${SEP}pr${SEP}open the pull request on GitHub"
   "^e${SEP}doc${SEP}attach a context document"
-  "^t${SEP}task${SEP}pull a task in from Things"
+  "^t${SEP}task${SEP}new task (empty: from Things)"
   "^f/^b${SEP}scroll${SEP}scroll the preview half a page"
   "^r${SEP}reload${SEP}reload the list now"
   "esc${SEP}close${SEP}close, or leave reply mode"
@@ -60,8 +61,9 @@ has_doc() {
     [[ -x "$WTS_KEYS_DIR/wts-doc" ]]
   fi
 }
-# ctrl-t only where Things can be read: `wts task add` with no Things would open
-# a picker over nothing. In a terminal, ask the helper; it answers in one glob.
+# Things only matters to ctrl-t on an empty title: the key itself is always
+# bound now, since what it does first is create a task wts holds on its own.
+# In a terminal, ask the helper; it answers in one glob.
 has_things() {
   if (( IN_FOOTER )); then
     [[ "${WTS_SWITCH_THINGS:-}" == 1 ]]
@@ -75,7 +77,6 @@ prune_keys() {
   drop=()
   has_pr     || drop+=("^o")
   has_doc    || drop+=("^e")
-  has_things || drop+=("^t")
   (( ${#drop} )) || return 0
   kept=()
   for raw in "${KEYS[@]}"; do
@@ -213,6 +214,17 @@ note_line() {
   print -r -- "$line"
 }
 
+# ctrl-t's mode. `enter` on an empty title does something only where Things can
+# be read, so the footer says so only there.
+newtask_line() {
+  local w line="enter create the task · esc back to the list"
+  has_things && line="enter create the task (empty: pick from Things) · esc back"
+  w=$(footer_width)
+  (( ${#line} > w )) && line="enter create the task · esc back"
+  (( ${#line} > w )) && line="enter create · esc back"
+  print -r -- "$line"
+}
+
 # `wts keys`: the same table, laid out for a terminal rather than for a popup.
 text() {
   local raw
@@ -227,7 +239,11 @@ text() {
   behind=("ctrl-x is 'wts stop'" "ctrl-d is 'wts rm'")
   has_pr     && behind+=("ctrl-o is 'wts pr'")
   has_doc    && behind+=("ctrl-e is 'wts doc use', or 'wts task doc' on a task")
-  has_things && behind+=("ctrl-t is 'wts task add'")
+  if has_things; then
+    behind+=("ctrl-t is 'wts task new', or 'wts task add' on an empty title")
+  else
+    behind+=("ctrl-t is 'wts task new'")
+  fi
   print -r -- "  ${(j:, :)behind}."
   print -r -- ""
   print -r -- "tmux (from 'wts setup tmux')"
@@ -245,13 +261,14 @@ if [[ "${1:-}" == "--footer" ]]; then
     expanded) expanded ;;
     reply)    reply_line ;;
     note)     note_line ;;
+    newtask)  newtask_line ;;
     *)        collapsed ;;
   esac
   exit 0
 fi
 
 if [[ -n "${1:-}" && "$1" != "--text" ]]; then
-  print -u2 -r -- "usage: wts-keys [--text | --footer [collapsed|expanded|reply|note]]"
+  print -u2 -r -- "usage: wts-keys [--text | --footer [collapsed|expanded|reply|note|newtask]]"
   exit 2
 fi
 

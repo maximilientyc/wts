@@ -57,8 +57,18 @@ _db_exists() {
 }
 
 # db_rows <sql> — read-only, fields separated by \x1f and rows ended by \x1e:
-# prompts are free text, so neither TAB nor newline can delimit. Read with
-#   while IFS=$'\x1f' read -r -d $'\x1e' a b c; do …; done < <(db_rows …)
+# prompts are free text, so neither TAB nor newline can delimit. Split with
+# parameter flags, never with `read -d`:
+#   out=$(db_rows …)
+#   for row in "${(@ps:\x1e:)out}"; do
+#     [[ -n "$row" ]] || continue
+#     f=("${(@ps:\x1f:)row}")   # empty fields are kept
+#   done
+# `read -d` puts the TERMINAL in non-canonical mode through the shell's own tty
+# (zsh opens /dev/tty at startup even in a script), whatever it reads from. Run
+# by fzf — a reload or a preview, in a process group of its own — that is a
+# terminal change from the background: SIGTTOU, and the process stops for good.
+# The switcher's list stopped refreshing the moment a task row existed.
 db_rows() {
   _db_exists || return 0
   _db -readonly -ascii "$WTS_DB" "$@"
@@ -379,11 +389,14 @@ task_context_md() {  # <task id> [<max note lines>]
   [[ -n "$id" ]] || return 1
   db_available || return 1
 
-  local title notes st area
-  # -d $'\x1e': the notes are the author's free text and hold newlines, so a
-  # plain `read` would stop at the first one and lose every field after it.
-  IFS=$'\x1f' read -r -d $'\x1e' title notes st area < <(db_rows "
+  local title notes st area out row
+  local -a f
+  # Split on \x1f and not read line by line: the notes are the author's free
+  # text and hold newlines. Not `read -d` either: see db_rows.
+  out=$(db_rows "
     SELECT title, notes, status, area FROM tasks WHERE id = $(sql_str "$id")" 2>/dev/null)
+  f=("${(@ps:\x1f:)${out%$'\x1e'}}")
+  title="${f[1]:-}" notes="${f[2]:-}" st="${f[3]:-}" area="${f[4]:-}"
   [[ -n "${title:-}" ]] || return 1
 
   print -r -- "## Task: $title"
@@ -403,38 +416,45 @@ task_context_md() {  # <task id> [<max note lines>]
 
   local body at
   local -i n=0
-  while IFS=$'\x1f' read -r -d $'\x1e' at body; do
+  out=$(db_rows "SELECT substr(added_at, 1, 10), body FROM task_notes
+                 WHERE task = $(sql_str "$id") ORDER BY added_at" 2>/dev/null)
+  for row in "${(@ps:\x1e:)out}"; do
+    f=("${(@ps:\x1f:)row}")
+    at="${f[1]:-}" body="${f[2]:-}"
     [[ -n "$body" ]] || continue
     (( n++ == 0 )) && { print -r -- "Added in wts:"; print -r -- "" }
     print -r -- "- ($at) $body"
     (( cap > 0 && n >= cap )) && { print -r -- "- (…)"; break }
-  done < <(db_rows "SELECT substr(added_at, 1, 10), body FROM task_notes
-                    WHERE task = $(sql_str "$id") ORDER BY added_at" 2>/dev/null)
+  done
   (( n )) && print -r -- ""
 
   # Every link the task carries, even the ones that became documents below: an
   # agent that can reach a page itself should not have to guess its address.
   local url kind
   n=0
-  while IFS=$'\x1f' read -r -d $'\x1e' url kind; do
+  # tasks.id and not id: json_each exposes an `id` column of its own, and an
+  # unqualified one is ambiguous — sqlite refuses to prepare the statement.
+  out=$(db_rows "SELECT json_extract(value, '\$.url'), json_extract(value, '\$.kind')
+                 FROM tasks, json_each(tasks.links)
+                 WHERE tasks.id = $(sql_str "$id") AND json_valid(tasks.links)" 2>/dev/null)
+  for row in "${(@ps:\x1e:)out}"; do
+    f=("${(@ps:\x1f:)row}")
+    url="${f[1]:-}" kind="${f[2]:-}"
     [[ -n "$url" ]] || continue
     (( n++ == 0 )) && { print -r -- "Links in the task:"; print -r -- "" }
     print -r -- "- [${kind:-link}] $url"
-  # tasks.id and not id: json_each exposes an `id` column of its own, and an
-  # unqualified one is ambiguous — sqlite refuses to prepare the statement.
-  done < <(db_rows "SELECT json_extract(value, '\$.url'), json_extract(value, '\$.kind')
-                    FROM tasks, json_each(tasks.links)
-                    WHERE tasks.id = $(sql_str "$id") AND json_valid(tasks.links)" 2>/dev/null)
+  done
   (( n )) && print -r -- ""
 
   local slug
   n=0
-  while IFS=$'\x1f' read -r -d $'\x1e' slug; do
+  out=$(db_rows "SELECT slug FROM task_docs WHERE task = $(sql_str "$id")
+                 ORDER BY added_at" 2>/dev/null)
+  for slug in "${(@ps:\x1e:)out}"; do
     [[ -n "$slug" ]] || continue
     (( n++ == 0 )) && { print -r -- "Documents attached to the task:"; print -r -- "" }
     print -r -- "- $slug"
-  done < <(db_rows "SELECT slug FROM task_docs WHERE task = $(sql_str "$id")
-                    ORDER BY added_at" 2>/dev/null)
+  done
   (( n )) && print -r -- ""
   return 0
 }

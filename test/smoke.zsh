@@ -1134,7 +1134,7 @@ check "and still padded to the list width" eval '
 check "the task preview is what the task carries" eval '
   tid=$("$SWITCH" --list | awk -F "\t" "\$2 ~ /^task:/ { print substr(\$2, 6); exit }")
   out=$("$SWITCH" --preview "task:$tid" "")
-  [[ "$out" == *"## Task:"* && "$out" == *"enter starts a session"* ]]'
+  [[ "$out" == *"## Task:"* && "$out" == *"attach it to a session"* ]]'
 check "WTS_SWITCH_TASKS=0 keeps them out" eval '
   ! env WTS_SWITCH_TASKS=0 "$SWITCH" --list | cut -f2 | grep -q "^task:"'
 # tab on a task pins the task, and enter appends to its notes instead of typing
@@ -1159,13 +1159,58 @@ check "ctrl-d goes through --rm, not straight to wts rm" \
 check "--rm on a task row does nothing at all" eval '
   "$SWITCH" --rm "" >/dev/null 2>&1
   [[ "$(q "select count(*) from sessions")" == "$(q "select count(*) from sessions")" ]]'
-check "fzf accepts the ctrl-t bind" \
-  eval 'printf "x\n" | fzf --bind="ctrl-t:execute(true)+reload(true)" --filter=x'
-check "wts keys lists ^t when the switcher bound it" eval '
-  env WTS_SWITCH_THINGS=1 WTS_SWITCH_COLS=120 "$ROOT/libexec/wts/wts-keys" --footer expanded \
-    | grep -qF "pull a task in from Things"'
-refute "and drops it when it did not" eval '
-  env WTS_SWITCH_COLS=120 "$ROOT/libexec/wts/wts-keys" --footer expanded | grep -qF "^t "'
+# ctrl-t: a task created from the popup. The mode is reply mode's machinery,
+# pinned on `newtask:`; enter creates a local task and hands `load` its id.
+export WTS_SWITCH_REPLY="$SANDBOX/reply-new" WTS_SWITCH_FOCUS="$SANDBOX/focus"
+rm -f "$WTS_SWITCH_REPLY" "$WTS_SWITCH_FOCUS"
+chain=$(env WTS_NO_THINGS=1 "$SWITCH" --reply new)
+check "ctrl-t enters new-task mode" eval '
+  [[ "$chain" == disable-search+* && "$chain" == *"change-prompt(new task> )"* ]] \
+  && [[ "$(head -1 "$WTS_SWITCH_REPLY")" == "newtask:" ]]'
+check "fzf parses the new-task chain" fzf_parses "$chain"
+check "the new-task footer says create" eval '
+  [[ "$(env WTS_SWITCH_COLS=120 "$ROOT/libexec/wts/wts-keys" --footer newtask)" == "enter create"* ]]'
+chain=$("$SWITCH" --reply send "  Write the migration guide " "" "")
+NEWTASK=$(q "select id from tasks where title = 'Write the migration guide'")
+check "enter creates a local task, trimmed" eval '[[ "$NEWTASK" == local:* ]]'
+check "and leaves the mode, reloading with load rebound" eval '
+  [[ ! -e "$WTS_SWITCH_REPLY" && "$chain" == enable-search+* \
+     && "$chain" == *"rebind(load)+reload-sync("* ]]'
+check "fzf parses the create chain" fzf_parses "$chain"
+check "load then puts the cursor on the new task" eval '
+  n=$("$SWITCH" --loaded)
+  row=$("$SWITCH" --list-fast | sed -n "$(( ${${n#*pos\(}%\)} + 1 ))p" | cut -f2)
+  [[ "$n" == "unbind(load)+pos("* && "$row" == "task:$NEWTASK" && ! -e "$WTS_SWITCH_FOCUS" ]]'
+check "and the next load is the startup reload again" eval '
+  [[ "$("$SWITCH" --loaded --no-git)" == *"reload-sync("*"--list --no-git)" ]]'
+ntasks=$(q "select count(*) from tasks")
+"$SWITCH" --reply new >/dev/null
+chain=$(env WTS_SWITCH_THINGS= "$SWITCH" --reply send "   " "" "")
+check "an empty title without Things only leaves the mode" eval '
+  [[ "$chain" != *execute* && "$chain" != *reload-sync* && ! -e "$WTS_SWITCH_REPLY" ]] \
+  && [[ "$(q "select count(*) from tasks")" == "$ntasks" ]]'
+"$SWITCH" --reply new >/dev/null
+check "an empty title with Things opens its picker" eval '
+  [[ "$(env WTS_SWITCH_THINGS=1 "$SWITCH" --reply send "" "" "")" == *"execute("*"--things)"* ]]'
+unset WTS_SWITCH_REPLY WTS_SWITCH_FOCUS
+check "wts keys lists ^t as a new task, Things or not" eval '
+  env WTS_SWITCH_COLS=120 "$ROOT/libexec/wts/wts-keys" --footer expanded | grep -qF "new task"'
+
+# enter on a task: the choice screen's answers, without the screen.
+ta() { env WTS_SWITCH_DRY=1 WTS_NO_THINGS=1 "$SWITCH" --task-action "$NEWTASK" "$@" }
+check "a prompt starts wts-fresh on the phrase, linked to the task" eval '
+  [[ "$(ta prompt "write the migration guide")" == "wts-fresh '\''write the migration guide'\'' --task $NEWTASK" ]]'
+refute "a one-word prompt is refused, it would be read as a name" ta prompt status
+check "a branch name loses the prefix typed by habit" eval '
+  [[ "$(ta branch feature/migration-guide)" == "wts-fresh migration-guide --task $NEWTASK" ]]'
+refute "a branch that cannot be a session name is refused" ta branch "Migration Guide"
+check "attaching links the task to the session" eval '
+  env WTS_NO_ATTACH=1 WTS_NO_THINGS=1 "$WTS" tattach smoke >/dev/null
+  [[ "$(ta session tattach)" == "switch tattach" ]] \
+  && [[ "$(q "select task from task_links where session = '\''tattach'\''")" == "$NEWTASK" ]]'
+refute "and the task leaves the task rows, it is on its session now" eval '
+  "$SWITCH" --list | cut -f2 | grep -qxF "task:$NEWTASK"'
+"$WTS" rm tattach -f >/dev/null
 
 # gc --apply is the primary capture path: a merged branch is torn down and must
 # leave a row behind, with gc's own verdict on how the work ended.

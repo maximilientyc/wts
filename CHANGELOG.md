@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- **`ctrl-t` in the switcher creates a task.** It used to only pull one in from
+  Things, and was not bound at all without Things: a task could be created only
+  from a terminal (`wts task new`). Now the prompt becomes `new task>`, `enter`
+  creates the task and puts the cursor on it; an empty title still opens the
+  Things picker where there is one. The cursor is placed by `load` once the list
+  is reloaded, because `pos()` chained after `reload-sync` runs on the old list.
+- **`enter` on a task asks what to do with it** instead of starting a session at
+  once on a name derived from the title: a new session from a prompt, a new
+  session from a branch name (both through `wts-fresh`, both pre-filled), or
+  attaching the task to an existing session. A second fzf in the same popup, not
+  tmux's command-prompt, which raced the popup's teardown. `esc` goes back to the
+  list.
+- **Fixed: the switcher stopped refreshing as soon as a task row existed** — the
+  list stayed on its skeleton, spinner turning. zsh's `read -d` changes the terminal's mode
+  through the shell's own tty, whatever it reads from; run by fzf (a reload or a
+  preview, in a process group of its own) that is a terminal change from the
+  background — SIGTTOU, and the process stops for good. The reads on those paths
+  split the rows with parameter flags instead.
+
 ## 1.2.0 — 2026-09-28
 
 The task stops being a label and becomes the place context lives — and it reaches
