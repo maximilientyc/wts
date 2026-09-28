@@ -532,6 +532,8 @@ entirely present in it, whatever the merge method, and is deleted with
 
 ## The work journal: `wts log`
 
+![wts task link labelling a finished session, wts ls showing the marker it adds, wts gc announcing what it would archive and then archiving it, the retrospective written by Claude, and wts task ls and wts log reporting what survived the teardown](docs/journal.gif)
+
 ```sh
 wts log                             # the last 180 days, as JSON
 wts log --since '-6 months'         # or an ISO date: --since 2026-04-01

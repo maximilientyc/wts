@@ -14,13 +14,31 @@
 #                        (charmbracelet/vhs#787); 0.11.0 works
 #   WTS_DEMO_MODEL=...   model of the agents (default: sonnet)
 #   WTS_DEMO_KEEP=1      leave the sandbox and its tmux server up afterwards
+#   WTS_DEMO_TAPE=...    another tape, and WTS_DEMO_OUT=... where its GIF goes
+#                        (default: docs/demo/demo.tape -> docs/demo.gif)
+#   WTS_DEMO_READY=...   jq filter over {session: agent_state}, the states the
+#                        tape needs before recording (default: demo.tape's one
+#                        blocked, one working, one idle)
+#   WTS_DEMO_BIN=...     a directory to put FIRST on PATH, for the setup and for
+#                        the pane shells. Without it the tape records the
+#                        INSTALLED wts, which cannot demonstrate a feature that
+#                        is not released yet: WTS_DEMO_BIN=$PWD/bin records the
+#                        checkout. Pane shells get it from the generated
+#                        .zshrc — tmux rebuilds PATH for a new pane, so passing
+#                        it through the environment would not reach them.
 
 set -euo pipefail
 
 ROOT="${0:A:h:h:h}"
-TAPE="${0:A:h}/demo.tape"
-OUT="$ROOT/docs/demo.gif"
+TAPE="${WTS_DEMO_TAPE:-${0:A:h}/demo.tape}"
+OUT="${WTS_DEMO_OUT:-$ROOT/docs/demo.gif}"
 VHS="${VHS:-vhs}"
+
+# First on PATH for everything below, including the `wts` the checks resolve.
+if [[ -n "${WTS_DEMO_BIN:-}" ]]; then
+  [[ -x "$WTS_DEMO_BIN/wts" ]] || { print -r -- "record: no wts in $WTS_DEMO_BIN" >&2; exit 1 }
+  export PATH="${WTS_DEMO_BIN:A}:$PATH"
+fi
 
 # A fixed path, not mktemp: Claude Code records folder trust per repository
 # path, so a stable clone is trusted once rather than on every take. Short and
@@ -84,6 +102,11 @@ mkdir -p "$TMUX_TMPDIR" "$XDG_STATE_HOME" "$WTS_LAYOUTS_PATH" "$ZDOTDIR"
 for f in .zshenv .zprofile .zshrc .zlogin; do
   if [[ -f "$HOME/$f" ]]; then print -r -- "source ${(q)HOME}/$f" > "$ZDOTDIR/$f"; fi
 done
+# Appended after the source, so it wins over whatever your config sets: this is
+# the only way the pane shells see WTS_DEMO_BIN at all.
+if [[ -n "${WTS_DEMO_BIN:-}" ]]; then
+  print -r -- "path=(${(q)${WTS_DEMO_BIN:A}} \$path)" >> "$ZDOTDIR/.zshrc"
+fi
 
 # A local bare repository stands in for origin: the squash merge below and the
 # fetch in `wts gc` stay on this machine.
@@ -127,12 +150,17 @@ g push -q origin --delete orig-leftovers
 # answer is "No, exit": pick the other one. The answer is stored for the clone's
 # path, so from the second take on this finds nothing to do.
 # Then wait for the three states the switcher has to show.
+# The default is demo.tape's requirement: its switcher frames have to show one
+# agent of each state. A tape that shows something else must not be held to it —
+# whether an agent lands on `working` or `blocked` depends on what it decides to
+# ask, so gating on it when the tape does not care is a take lost to a coin toss.
+# The filter runs over {session: agent_state}.
+READY_FILTER="${WTS_DEMO_READY:-.[\"gc-quiet\"] == \"blocked\"
+  and .[\"stale-guard-docs\"] == \"working\" and .[\"name-fallback\"] == \"idle\"}"
 ready() {
-  wts status --json | jq -e 'map({(.name): .agent_state}) | add
-    | .["gc-quiet"] == "blocked" and .["stale-guard-docs"] == "working"
-      and .["name-fallback"] == "idle"' >/dev/null
+  wts status --json | jq -e "map({(.name): .agent_state}) | add | $READY_FILTER" >/dev/null
 }
-print "record: waiting for the agents (blocked, working, idle)"
+print "record: waiting for the agents"
 integer waited=0
 until ready; do
   for p in $(tmux list-panes -a -F '#{pane_id}'); do

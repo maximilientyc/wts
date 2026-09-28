@@ -26,7 +26,8 @@ completions/_wts           zsh completion
 test/smoke.zsh             end-to-end test in a sandbox
 test/bench-big.zsh         speed on a generated large repository (make bench)
 docs/big-repo-analysis.md  what that bench found, and the fixes it suggests
-docs/demo/                record.zsh + demo.tape: the README GIF (make demo)
+docs/demo/                record.zsh + demo.tape (README GIF, make demo)
+                          + journal.tape (the wts log demo, WTS_DEMO_TAPE=)
 ```
 
 Homebrew, `make install` and a git checkout share this tree, so `bin/wts` works
