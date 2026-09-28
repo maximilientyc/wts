@@ -641,6 +641,14 @@ inside a worktree they need no id. What they write is wts's own: Things stays
 read-only, and a note you add here is **not** overwritten the next time wts
 refreshes the task from Things — which a column on the task would have been.
 
+The first `wts task add` on macOS 15+ makes the system ask whether your terminal
+may *access data from other apps*: Things keeps its database in its own
+container. Say yes once and wts remembers that it can read it; say no and it
+stops offering Things at all — `wts task new "<title>"` keeps working either
+way, on a task wts holds by itself, and `wts task add` is still how you try
+again once you have changed your mind in System Settings. Nothing else ever
+opens Things: not `wts ls`, not the switcher, not a hook.
+
 Four channels carry it into the session, and they are four because each one
 fails differently:
 

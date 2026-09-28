@@ -59,6 +59,14 @@ straight from the checkout. Scripts locate each other from their own path
   `wts-doc` is the one exception and says why in its header — fetching a page is
   precisely a job for the machine's own connectors, whose names differ from one
   machine to the next, so the allow list is enumerated, never hardcoded.
+- **Another app's data is privileged on macOS 15+** (`~/Library/Containers`,
+  `~/Library/Group Containers`): the first touch raises "iTerm would like to
+  access data from other apps" — the *glob* raises it, before any open, and a
+  denial is remembered. So the same rule as the model: only a command the user
+  typed may read Things. Anything that merely describes what a key does asks
+  `wts-things available`, which reads the cached verdict in `kv['things.db']`
+  and nothing else. The switcher asked `wts-things db` on every popup open, to
+  word one footer line: that dialog on every `prefix+s` is how it was found.
 - Layout files stay ASCII (Ruby reads them under `LANG=C` otherwise fails). So do
   the switcher's display columns: `emit` pads them to an exact character count
   and the smoke test asserts it, but a glyph of East Asian **Ambiguous** width

@@ -63,12 +63,15 @@ has_doc() {
 }
 # Things only matters to ctrl-t on an empty title: the key itself is always
 # bound now, since what it does first is create a task wts holds on its own.
-# In a terminal, ask the helper; it answers in one glob.
+# `1` and not just non-empty: `maybe` means ctrl-t will try Things, which is not
+# something to promise in a footer. In a terminal, ask the helper for its cached
+# verdict — printing a key table must not raise macOS's "access data from other
+# apps" dialog, which asking Things itself does.
 has_things() {
   if (( IN_FOOTER )); then
     [[ "${WTS_SWITCH_THINGS:-}" == 1 ]]
   else
-    [[ -x "$WTS_KEYS_DIR/wts-things" ]] && "$WTS_KEYS_DIR/wts-things" db >/dev/null 2>&1
+    [[ -x "$WTS_KEYS_DIR/wts-things" ]] && "$WTS_KEYS_DIR/wts-things" available
   fi
 }
 prune_keys() {

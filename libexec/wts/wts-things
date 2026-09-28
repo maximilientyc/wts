@@ -2,6 +2,7 @@
 # wts-things — the Things 3 task list, read from its own database.
 #
 # Usage: wts-things db                       the database it will read, or why not
+#        wts-things available [--maybe]      yes/no from cache alone, no Things read
 #        wts-things tasks [--status open|completed|all]
 #                         [--since <iso>] [--until <iso>] [--limit N]
 #        wts-things show <uuid>              one task as a JSON object
@@ -63,6 +64,48 @@ things_db() {
     return 1
   fi
   print -r -- "${c[1]}"
+}
+
+# ─── Asking without reading ──────────────────────────────────────────────────
+#
+# Reaching into Things' container is a PRIVILEGED read on macOS 15+: the system
+# asks "iTerm would like to access data from other apps" — and the glob above is
+# already enough to raise it, before any SQLite open. The switcher ran `db` on
+# every popup open just to word one footer line, so opening the switcher raised
+# a system dialog about an app the user had not asked for. Nothing that merely
+# *describes* what a key does may touch Things.
+#
+# So the verdict of a real probe is cached in wts's own database and `available`
+# answers from there. It is never refreshed on its own: the next command that
+# actually reads Things (`wts task add`, `wts log`) updates it, and that one the
+# user typed. Three states, because "not asked yet" is not "absent":
+#   a path   Things was read once and can be read        `available` -> 0
+#   empty    a probe failed (not installed, or denied)   -> 1, and --maybe -> 1
+#   no row   never probed                                -> 1, but --maybe -> 0
+# --maybe is what an explicit key press asks: try, and let the probe answer.
+things_remember() {  # <path|"">
+  # An override describes this run, not the machine: it must not poison the cache.
+  [[ -n "${WTS_NO_THINGS:-}" || -n "${WTS_THINGS_DB:-}" ]] && return 0
+  db_available || return 0
+  # Only on a change: every `show` would otherwise take the write lock, and
+  # `wts task add` calls that one per task it snapshots.
+  [[ "$(db_ro "SELECT value FROM kv WHERE key = 'things.db'" 2>/dev/null)" == "$1" ]] && return 0
+  db_init 2>/dev/null || return 0
+  db_q "INSERT OR REPLACE INTO kv VALUES ('things.db', $(sql_str "$1"))" >/dev/null 2>&1
+  return 0
+}
+
+cmd_available() {
+  local maybe=0
+  [[ "${1:-}" == "--maybe" ]] && maybe=1
+  [[ -n "${WTS_NO_THINGS:-}" ]] && return 1
+  [[ -n "${WTS_THINGS_DB:-}" ]] && { [[ -s "$WTS_THINGS_DB" ]]; return $? }
+  db_available || return 1
+  local cached
+  cached=$(db_ro "SELECT value FROM kv WHERE key = 'things.db'" 2>/dev/null)
+  [[ -n "$cached" ]] && return 0
+  # No row at all: never probed. Only --maybe reads that as a yes.
+  (( maybe )) && [[ -z "$(db_ro "SELECT 1 FROM kv WHERE key = 'things.db'" 2>/dev/null)" ]]
 }
 
 # Read-only, always. A user's ~/.sqliterc would otherwise reformat every answer,
@@ -254,8 +297,18 @@ cmd_pick() {
 
 # ─── Dispatch ────────────────────────────────────────────────────────────────
 
-THINGS=$(things_db) || exit 1
-things_compatible || exit 1
+# Before the probe, and not in the case below: asking whether Things is readable
+# must never be what reads it.
+if [[ "${1:-}" == "available" ]]; then
+  cmd_available "${2:-}"
+  exit $?
+fi
+
+# Every other verb reads Things for real, and records what it found for the
+# callers that cannot.
+THINGS=$(things_db) || { things_remember ""; exit 1 }
+things_compatible || { things_remember ""; exit 1 }
+things_remember "$THINGS"
 
 case "${1:-}" in
   db)    print -r -- "$THINGS" ;;
@@ -263,5 +316,5 @@ case "${1:-}" in
   show)  shift; (( $# == 1 )) || { print -u2 "usage: wts-things show <uuid>"; exit 2 }; cmd_show "$1" ;;
   links) shift; (( $# == 1 )) || { print -u2 "usage: wts-things links <uuid>"; exit 2 }; cmd_links "$1" ;;
   pick)  shift; cmd_pick "$@" ;;
-  *) print -u2 "usage: wts-things db|tasks|show|links|pick …"; exit 2 ;;
+  *) print -u2 "usage: wts-things db|available|tasks|show|links|pick …"; exit 2 ;;
 esac
