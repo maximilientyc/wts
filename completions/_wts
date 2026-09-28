@@ -378,7 +378,8 @@ _wts() {
           "add:put a Things task on the wts list" \
           "note:append free text to a task" \
           "edit:the task notes in \$EDITOR" \
-          "doc:attach a context document to a task"
+          "doc:attach a context document to a task" \
+          "done:mark a local task done"
       elif [[ "${words[3]}" == doc ]]; then
         # `wts task doc [<task>] <doc>`: the library, since a task in position 1
         # is optional and the document is the argument that is always wanted.

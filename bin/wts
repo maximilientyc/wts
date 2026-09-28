@@ -17,6 +17,7 @@
 #        wts retro [name...] [--force]
 #        wts task ls | show <id> | link [<id>] [session] | unlink | new "<title>"
 #        wts task add [<id>] | note [<id>] "<text>" | edit [<id>] | doc [<id>] [<doc>]
+#        wts task done [<id>]
 #        wts layouts
 #        wts keys
 #        wts setup tmux | git | claude [--install]
@@ -86,7 +87,7 @@
 
 set -euo pipefail
 
-WTS_VERSION="1.3.2"
+WTS_VERSION="1.4.0"
 
 # ─── Install layout ──────────────────────────────────────────────────────────
 # Homebrew, `make install` and a git checkout all share the same tree:

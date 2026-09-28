@@ -139,6 +139,10 @@ straight from the checkout. Scripts locate each other from their own path
   the script when the condition is false — the statement's own status is 1. Use
   an `if`. Helpers have no `-e`, which is why the same line is fine there. This
   broke `wts rm` once, silently, for every repository without `origin/HEAD`.
+- `db_ro` returns a control character as the two characters `^_` (sqlite3 3.50+
+  escapes them in its default output): `char(31)` joined in a SELECT and split
+  with `IFS=$'\x1f'` reads as one field. Rows of several fields go through
+  `db_rows`, which uses `-ascii`.
 - `sqlite3`: always `-init /dev/null` (a user's `~/.sqliterc` with `.mode box`
   changes every output), and `.timeout` on every connection, or a concurrent
   writer fails with "database is locked". Rows with free text (prompts span

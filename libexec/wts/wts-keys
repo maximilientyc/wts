@@ -31,7 +31,7 @@ KEYS=(
   "enter${SEP}switch${SEP}switch, or choose for the task"
   "tab${SEP}reply${SEP}reply to the agent, or note a task"
   "^x${SEP}stop${SEP}stop the session, keep the worktree"
-  "^d${SEP}rm${SEP}remove session, worktree and branch"
+  "^d${SEP}rm${SEP}rm session, or close a local task"
   "^o${SEP}pr${SEP}open the pull request on GitHub"
   "^e${SEP}doc${SEP}attach a context document"
   "^t${SEP}task${SEP}new task (empty: from Things)"
@@ -239,7 +239,7 @@ text() {
   done
   # Names the command behind each key, and only the keys actually bound.
   local -a behind
-  behind=("ctrl-x is 'wts stop'" "ctrl-d is 'wts rm'")
+  behind=("ctrl-x is 'wts stop'" "ctrl-d is 'wts rm', or 'wts task done' on a task")
   has_pr     && behind+=("ctrl-o is 'wts pr'")
   has_doc    && behind+=("ctrl-e is 'wts doc use', or 'wts task doc' on a task")
   if has_things; then
