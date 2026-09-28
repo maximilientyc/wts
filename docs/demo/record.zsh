@@ -30,8 +30,13 @@
 set -euo pipefail
 
 ROOT="${0:A:h:h:h}"
-TAPE="${WTS_DEMO_TAPE:-${0:A:h}/demo.tape}"
-OUT="${WTS_DEMO_OUT:-$ROOT/docs/demo.gif}"
+# Resolved HERE, while the working directory is still the one the command was
+# typed in: the recording runs from inside the sandbox ($D), so a relative
+# WTS_DEMO_TAPE — which is how both tapes document themselves — was looked up
+# under the sandbox and vhs answered "no such file" on stdout, which is
+# discarded. The take failed silently, after the agents had been started.
+TAPE="${${WTS_DEMO_TAPE:-${0:A:h}/demo.tape}:A}"
+OUT="${${WTS_DEMO_OUT:-$ROOT/docs/demo.gif}:A}"
 VHS="${VHS:-vhs}"
 
 # First on PATH for everything below, including the `wts` the checks resolve.
@@ -55,6 +60,10 @@ die() { print -r -- "record: $*" >&2; exit 1 }
 for c in "$VHS" gifsicle tmux tmuxinator claude jq wts; do
   command -v "$c" >/dev/null || die "$c not found"
 done
+# Before the agents are started, not after: vhs reports a missing tape on stdout,
+# which the recording discards, so the take used to die in silence having already
+# spent a few turns.
+[[ -f "$TAPE" ]] || die "no tape at $TAPE"
 [[ "$("$VHS" --version)" != *0.12.0* ]] ||
   die "vhs 0.12.0 writes no output (charmbracelet/vhs#787): set VHS to a 0.11.0 binary"
 installed=$(wts --version) checkout=$("$ROOT/bin/wts" --version)

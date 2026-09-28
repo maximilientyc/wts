@@ -374,7 +374,15 @@ _wts() {
           "show:one task, its notes and its links" \
           "link:attach a session to a task" \
           "unlink:detach the session" \
-          "new:a local task, without Things"
+          "new:a local task, without Things" \
+          "add:put a Things task on the wts list" \
+          "note:append free text to a task" \
+          "edit:the task notes in \$EDITOR" \
+          "doc:attach a context document to a task"
+      elif [[ "${words[3]}" == doc ]]; then
+        # `wts task doc [<task>] <doc>`: the library, since a task in position 1
+        # is optional and the document is the argument that is always wanted.
+        _wts_docs
       else
         _wts_tasks_or_sessions
       fi ;;

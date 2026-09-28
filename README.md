@@ -128,6 +128,7 @@ wts gc [--apply] [--no-fetch] [--no-retro]
 wts log [--since <when>] [--until <when>] [--task <id>] [--brief] [--no-notes]
 wts retro [name...] [--force]
 wts task ls | show <id> | link [<id>] [name] | unlink [name] | new "<title>"
+wts task add [<id>] | note [<id>] "<text>" | edit [<id>] | doc [<id>] [<url|slug>]
 wts layouts
 wts keys
 wts db path | schema | sql "<SELECT ...>" | notes [--all] | get | set | del
@@ -266,7 +267,8 @@ branch and the registry entry stay, the popup stays open and the row reads
 pull request on GitHub (`wts pr`, through `gh pr view --web`: without a PR the popup
 says so and stays open; without `gh` the key is neither bound nor listed),
 `ctrl-e` attaches a [context document](#context-documents-wts-doc) to the session
-and tells its agent (`wts doc use`, picker included),
+and tells its agent (`wts doc use`, picker included), `ctrl-t` pulls a
+[task](#the-work-you-have-not-started-yet) in from Things,
 `ctrl-f` / `ctrl-b` scroll the preview by half a page, `ctrl-r` reloads. The
 current session is never killed from the popup, which it would close. tmux
 sessions unknown to wts are listed after, and `ctrl-x` works on them too.
@@ -329,6 +331,41 @@ subject. The width follows the highlighted session (`focus` → `transform` →
 `change-preview-window`, fzf 0.46 or newer; older versions keep the half-width
 window). The list is laid out for the other half, so a wider pane is truncated on
 the right rather than pushed into the list.
+
+### The work you have not started yet
+
+![a task given a note and a context document, wts task show listing what it now carries, the switcher showing that task as a row with a count of its context, its preview holding the note and the document, tab typing another note straight onto it without leaving the popup, and enter starting a session on the task whose agent opens on the context file](docs/tasks.gif)
+
+Under the sessions, the popup lists the **open tasks that have no session** — the
+other half of the question it answers. A task row reads `task` in the AGENT
+column, and `N ctx` in DELTA: how many documents, links and notes it already
+carries, so you can see at a glance whether a piece of work is ready to start.
+The preview is the task itself — title, status, the notes you kept on it, its
+links, its documents — which makes the popup the place you decide *what* to do,
+not only *where* to go back to.
+
+On a task row:
+
+- **`enter` starts a session on it.** The name is derived from the title
+  (`Ship the audit trail` → `ship-audit-trail`), and creation goes through the
+  same path as `prefix+g` — so the branch is still cut from a freshly fetched
+  base, it still refuses outside a repository, and the popup never calls the
+  model. Nothing to confirm: `enter` acts on the row, the way it does on a
+  session. When you want to compose the creation by hand — another layout, an
+  extra phrase — `prefix+g` is still the way, and the preview has already told
+  you what the task carries.
+- **`tab` notes on it**, the way `tab` replies to an agent: the prompt becomes
+  `note on <task>>` and `enter` appends the line to the task's notes. This is the
+  fastest way to put something where the next session on this task will find it.
+- **`ctrl-e` attaches a document to the task** rather than to a session, so every
+  later attempt at it inherits the document.
+- **`ctrl-t` pulls a task in from Things** (`wts task add`), which is how a task
+  gets on this list in the first place: the switcher only ever reads its own
+  database — one query, no Things, no git, no model, because it runs every 2 s.
+
+A task already being worked on is not listed twice: it is already on screen as
+its session's row, with the `*` in SUBJECT. Ten tasks at most, most recently
+touched first (`WTS_SWITCH_TASKS=<n>`, `0` to hide them).
 
 `prefix+a` jumps straight to the next agent that needs you (`stuck?`, `blocked`,
 `failed`, `idle`), without a popup; pressing it again cycles through them.
@@ -573,15 +610,51 @@ about 2–5 MB per semester), so `wts log` can tell you whether drilling into th
 conversation is still possible: each session carries
 `transcript.available`, tested at export time rather than promised.
 
-**The links you keep in a task become context.** `wts <name> --task <id>` reads
-the URLs out of the task's notes — the Notion page, the meeting minutes, the Slack
-thread — and attaches them as [context documents](#context-documents-wts-doc), so
-the agent opens on them. They are recorded as **pointers**, not fetched: a task
-carries one to three links, the fetch model is sonnet with a 90 s cap, and paying
-that at creation would put minutes in front of a starting agent. A pointer is also
-likelier to work — a Slack permalink or a private Notion page is exactly what the
-sandboxed fetch cannot read and the agent in the pane can. `wts doc sync` fetches
-them later, at your pace.
+### A task is where the context lives
+
+A session lasts days and dies at the merge; the task lasts months. So the task is
+where the material belongs — and `wts <name> --task <id>` hands **all** of it to
+the new session:
+
+```sh
+wts task add                        # pick a Things task; it joins wts's list
+wts task note "the spec moved to the new Notion page"   # from inside a worktree
+wts task edit                       # longer context, in $EDITOR
+wts task doc api-spec               # a document every session on this task gets
+wts audit-trail --task <id>         # a session that opens on all of the above
+```
+
+`note`, `edit` and `doc` default to the task of the session you are in, so
+inside a worktree they need no id. What they write is wts's own: Things stays
+read-only, and a note you add here is **not** overwritten the next time wts
+refreshes the task from Things — which a column on the task would have been.
+
+Four channels carry it into the session, and they are four because each one
+fails differently:
+
+1. **The agent's opening prompt** is the task title, when you typed no phrase.
+   `wts fix-audit --task <id>` used to start the agent on nothing at all.
+2. **The documents on the task** are attached like `--doc` ones. Already fetched,
+   so creation pays nothing.
+3. **`.wts/context.md` opens with the task**: its title, status, your notes, its
+   links, before the documents. This is the only channel the agent reads *before
+   its first turn*.
+4. **The `SessionStart` hook repeats it** — and it is the only one that comes
+   back, because Claude Code re-runs the hook after `/clear`, `/compact` and a
+   resume, while a prompt and a file are read once.
+
+**The links you keep in a task become context too.** `--task` reads the URLs out
+of the task's notes — the Notion page, the meeting minutes, the Slack thread — and
+attaches them as [context documents](#context-documents-wts-doc). They are
+recorded as **pointers**, not fetched: a task carries one to three links, the fetch
+model is sonnet with a 90 s cap, and paying that at creation would put minutes in
+front of a starting agent. A pointer is also likelier to work — a Slack permalink
+or a private Notion page is exactly what the sandboxed fetch cannot read and the
+agent in the pane can. `wts doc sync` fetches them later, at your pace. A document
+you attached with `wts task doc` wins over a pointer to the same page.
+
+All of it survives the teardown: the notes and documents belong to the task, not
+to the session that was removed with it.
 
 **Where the model is called, and where it is not.** Only in `wts gc --apply`, and
 only after every destructive step has finished and been reported — so a timeout, a

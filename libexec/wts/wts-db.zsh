@@ -8,6 +8,8 @@
 #   kv           small caches (wts-doc's connector list)
 #   notes        what the Claude agents leave for each other (`wts db set`)
 #   tasks        the durable unit of work above a session (a Things 3 task)
+#   task_notes   free text the author keeps ON a task, not on one of its sessions
+#   task_docs    the context documents a task opens its sessions on
 #   task_links   which session serves which task, while the session lives
 #   archive      finished work: what `wts log` reports and nothing ever deletes
 #
@@ -22,7 +24,7 @@
 
 WTS_STATE_DIR="${WTS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wts}"
 WTS_DB="${WTS_DB:-$WTS_STATE_DIR/wts.db}"
-WTS_DB_SCHEMA=2
+WTS_DB_SCHEMA=3
 
 db_available() {
   (( ${+commands[sqlite3]} ))
@@ -206,6 +208,35 @@ CREATE TABLE IF NOT EXISTS tasks (
   completed_at TEXT NOT NULL DEFAULT '',
   synced_at    TEXT NOT NULL
 );
+-- The context the author keeps ON the task: free text, and the documents its
+-- sessions should open on. Both belong to the task, so they outlive every
+-- session that serves it and the second attempt starts where the first left off.
+--
+-- Tables of their own, and not two more columns on tasks, for two independent
+-- reasons. snapshot() in wts-task overwrites every column it reads from Things
+-- (last writer wins, by design: nothing is ever written back), so a column here
+-- would be wiped by the next refresh. And db_init only ever runs CREATE TABLE IF
+-- NOT EXISTS: a new table migrates itself on any existing database, while a new
+-- column would silently never appear.
+--
+-- Notes are append-only rows and not one blob: each keeps the date it was
+-- written, so the agent reading them sees what came last. wts task edit is the
+-- one verb that replaces them.
+CREATE TABLE IF NOT EXISTS task_notes (
+  task     TEXT NOT NULL,
+  body     TEXT NOT NULL,
+  added_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS task_notes_by_task ON task_notes(task);
+-- A slug of the wts doc library, not a URL: the slug is what materialize and
+-- wts doc sync take, so a document on a task is the same object as one on a
+-- session rather than a second kind of reference to the same page.
+CREATE TABLE IF NOT EXISTS task_docs (
+  task     TEXT NOT NULL,
+  slug     TEXT NOT NULL,
+  added_at TEXT NOT NULL,
+  PRIMARY KEY (task, slug)
+);
 -- The live link, dropped with its session like briefs and notes: a session name
 -- is reused (wts rm auth-form, then wts auth-form again), so a link that
 -- outlived its session would hand the new incarnation the old one's task. The
@@ -328,6 +359,84 @@ db_has_session() {  # <name>
 
 db_session_field() {  # <name> <column>
   db_ro "SELECT $2 FROM sessions WHERE name = $(sql_str "$1")" 2>/dev/null
+}
+
+# The task a live session serves, or nothing. The durable link is archive.task;
+# this one dies with the session (see task_links above).
+db_task_of_session() {  # <name>
+  db_ro "SELECT task FROM task_links WHERE session = $(sql_str "$1")" 2>/dev/null
+}
+
+# A task's whole context as markdown: what the author put on the task rather
+# than on one of its sessions. Sourced here and not a `wts task` verb because
+# three helpers render it and one of them is wts-doc, which wts-task already
+# execs — a verb would close the loop. Same reason wts-keys owns the key table.
+#
+# Database reads only: this runs inside the switcher's 2-second refresh and
+# inside the Claude SessionStart hook, neither of which may call the model.
+task_context_md() {  # <task id> [<max note lines>]
+  local id="$1" cap="${2:-0}"
+  [[ -n "$id" ]] || return 1
+  db_available || return 1
+
+  local title notes st area
+  # -d $'\x1e': the notes are the author's free text and hold newlines, so a
+  # plain `read` would stop at the first one and lose every field after it.
+  IFS=$'\x1f' read -r -d $'\x1e' title notes st area < <(db_rows "
+    SELECT title, notes, status, area FROM tasks WHERE id = $(sql_str "$id")" 2>/dev/null)
+  [[ -n "${title:-}" ]] || return 1
+
+  print -r -- "## Task: $title"
+  print -r -- "<!-- wts-task: $id -->"
+  print -r -- "- status: ${st:-unknown}"
+  [[ -n "${area:-}" ]] && print -r -- "- area: $area"
+  print -r -- ""
+
+  # Verbatim, newlines and all: this is the author's own text, and reflowing it
+  # would break a pasted error message or a list of acceptance criteria.
+  if [[ -n "${notes:-}" ]]; then
+    print -r -- "Notes on the task (the author's own, verbatim):"
+    print -r -- ""
+    print -r -- "$notes"
+    print -r -- ""
+  fi
+
+  local body at
+  local -i n=0
+  while IFS=$'\x1f' read -r -d $'\x1e' at body; do
+    [[ -n "$body" ]] || continue
+    (( n++ == 0 )) && { print -r -- "Added in wts:"; print -r -- "" }
+    print -r -- "- ($at) $body"
+    (( cap > 0 && n >= cap )) && { print -r -- "- (…)"; break }
+  done < <(db_rows "SELECT substr(added_at, 1, 10), body FROM task_notes
+                    WHERE task = $(sql_str "$id") ORDER BY added_at" 2>/dev/null)
+  (( n )) && print -r -- ""
+
+  # Every link the task carries, even the ones that became documents below: an
+  # agent that can reach a page itself should not have to guess its address.
+  local url kind
+  n=0
+  while IFS=$'\x1f' read -r -d $'\x1e' url kind; do
+    [[ -n "$url" ]] || continue
+    (( n++ == 0 )) && { print -r -- "Links in the task:"; print -r -- "" }
+    print -r -- "- [${kind:-link}] $url"
+  # tasks.id and not id: json_each exposes an `id` column of its own, and an
+  # unqualified one is ambiguous — sqlite refuses to prepare the statement.
+  done < <(db_rows "SELECT json_extract(value, '\$.url'), json_extract(value, '\$.kind')
+                    FROM tasks, json_each(tasks.links)
+                    WHERE tasks.id = $(sql_str "$id") AND json_valid(tasks.links)" 2>/dev/null)
+  (( n )) && print -r -- ""
+
+  local slug
+  n=0
+  while IFS=$'\x1f' read -r -d $'\x1e' slug; do
+    [[ -n "$slug" ]] || continue
+    (( n++ == 0 )) && { print -r -- "Documents attached to the task:"; print -r -- "" }
+    print -r -- "- $slug"
+  done < <(db_rows "SELECT slug FROM task_docs WHERE task = $(sql_str "$id")
+                    ORDER BY added_at" 2>/dev/null)
+  (( n )) && print -r -- ""
+  return 0
 }
 
 # The wts session the caller runs in, or failure. For `wts db` and the Claude

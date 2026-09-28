@@ -16,6 +16,7 @@
 #        wts log [--since <when>] [--until <when>] [--brief] [--no-notes]
 #        wts retro [name...] [--force]
 #        wts task ls | show <id> | link [<id>] [session] | unlink | new "<title>"
+#        wts task add [<id>] | note [<id>] "<text>" | edit [<id>] | doc [<id>] [<doc>]
 #        wts layouts
 #        wts keys
 #        wts setup tmux | git | claude [--install]
@@ -54,7 +55,8 @@
 #   retro      : write the retrospectives gc could not (no model, a timeout);
 #                reads the archive, never the worktree, so it works any time
 #   task       : the work above a session — a Things 3 task, or a local one.
-#                One task, one to N sessions; `--task` links at creation
+#                One task, one to N sessions; `--task` links at creation and
+#                hands over the task's notes and documents as context
 #   layouts    : list available layouts (yours shadow the built-in ones)
 #   keys       : switcher keys and tmux bindings (the popup shows them too)
 #   setup tmux : print the tmux.conf snippet (switcher popup, `wts` command)
@@ -84,7 +86,7 @@
 
 set -euo pipefail
 
-WTS_VERSION="1.1.0"
+WTS_VERSION="1.2.0"
 
 # ─── Install layout ──────────────────────────────────────────────────────────
 # Homebrew, `make install` and a git checkout all share the same tree:
@@ -394,6 +396,13 @@ fi
 case "$1" in
   help|-h|--help)       usage; exit 0 ;;
   version|-V|--version) print -r -- "wts $WTS_VERSION"; exit 0 ;;
+  # --doc and --task are real options, they just cannot come first: the name (or
+  # the phrase) does. Named here rather than reported as unknown, because
+  # `wts --task <id>` is the obvious thing to try once a task carries the context
+  # — and "unknown option '--task'" sends you to look for a typo.
+  --doc*|--task*)       print -u2 -r -- "wts: '$1' labels a session, it does not name one."
+                        print -u2 -r -- "     the name comes first:  wts <name> $*"
+                        exit 2 ;;
   -*)                   print -u2 -r -- "wts: unknown option '$1' (see: wts help)"; exit 2 ;;
 esac
 
@@ -642,8 +651,17 @@ if [[ "$1" == "restore" ]]; then
     # fetched: a restore is not an explicit attach. Reset on every iteration,
     # like WTS_RESUME below.
     export WTS_DOC=""
-    if [[ -n "$docs" && -x "$WTS_LIBEXEC/wts-doc" ]]; then
+    # `|| restore_task=""`: this file runs under `set -e`, and a failing read
+    # must not abort a restore that has nothing to do with tasks.
+    restore_task=$(db_task_of_session "$name" 2>/dev/null) || restore_task=""
+    typeset -a restore_task_opt
+    restore_task_opt=()
+    if [[ -n "$restore_task" ]]; then
+      restore_task_opt=(--task "$restore_task")
+    fi
+    if [[ ( -n "$docs" || -n "$restore_task" ) && -x "$WTS_LIBEXEC/wts-doc" ]]; then
       WTS_DOC=$("$WTS_LIBEXEC/wts-doc" materialize "$worktree" "$workdir" \
+                  "${restore_task_opt[@]}" \
                   ${(s: :)docs} 2>/dev/null) || WTS_DOC=""
     fi
 
@@ -1175,6 +1193,16 @@ if [[ "$1" == "new" ]]; then
     done
     DOC_REQ=("${(@)DOC_REQ:#}")
   fi
+  # Same for a bare --task: resolved once, or the Things picker would open once
+  # per session and the batch could end up spread over several tasks.
+  if [[ "${TASK_ASKED:-false}" == true && -z "$TASK_REQ" ]]; then
+    if [[ ! -x "$WTS_LIBEXEC/wts-task" ]]; then
+      echo "wts: $WTS_LIBEXEC/wts-task not found" >&2
+      exit 1
+    fi
+    TASK_REQ=$("$WTS_LIBEXEC/wts-task" resolve "") || exit 1
+    [[ -n "$TASK_REQ" ]] || { echo "wts: no task chosen" >&2; exit 1 }
+  fi
   NEW_PROFILE="default"
   if [[ "${1:-}" == "-p" ]]; then
     [[ -n "${2:-}" ]] || { echo "wts: -p expects a layout" >&2; exit 1 }
@@ -1201,8 +1229,12 @@ if [[ "$1" == "new" ]]; then
   for n in "$@"; do
     echo "── $n ($NEW_PROFILE)"
     rm -f "$session_out"
+    # WTS_TASK_ARG as well as the documents: strip_doc_args has always read it,
+    # but nothing ever set it, so `wts new --task <id> a b` parsed the flag and
+    # then created three sessions linked to nothing.
     if WTS_NO_ATTACH=1 WTS_SESSION_OUT="$session_out" \
-       WTS_DOC_ARGS="${(pj:\x1f:)DOC_REQ}" "$WTS_SELF" "$n" "$NEW_PROFILE"; then
+       WTS_DOC_ARGS="${(pj:\x1f:)DOC_REQ}" WTS_TASK_ARG="${TASK_REQ:-}" \
+       "$WTS_SELF" "$n" "$NEW_PROFILE"; then
       if [[ -s "$session_out" ]]; then
         started+=("$(<"$session_out")")
       else
@@ -1359,6 +1391,16 @@ if [[ "${TASK_ASKED:-false}" == true ]]; then
     echo "wts: no task chosen" >&2
     exit 1
   fi
+  # A task the author has already described IS the phrase. Without this,
+  # `wts fix-audit --task <id>` started the agent on nothing at all: the task
+  # reached the registry and the context file, and the one place the agent
+  # actually reads first — its own command line — said nothing about the work.
+  # Before the naming call, so an unnamed `wts "<phrase>" --task <id>` is
+  # unaffected (its phrase was parsed above and wins).
+  if [[ -z "$PROMPT" ]]; then
+    PROMPT=$("$WTS_LIBEXEC/wts-task" title "$TASK_ID" 2>/dev/null) || PROMPT=""
+    PROMPT="${PROMPT//[[:cntrl:]]/ }"
+  fi
 fi
 
 # ─── Documents (--doc) ───────────────────────────────────────────────────────
@@ -1407,6 +1449,17 @@ fi
 # read and the agent in the pane can. `wts doc sync` fetches them later.
 if [[ -n "${TASK_ID:-}" && -x "$WTS_LIBEXEC/wts-doc" ]]; then
   integer _task_docs=0
+  # The documents the author attached to the task itself (`wts task doc`) come
+  # first: they are already in the library and already fetched, so a pointer to
+  # the same page found in the notes below is skipped as a duplicate rather than
+  # replacing a document wts can actually read.
+  while IFS= read -r _slug; do
+    [[ -n "$_slug" ]] || continue
+    if (( ${DOC_SLUGS[(Ie)$_slug]} == 0 )); then
+      DOC_SLUGS+=("$_slug")
+      (( ++_task_docs ))
+    fi
+  done < <("$WTS_LIBEXEC/wts-task" docs "$TASK_ID" 2>/dev/null)
   while IFS= read -r _url; do
     [[ -n "$_url" ]] || continue
     if _slug=$(WTS_NO_LLM=1 "$WTS_LIBEXEC/wts-doc" resolve "$_url" 2>/dev/null); then
@@ -1420,7 +1473,7 @@ if [[ -n "${TASK_ID:-}" && -x "$WTS_LIBEXEC/wts-doc" ]]; then
     fi
   done < <("$WTS_LIBEXEC/wts-task" links "$TASK_ID" 2>/dev/null)
   if (( _task_docs )); then
-    echo "→ task: $_task_docs link(s) from its notes attached as context"
+    echo "→ task: $_task_docs document(s) from the task attached as context"
   fi
 fi
 
@@ -1527,10 +1580,23 @@ fi
 # is relative to the pane's working directory, because Claude Code resolves an
 # `@` reference from the pane's cwd.
 
+# A task with notes but no document still gets a context file: its title, status
+# and the author's notes are exactly what the agent needs first, and the layout
+# already tells it to read this file. The task is passed as an id rather than
+# looked up from task_links, which is only written below — after registry_put,
+# because it references the session row.
 WTS_DOC=""
-if (( ${#DOC_SLUGS} )); then
+# An array and not `${TASK_ID:+--task "$TASK_ID"}`: zsh does not word-split an
+# unquoted expansion, so that form hands materialize ONE argument reading
+# "--task <id>", which is not the flag and is then looked up as a document slug.
+typeset -a TASK_OPT
+TASK_OPT=()
+if [[ -n "${TASK_ID:-}" ]]; then
+  TASK_OPT=(--task "$TASK_ID")
+fi
+if (( ${#DOC_SLUGS} )) || (( ${#TASK_OPT} )); then
   if WTS_DOC=$("$WTS_LIBEXEC/wts-doc" materialize "$worktree_path" "$WORKDIR" \
-                 "${DOC_SLUGS[@]}"); then
+                 "${TASK_OPT[@]}" "${DOC_SLUGS[@]}"); then
     echo "→ context: ${#DOC_SLUGS} document(s) in $WTS_DOC"
   else
     echo "⚠ the context document could not be written" >&2

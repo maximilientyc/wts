@@ -73,7 +73,15 @@ fi
 db_available || { print -u2 "wts-status: sqlite3 is required"; exit 1; }
 # The registry, read once: the main pass and the prompt merge below share it.
 REGISTRY=$(registry_json)
-[[ "$REGISTRY" != '{}' ]] || { print '[]'; exit 0; }
+# Same rule as the empty-objects guard further down, and for the same reason:
+# only --json has a representation of "nothing". This shortcut used to print
+# "[]" whatever the format, and the switcher read that line as a session named
+# "[]" — invisible while the registry always had a session in it, a junk row the
+# moment it does not (a fresh install, or tasks queued and no session yet).
+if [[ "$REGISTRY" == '{}' ]]; then
+  [[ "$FORMAT" == "json" ]] && print '[]'
+  exit 0
+fi
 
 # ─── Global collection (one call per tool) ───────────────────────────────────
 

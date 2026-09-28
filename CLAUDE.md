@@ -19,6 +19,7 @@ libexec/wts/wts-retro      capture at teardown: collect/store facts, write the r
 libexec/wts/wts-log        the work journal as one JSON document (archive + Things)
 libexec/wts/wts-things     Things 3 reader, read-only: tasks, their notes and links
 libexec/wts/wts-db.zsh     the state database (SQLite): schema, import, helpers; sourced by all
+                           also the one renderer for a task's context (task_context_md)
 libexec/wts/wts-context    Claude Code SessionStart hook: tells an agent about the other sessions
 share/wts/layouts/         built-in layouts (default.yml)
 examples/layouts/          richer layouts, not installed as built-ins
@@ -57,7 +58,17 @@ straight from the checkout. Scripts locate each other from their own path
   `wts-doc` is the one exception and says why in its header — fetching a page is
   precisely a job for the machine's own connectors, whose names differ from one
   machine to the next, so the allow list is enumerated, never hardcoded.
-- Layout files stay ASCII (Ruby reads them under `LANG=C` otherwise fails).
+- Layout files stay ASCII (Ruby reads them under `LANG=C` otherwise fails). So do
+  the switcher's display columns: `emit` pads them to an exact character count
+  and the smoke test asserts it, but a glyph of East Asian **Ambiguous** width
+  (U+25C6 `◆` among them) is two columns wide in some terminals — the row
+  measures right and looks shifted. Sigils belong in unpadded output.
+- The switcher's list line is **three TAB fields**: `<display>`, `<preview
+  target>`, `<session name>`. A row that is not a session (the header, a task)
+  leaves field 3 empty, which is what makes every `{3}` bind a no-op on it — so a
+  new bind needs no knowledge of row kinds, but it must guard an empty name
+  before passing it to a command. `wts rm ''` deletes by substring match and
+  matches everything.
 - State goes through `wts-db.zsh`, never a file of its own: `db_q` to write,
   `db_ro`/`db_rows` to read, every value through `sql_str`. The tables other
   than `notes` are written by wts only; `wts db` gives agents read access to all
@@ -101,6 +112,14 @@ straight from the checkout. Scripts locate each other from their own path
   schema is read as commands. Single quotes are safe.
 - `local a="$1" b="$a"` does not work: `local` declares every name before it
   assigns, so `$a` is read while still unset and `set -u` fails. Split it.
+- `${var:+--flag "$var"}` is **one** argument, not two: zsh does not word-split an
+  unquoted parameter expansion (no `SH_WORD_SPLIT`). The callee receives
+  `--flag value` as a single string, which matches no flag and is then used as a
+  positional — silently, because the flag was optional. Use an array:
+  `opt=(); [[ -n "$var" ]] && opt=(--flag "$var")`, then `"${opt[@]}"`.
+- A function whose answer is read with `x=$(f)` runs in a **subshell**: globals it
+  sets (`typeset -g`, an array of results) do not reach the caller. Either print
+  everything on stdout, or set globals and return a status — not both.
 - In `bin/wts` (`set -e`), a bare `[[ cond ]] && cmd` as a whole statement exits
   the script when the condition is false — the statement's own status is 1. Use
   an `if`. Helpers have no `-e`, which is why the same line is fine there. This
