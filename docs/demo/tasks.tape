@@ -22,10 +22,6 @@
 # have no place in a GIF that ends up in a README. It costs the tape ctrl-t,
 # which is the one key of this feature the GIF cannot show.
 #
-# The filter is retyped before `enter` in scene 5 on purpose: leaving note mode
-# clears the query, the full list comes back, and fzf keeps the cursor by INDEX —
-# so the highlighted row after `escape` is not necessarily the task any more.
-#
 # Waits on the prompt use /❯$/, the line the cursor is on: your zsh prompt
 # (powerlevel10k) ends with that character when the command has returned.
 
@@ -41,16 +37,32 @@ Set Theme "Catppuccin Mocha"
 Set Framerate 25
 Set TypingSpeed 45ms
 
-# Your own prompt instead of VHS's, no Things for the whole take, and prefix+s
-# bound to THIS checkout on the sandbox server only.
+# Your own prompt instead of VHS's, then three things this tape cannot do without.
+#
+# `tmux new-session -A -s demo`: the shell has to be INSIDE tmux before prefix+s
+# can mean anything. demo.tape gets there without asking, because its scene 2
+# creates a session and attaches; this tape presses the prefix first, so it
+# attaches on purpose. Without it Ctrl+B is a no-op in zsh and the "s" lands in
+# the command line.
+#
+# `setenv -g` and not only `export`: a popup inherits the tmux SERVER's
+# environment, not the pane's, so WTS_NO_THINGS exported here would keep Things
+# out of the `wts task` commands below and let it back in inside the switcher.
+#
+# `source-file`: the prefix+s binding in your ~/.tmux.conf holds an absolute path
+# to the INSTALLED wts-switch, which knows nothing about tasks. This rebinds it to
+# the checkout — on the sandbox server only, which is private to this take.
 Hide
 Type "exec zsh -l"
 Enter
 Sleep 2s
-Type "cd wts && export WTS_NO_THINGS=1"
+Type "cd wts && tmux new-session -A -s demo -c /private/tmp/wts-demo/wts"
+Enter
+Sleep 3s
+Type "tmux setenv -g WTS_NO_THINGS 1 && export WTS_NO_THINGS=1"
 Enter
 Sleep 1s
-Type "wts setup tmux > /tmp/wts-demo/dev.tmux && tmux source-file /tmp/wts-demo/dev.tmux && clear"
+Type "wts setup tmux > /private/tmp/wts-demo/dev.tmux && tmux source-file /private/tmp/wts-demo/dev.tmux && clear"
 Enter
 Sleep 1s
 Show
@@ -88,7 +100,10 @@ Sleep 5s
 # enough to tell, at a glance, whether it is ready to be picked up.
 Ctrl+B
 Type "s"
-Wait+Screen@20s /task/
+# On the popup's own prompt, not on /task/: scene 2's output is still on the
+# screen behind the popup and holds that word, so /task/ would match before the
+# frame this scene is about has been drawn.
+Wait+Screen@20s /session>/
 Sleep 4s
 
 # 4. Filtering to it makes the preview the task itself: its status, the note, the
@@ -108,14 +123,15 @@ Sleep 4s
 Escape
 Sleep 2s
 
-# 6. And enter on the task starts a session on it. The popup closes and tmux's
-# command prompt opens pre-filled — the name proposed from the title, still
-# editable, and the branch still cut from a freshly fetched base because this
-# goes through the same `wts` command as prefix+g.
+# 6. And enter on the task starts a session on it: the name derived from the
+# title, the branch cut from a freshly fetched base because this opens a window on
+# wts-fresh, the same path prefix+g takes.
+#
+# The filter is retyped first: leaving note mode cleared the query, the full list
+# came back, and fzf keeps the cursor by INDEX — so the highlighted row is not
+# necessarily the task any more.
 Type "audit"
 Sleep 1500ms
-Enter
-Sleep 4s
 Enter
 Sleep 1s
 # Hidden past the wait, as in demo.tape: your nvim's startup notifications fade

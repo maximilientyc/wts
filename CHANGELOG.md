@@ -8,15 +8,23 @@ on the first command; nothing existing changes shape or behaviour.
 
 - **The switcher lists the open tasks that have no session**, under the sessions:
   `task` in the AGENT column, `N ctx` in DELTA (documents + links + notes), and
-  the task itself as the preview. `enter` on one **starts a session on it** — the
-  popup closes and tmux's command prompt opens pre-filled with
-  `wts <slug> --task <id>`, the name proposed from the title. Pre-filled rather
-  than created outright, for three reasons in this order: creation then goes
-  through the `wts` command-alias and so through `wts-fresh`, which refuses
-  outside a repository and cuts the branch from a freshly fetched
-  `origin/<default>`; the name, the layout and an extra phrase stay editable; and
-  the slug is derived with `WTS_NO_LLM=1`, so the popup still never calls the
-  model. `WTS_SWITCH_TASKS=<n>` caps the list (10), `0` hides it.
+  the task itself as the preview. `enter` on one **starts a session on it**: the
+  name is derived from the title with `WTS_NO_LLM=1` (the popup must not call the
+  model), and the window it opens runs `wts-fresh` — exactly what the `wts`
+  command-alias does for `prefix+g` — so the branch is still cut from a freshly
+  fetched `origin/<default>` and creation still refuses outside a repository.
+  `WTS_SWITCH_TASKS=<n>` caps the list (10), `0` hides it.
+
+  It does *not* pre-fill tmux's command prompt, which was the first design.
+  `command-prompt` puts interactive state on the client, and the switcher runs
+  inside the popup's own process: the prompt raced the popup's teardown and tmux
+  discarded it. Measured on tmux 3.7, from identical code — the prompt appeared on
+  the first `enter` of a take and was gone on the second, on the same server.
+  Deferring it through `run-shell -b` did not fix it, and `send-keys` into the
+  pane behind the popup is worse: in a wts session that pane is usually nvim or
+  the agent, and the line would be typed into a file. The cost is that the name
+  and layout are no longer editable before it starts; `prefix+g` is still there
+  for a creation you want to compose by hand.
 - **`tab` on a task is note mode.** The same machinery that replies to an agent:
   the prompt becomes `note on <task>>`, and `enter` appends the line to the task's
   notes instead of sending it to a pane there is none of. What was missing was

@@ -768,17 +768,29 @@ pull_task() {
 }
 
 # ─── Start a session on a task ───────────────────────────────────────────────
-# `enter` on a task row. Not an `execute` bind: the popup has to be gone before
-# tmux's command prompt can be seen, so this runs after fzf has exited, where
-# switch-client already runs for a session.
+# `enter` on a task row. Not an `execute` bind: this runs after fzf has exited,
+# where switch-client already runs for a session.
 #
-# It pre-fills the prompt rather than creating outright, the way prefix+g does.
-# Three reasons, in order of weight: creation then goes through the `wts`
-# command-alias and so through wts-fresh, which refuses outside a repository and
-# cuts the branch from a freshly fetched origin/<default> — re-implementing that
-# here would be the third copy; the name, the layout and an extra phrase stay
-# editable, and the name is only ever a proposal; and the slug is derived with
-# WTS_NO_LLM=1, so the popup never calls the model, which is the rule.
+# It opens a window on wts-fresh, which is EXACTLY what the `wts` command-alias
+# does for prefix+g — so the branch is still cut from a freshly fetched
+# origin/<default>, creation still refuses outside a repository, and none of that
+# is reimplemented here. The window is transient: wts ends with
+# `exec tmuxinator start`, which switches the client to the new session.
+#
+# It does NOT pre-fill tmux's command prompt, which was the first design and had
+# to be abandoned. `tmux command-prompt` puts interactive state on the CLIENT, and
+# this function runs inside the popup's own process, so the prompt raced the
+# popup's teardown and tmux discarded it — measured on tmux 3.7: from identical
+# code, the prompt appeared on the first `enter` of a take and was gone on the
+# second, on the same server. Deferring it through `run-shell -b` and a sleep did
+# not fix it. `send-keys` into the pane behind the popup is worse still: in a wts
+# session that pane is usually nvim or the agent, and the line would be typed
+# into a file.
+#
+# The cost is that the name, the layout and an extra phrase are no longer editable
+# before it starts. The name is derived from the title with WTS_NO_LLM=1 (the
+# popup must not call the model), the task title becomes the agent's prompt
+# anyway, and prefix+g is still there for a creation you want to compose by hand.
 start_task() { # $1 = task id
   local id="$1" title slug
   [[ -n "$id" ]] || return 0
@@ -789,22 +801,20 @@ start_task() { # $1 = task id
     slug=$(WTS_NO_LLM=1 "$WTS_BIN/wts-name" "$title" 2>/dev/null) || slug=""
   fi
   # wts-name always answers something, but a title of nothing but stopwords can
-  # come back empty: leave the name for the user to type rather than propose one.
+  # come back empty. A name is required here — `wts --task <id>` with no name
+  # refuses, by design — so say so rather than open a window that will fail.
   [[ "$slug" =~ '^[a-z0-9][a-z0-9-]*$' ]] || slug=""
-
-  # The alias is installed by `wts setup tmux`; without it the prompt would be
-  # pre-filled with a tmux command that does not exist. Then go straight through
-  # wts-fresh, which is what the alias runs anyway.
-  # tmux prints the alias quoted or bare depending on its value
-  # (`command-alias[100] "wts=new-window …"`), so the quote is not part of the
-  # pattern: what must precede `wts=` is anything that is not a name character,
-  # or another alias ending in "wts" would match.
-  if tmux show-options -s command-alias 2>/dev/null | grep -qE '[^a-zA-Z0-9_-]wts='; then
-    tmux command-prompt -T command -I "wts $slug --task $id " 2>/dev/null && return 0
+  if [[ -z "$slug" ]]; then
+    tmux display-message "wts: no name could be derived from that task, use prefix+g" 2>/dev/null
+    return 0
   fi
+
   if [[ -x "$WTS_BIN/wts-fresh" ]]; then
+    # -c '#{pane_current_path}': the repository the user is looking at, the same
+    # expansion the `wts` command-alias uses. No -d: the window has to take the
+    # focus, or tmuxinator answers "no current client" and exits 1.
     tmux new-window -n wts -c '#{pane_current_path}' \
-      "$WTS_BIN/wts-fresh" ${slug:+"$slug"} --task "$id" 2>/dev/null && return 0
+      "$WTS_BIN/wts-fresh" "$slug" --task "$id" 2>/dev/null && return 0
   fi
   tmux display-message "wts: could not start a session on that task" 2>/dev/null
   return 0

@@ -334,6 +334,8 @@ the right rather than pushed into the list.
 
 ### The work you have not started yet
 
+![a task given a note and a context document, wts task show listing what it now carries, the switcher showing that task as a row with a count of its context, its preview holding the note and the document, tab typing another note straight onto it without leaving the popup, and enter starting a session on the task whose agent opens on the context file](docs/tasks.gif)
+
 Under the sessions, the popup lists the **open tasks that have no session** — the
 other half of the question it answers. A task row reads `task` in the AGENT
 column, and `N ctx` in DELTA: how many documents, links and notes it already
@@ -344,11 +346,14 @@ not only *where* to go back to.
 
 On a task row:
 
-- **`enter` starts a session on it.** The popup closes and tmux's command prompt
-  opens pre-filled — `wts ship-audit-trail --task <id>` — with the name proposed
-  from the title. Press Enter, or edit it first to add a layout or a phrase. It
-  goes through the same `wts` command as `prefix+g`, so the branch is still cut
-  from a freshly fetched base, and the popup never calls the model.
+- **`enter` starts a session on it.** The name is derived from the title
+  (`Ship the audit trail` → `ship-audit-trail`), and creation goes through the
+  same path as `prefix+g` — so the branch is still cut from a freshly fetched
+  base, it still refuses outside a repository, and the popup never calls the
+  model. Nothing to confirm: `enter` acts on the row, the way it does on a
+  session. When you want to compose the creation by hand — another layout, an
+  extra phrase — `prefix+g` is still the way, and the preview has already told
+  you what the task carries.
 - **`tab` notes on it**, the way `tab` replies to an agent: the prompt becomes
   `note on <task>>` and `enter` appends the line to the task's notes. This is the
   fastest way to put something where the next session on this task will find it.
