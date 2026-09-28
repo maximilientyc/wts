@@ -37,9 +37,7 @@ set -uo pipefail
 # so a status on a 95k-file repository stays at ~0.1 s.
 export GIT_OPTIONAL_LOCKS=0
 
-WTS_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wts"
-WTS_STATE_FILE="$WTS_STATE_DIR/sessions.json"
-PANEHASH_DIR="$WTS_STATE_DIR/panehash"
+source "${0:A:h}/wts-db.zsh"
 CLAUDE_SESSIONS_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions"
 
 # An agent reports `working` but its pane has not changed for this long: it is
@@ -72,7 +70,10 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-[[ -s "$WTS_STATE_FILE" ]] || { print '[]'; exit 0; }
+db_available || { print -u2 "wts-status: sqlite3 is required"; exit 1; }
+# The registry, read once: the main pass and the prompt merge below share it.
+REGISTRY=$(registry_json)
+[[ "$REGISTRY" != '{}' ]] || { print '[]'; exit 0; }
 
 # ─── Global collection (one call per tool) ───────────────────────────────────
 
@@ -100,8 +101,6 @@ fi
 [[ -n "$sessions_map" ]] || sessions_map='{}'
 
 tmux_alive=$(tmux list-sessions -F '#{session_name}' 2>/dev/null)
-
-mkdir -p "$PANEHASH_DIR" 2>/dev/null
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -262,18 +261,17 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
 
         # Staleness watchdog: pane hash compared with the previous tick.
         if [[ "$agent_state" == '"working"' ]]; then
-          hashfile="$PANEHASH_DIR/${sid}"
           cur=$(tmux capture-pane -p -t "$pane_id" 2>/dev/null | shasum | cut -d' ' -f1)
           now=$(date +%s)
-          if [[ -n "$cur" && -s "$hashfile" ]]; then
-            prev_hash=$(sed -n 1p "$hashfile"); prev_ts=$(sed -n 2p "$hashfile")
-            if [[ "$cur" == "$prev_hash" ]]; then
-              (( now - ${prev_ts:-$now} >= STALE_AFTER )) && stale=true
-            else
-              print -r -- "$cur\n$now" > "$hashfile"
-            fi
+          prev_hash="" prev_ts=""
+          IFS=$'\x1f' read -r -d $'\x1e' prev_hash prev_ts \
+            < <(db_rows "SELECT hash, since FROM pane_hashes
+                         WHERE agent_session = $(sql_str "$sid")" 2>/dev/null)
+          if [[ -n "$cur" && -n "$prev_hash" && "$cur" == "$prev_hash" ]]; then
+            (( now - ${prev_ts:-$now} >= STALE_AFTER )) && stale=true
           elif [[ -n "$cur" ]]; then
-            print -r -- "$cur\n$now" > "$hashfile"
+            db_q "INSERT OR REPLACE INTO pane_hashes VALUES
+                  ($(sql_str "$sid"), $(sql_str "$cur"), $now)" >/dev/null 2>&1
           fi
         fi
       fi
@@ -306,7 +304,7 @@ done < <(jq -r '$ARGS.positional as $only
   | select(($only | length) == 0 or (.key | IN($only[])))
   | [.key, (.value.profile // "-"), (.value.repo_root // ""),
      (.value.worktree // ""), (.value.branch // "-"), (.value.subdir // ""),
-     (.value.context // ""), (.value.created_at // "")] | .[]' "$WTS_STATE_FILE" --args "${ONLY[@]}")
+     (.value.context // ""), (.value.created_at // "")] | .[]' <<< "$REGISTRY" --args "${ONLY[@]}")
 
 # Empty registry: only --json has a representation ("[]"); the presentation
 # formats must emit nothing, otherwise they pollute the caller's list.
@@ -330,7 +328,7 @@ all=$(printf '%s\n' "${objects[@]}" | jq -s "$SORT_KEY")
 # Starting phrase (`wts "<phrase>"`): merged here from the registry, not in the
 # main pass, whose "one field per line" stream would be shifted by a multiline
 # phrase.
-if merged=$(print -r -- "$all" | jq --slurpfile reg "$WTS_STATE_FILE" \
+if merged=$(print -r -- "$all" | jq --slurpfile reg <(print -r -- "$REGISTRY") \
       'map(. + {prompt: ($reg[0][.name].prompt // "")})' 2>/dev/null); then
   all="$merged"
 fi

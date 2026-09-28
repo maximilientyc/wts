@@ -89,7 +89,11 @@ pane_contains() { # <session> <text>
   done
   return 1
 }
-in_registry() { jq -e --arg n "$1" 'has($n)' "$XDG_STATE_HOME/wts/sessions.json" }
+DB="$XDG_STATE_HOME/wts/wts.db"
+q() { sqlite3 -init /dev/null "$DB" "$@" }
+in_registry() { [[ "$(q "SELECT count(*) FROM sessions WHERE name = '$1'")" == 1 ]] }
+reg_field() { q "SELECT $2 FROM sessions WHERE name = '$1'" }   # <session> <column>
+doc_cached() { [[ -n "$(q "SELECT 1 FROM doc_cache WHERE slug = '$1' AND length(body) > 0")" ]] }
 
 # ─── CLI surface ─────────────────────────────────────────────────────────────
 
@@ -141,7 +145,7 @@ check "session registered" in_registry auth-form
 WTS_NO_ATTACH=1 "$WTS" "export users as csv" smoke >/dev/null
 check "name derived locally from a phrase" has_session export-users-csv
 check "phrase stored in the registry" \
-  jq -e '.["export-users-csv"].prompt == "export users as csv"' "$XDG_STATE_HOME/wts/sessions.json"
+  eval '[[ "$(reg_field export-users-csv prompt)" == "export users as csv" ]]'
 
 refute "missing layout fails" env WTS_NO_ATTACH=1 "$WTS" other nope
 refute "missing layout creates nothing" test -e "$WT/other"
@@ -358,7 +362,8 @@ unset WTS_SWITCH_REPLY WTS_SWITCH_HELP WTS_SWITCH_COLS
 # ─── pr: ctrl-o and `wts pr` ─────────────────────────────────────────────────
 # A stand-in gh: logs where and how it is called, and knows exactly one PR. The
 # real gh would hit the network and needs a login; CI has one on PATH, so every
-# "without gh" case below runs with a PATH that has nothing but zsh and jq.
+# "without gh" case below runs with a PATH that has nothing but zsh, jq and
+# sqlite3 (the registry).
 export WTS_SMOKE_GH_LOG="$SANDBOX/gh.log"
 export WTS_SMOKE_PR_BRANCH="feature/auth-form"
 cat > "$SANDBOX/bin/gh" <<'EOF'
@@ -375,6 +380,7 @@ chmod +x "$SANDBOX/bin/gh"
 mkdir -p "$SANDBOX/nogh"
 ln -s "$(command -v jq)" "$SANDBOX/nogh/jq"
 ln -s "$(command -v zsh)" "$SANDBOX/nogh/zsh"
+ln -s "$(command -v sqlite3)" "$SANDBOX/nogh/sqlite3"
 
 # Exit non-zero, and the message (stdout or stderr) matches.
 fails_with() { # <pattern> <cmd...>
@@ -499,7 +505,7 @@ SPEC="$SANDBOX/spec.md"
 print -rl -- "# Payments architecture" "" "Webhooks must be idempotent." > "$SPEC"
 
 check "doc add takes a local markdown file" "$WTS" doc add "$SPEC" --name spec
-check "the body is cached" test -s "$XDG_STATE_HOME/wts/docs/spec.md"
+check "the body is cached" doc_cached spec
 check "the library entry knows it is a file" \
   jq -e '.docs.spec.kind == "file"' "$XDG_CONFIG_HOME/wts/docs.json"
 check "doc ls lists it" eval 'out=$("$WTS" doc ls); [[ "$out" == *spec* ]]'
@@ -523,10 +529,10 @@ check "every document is marked with its slug" \
 check "the worktree stays clean" \
   eval '[[ -z "$(git -C "$WT/docsess" status --porcelain)" ]]'
 check "the registry records the document" \
-  jq -e '.docsess.docs == ["spec"]' "$XDG_STATE_HOME/wts/sessions.json"
+  eval '[[ "$(reg_field docsess docs)" == "[\"spec\"]" ]]'
 WTS_NO_ATTACH=1 "$WTS" docsess smoke >/dev/null
 check "an idempotent re-run does not detach it" \
-  jq -e '.docsess.docs == ["spec"]' "$XDG_STATE_HOME/wts/sessions.json"
+  eval '[[ "$(reg_field docsess docs)" == "[\"spec\"]" ]]'
 
 check "--doc=<slug> is accepted too" \
   env WTS_NO_ATTACH=1 "$WTS" docsess2 smoke --doc=spec
@@ -586,7 +592,7 @@ tmux kill-session -t "=pickprobe" 2>/dev/null || true
 "$WTS" rm docsess -f >/dev/null
 refute "rm leaves no husk behind .wts/" test -d "$WT/docsess"
 "$WTS" doc rm spec >/dev/null
-refute "doc rm drops the cached body" test -e "$XDG_STATE_HOME/wts/docs/spec.md"
+refute "doc rm drops the cached body" doc_cached spec
 refute "doc rm drops the library entry" \
   jq -e '.docs | has("spec")' "$XDG_CONFIG_HOME/wts/docs.json"
 "$WTS" doc rm ptr >/dev/null
@@ -673,6 +679,127 @@ refute "rm kills the session" has_session export-users-csv
 refute "rm removes the worktree" test -d "$WT/export-users-csv"
 refute "rm deletes the branch" git show-ref --verify --quiet refs/heads/feature/export-users-csv
 refute "rm drops the registry entry" in_registry export-users-csv
+
+# ─── State database: wts db, notes, the Claude hook ──────────────────────────
+# Every Claude session must be able to read the shared state and leave notes,
+# concurrently, without being able to damage wts's own tables.
+
+WTS_NO_ATTACH=1 "$WTS" dbsess smoke >/dev/null
+WTS_NO_ATTACH=1 "$WTS" dbpeer "fix the peer's login" smoke >/dev/null
+CONTEXT="$ROOT/libexec/wts/wts-context"
+
+check "the database is in WAL mode" eval '[[ "$(q "PRAGMA journal_mode")" == wal ]]'
+apostrophe_intact() { [[ "$(reg_field dbpeer prompt)" == "fix the peer's login" ]] }
+check "a phrase with an apostrophe is stored intact" apostrophe_intact
+check "db sql reads the registry" eval '"$WTS" db sql "SELECT name FROM sessions" | grep -qx dbsess'
+check "db sql --json" \
+  eval '"$WTS" db sql "SELECT count(*) AS n FROM sessions" --json | jq -e ".[0].n >= 2"'
+refute "db sql cannot write" "$WTS" db sql "DELETE FROM sessions"
+refute "db sql cannot read files" "$WTS" db sql "SELECT readfile('/etc/hosts')"
+check "the registry survived the attempt" in_registry dbsess
+refute "db set outside any session fails" eval '(cd / && "$WTS" db set k v)'
+
+note_from_worktree() {
+  (cd "$WT/dbsess" && "$WTS" db set api "it's 429 on /login") &&
+    [[ "$(q "SELECT session || '|' || value FROM notes WHERE key = 'api'")" == "dbsess|it's 429 on /login" ]]
+}
+check "db set finds the session from the worktree" note_from_worktree
+get_back() { [[ "$(cd "$WT/dbsess" && "$WTS" db get api)" == "it's 429 on /login" ]] }
+check "db get reads it back" get_back
+
+# From a pane, outside the worktree: the session comes from $TMUX_PANE.
+note_from_pane() {
+  local i
+  tmux send-keys -t "=dbpeer:" "cd / && $WTS db set from-pane yes" Enter
+  for i in {1..50}; do
+    [[ "$(q "SELECT session FROM notes WHERE key = 'from-pane'")" == dbpeer ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+check "db set finds the session from the tmux pane" note_from_pane
+
+# Ten agents and three registry writers at once: nothing lost, nothing locked.
+concurrent_writes() {
+  local i errs="$SANDBOX/db-errs"
+  : > "$errs"
+  for i in {1..10}; do
+    "$WTS" db set "k$i" "v$i" --session dbsess 2>>"$errs" &
+  done
+  for i in {1..3}; do
+    WTS_NO_ATTACH=1 "$WTS" dbsess smoke >/dev/null 2>>"$errs" &
+  done
+  wait
+  [[ "$(q "SELECT count(*) FROM notes WHERE session = 'dbsess' AND key GLOB 'k*'")" == 10 ]] &&
+    ! grep -q -i -e locked -e "registry not updated" "$errs"
+}
+check "concurrent writers lose nothing" concurrent_writes
+check "notes --all lists every session's notes" \
+  eval '"$WTS" db notes --all --json | jq -e "map(.session) | unique == [\"dbpeer\", \"dbsess\"]"'
+
+# The SessionStart hook.
+check "the hook is silent outside a wts session" \
+  eval '[[ -z "$(cd / && env -u TMUX -u TMUX_PANE "$CONTEXT")" ]]'
+hook_in_session() {
+  local out
+  out=$(cd "$WT/dbsess" && env -u TMUX -u TMUX_PANE "$CONTEXT")
+  [[ "$out" == *'session `dbsess`'* && "$out" == *"- dbpeer (feature/dbpeer): fix the peer's login"* \
+     && "$out" == *"dbpeer/from-pane"* && "$out" == *"db set <key>"* \
+     && "$out" != *"dbsess/api"* ]]
+}
+check "the hook describes the other sessions and their notes" hook_in_session
+
+settings="$CLAUDE_CONFIG_DIR/settings.json"
+print -r -- '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo mine"}]}]}}' > "$settings"
+check "setup claude prints the hook" eval '"$WTS" setup claude | grep -qF "$ROOT/libexec/wts/wts-context"'
+"$WTS" setup claude --install >/dev/null
+"$WTS" setup claude --install >/dev/null
+check "setup claude --install is idempotent" \
+  jq -e '[.hooks.SessionStart[].hooks[] | select(.command | endswith("/wts-context"))] | length == 1' "$settings"
+check "setup claude --install keeps the other hooks" \
+  jq -e '[.hooks.SessionStart[].hooks[] | select(.command == "echo mine")] | length == 1' "$settings"
+
+"$WTS" rm dbsess -f >/dev/null
+no_notes_left() { [[ "$(q "SELECT count(*) FROM notes WHERE session = 'dbsess'")" == 0 ]] }
+check "rm drops the session's notes" no_notes_left
+"$WTS" rm dbpeer -f >/dev/null
+
+# ─── Import of the pre-1.0 state files ───────────────────────────────────────
+
+OLD="$SANDBOX/state-old"
+mkdir -p "$OLD/wts/brief" "$OLD/wts/panehash"
+print -r -- stale > "$OLD/wts/brief/legacy"
+cat > "$OLD/wts/sessions.json" <<'EOF'
+{
+  "legacy": {"profile": "smoke", "repo_root": "/r", "worktree": "/w", "branch": "feature/legacy",
+             "subdir": "", "context": "", "prompt": "line one\nit's two", "docs": ["spec"],
+             "created_at": "2026-01-01T00:00:00Z"},
+  "bare": {"worktree": "/w2"}
+}
+EOF
+import_runs() {
+  local err
+  err=$(XDG_STATE_HOME="$OLD" "$WTS" db path 2>&1 >/dev/null)
+  [[ "$err" == *"state imported"*"2 sessions"* ]]
+}
+check "the first command imports sessions.json" import_runs
+qo() { sqlite3 -init /dev/null "$OLD/wts/wts.db" "$@" }
+check "the old file is kept, renamed" test -s "$OLD/wts/sessions.json.migrated"
+refute "the old file is gone" test -e "$OLD/wts/sessions.json"
+refute "the old caches are gone" test -e "$OLD/wts/brief"
+prompt_survives() {
+  [[ "$(qo "SELECT prompt FROM sessions WHERE name = 'legacy'")" == "line one"$'\n'"it's two" ]]
+}
+check "a multiline prompt with an apostrophe survives the import" prompt_survives
+bare_defaults() { [[ "$(qo "SELECT docs || created_at FROM sessions WHERE name = 'bare'")" == '[]2'* ]] }
+check "a sparse entry gets defaults" bare_defaults
+same_shape() {
+  diff <(jq -S .legacy "$OLD/wts/sessions.json.migrated") \
+       <(XDG_STATE_HOME="$OLD" zsh -c 'source "$1/libexec/wts/wts-db.zsh"; registry_json' _ "$ROOT" | jq -S .legacy)
+}
+check "the registry reads back in the old shape" same_shape
+check "a second run imports nothing more" \
+  eval '[[ -z "$(XDG_STATE_HOME="$OLD" "$WTS" db path 2>&1 >/dev/null)" ]]'
 
 # ─── Stale local base ────────────────────────────────────────────────────────
 # Last, and only now: giving the repo a remote changes what `wts gc` compares

@@ -15,7 +15,8 @@
 #        wts gc [--apply] [--no-fetch]
 #        wts layouts
 #        wts keys
-#        wts setup tmux | git
+#        wts setup tmux | git | claude [--install]
+#        wts db path | schema | sql "<SELECT>" | notes [--all] | get | set | del
 #        wts help | wts version
 #
 #   <name>     : name of the worktree AND of the tmux session
@@ -47,6 +48,10 @@
 #   keys       : switcher keys and tmux bindings (the popup shows them too)
 #   setup tmux : print the tmux.conf snippet (switcher popup, `wts` command)
 #   setup git  : print the two git settings that keep `wts ls` fast on a large repository
+#   setup claude : print (--install: add) the Claude Code hook that tells every
+#                agent in a wts session about the others and about `wts db`
+#   db         : the state database (SQLite): read anything, and notes the
+#                agents leave for each other (`wts db help`)
 #
 # Examples:
 #   wts auth-form
@@ -65,7 +70,7 @@
 
 set -euo pipefail
 
-WTS_VERSION="0.4.3"
+WTS_VERSION="1.0.0"
 
 # ─── Install layout ──────────────────────────────────────────────────────────
 # Homebrew, `make install` and a git checkout all share the same tree:
@@ -84,19 +89,18 @@ WTS_USER_LAYOUTS="${WTS_LAYOUTS_PATH:-${XDG_CONFIG_HOME:-$HOME/.config}/wts/layo
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 
 # ─── Session registry (for `ls` / `restore`) ─────────────────────────────────
-# State file listing the sessions created by wts, so they can be listed again
-# and restarted after a reboot (worktrees survive one, tmux does not).
+# The sessions created by wts, so they can be listed again and restarted after
+# a reboot (worktrees survive one, tmux does not). A table of the state
+# database, libexec/wts/wts-db.zsh, which every helper sources too.
 
-WTS_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wts"
-WTS_STATE_FILE="$WTS_STATE_DIR/sessions.json"
+source "$WTS_LIBEXEC/wts-db.zsh"
 
 registry_available() {
-  command -v jq >/dev/null 2>&1
+  db_available
 }
 
 registry_init() {
-  mkdir -p "$WTS_STATE_DIR"
-  [[ -s "$WTS_STATE_FILE" ]] || echo '{}' > "$WTS_STATE_FILE"
+  db_init
 }
 
 # registry_put <session> <layout> <repo_root> <worktree> <branch> <subdir> <context> [prompt] [docs-json]
@@ -106,52 +110,55 @@ registry_init() {
 # must not detach what `wts doc use` attached since.
 registry_put() {
   registry_available || return 0
-  registry_init
-  local tmp="${WTS_STATE_FILE}.tmp.$$"
-  if jq --arg n "$1" --arg profile "$2" --arg repo_root "$3" --arg worktree "$4" \
-        --arg branch "$5" --arg subdir "$6" --arg context "$7" --arg prompt "${8:-}" \
-        --argjson docs "${9:-[]}" \
-        --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        '.[$n] = {profile: $profile, repo_root: $repo_root, worktree: $worktree,
-                  branch: $branch, subdir: $subdir, context: $context,
-                  prompt: (if $prompt == "" then (.[$n].prompt // "") else $prompt end),
-                  docs: (if ($docs | length) == 0 then (.[$n].docs // []) else $docs end),
-                  created_at: (.[$n].created_at // $now)}' \
-        "$WTS_STATE_FILE" > "$tmp" 2>/dev/null; then
-    mv "$tmp" "$WTS_STATE_FILE"
-  else
-    rm -f "$tmp"
-    echo "⚠ registry not updated ($WTS_STATE_FILE)" >&2
+  registry_init || return 0
+  if ! db_q "INSERT INTO sessions
+      (name, profile, repo_root, worktree, branch, subdir, context, prompt, docs, created_at)
+    VALUES ($(sql_str "$1"), $(sql_str "$2"), $(sql_str "$3"), $(sql_str "$4"),
+            $(sql_str "$5"), $(sql_str "$6"), $(sql_str "$7"), $(sql_str "${8:-}"),
+            json($(sql_str "${9:-[]}")), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    ON CONFLICT(name) DO UPDATE SET
+      profile = excluded.profile, repo_root = excluded.repo_root,
+      worktree = excluded.worktree, branch = excluded.branch,
+      subdir = excluded.subdir, context = excluded.context,
+      prompt = CASE WHEN excluded.prompt = '' THEN sessions.prompt ELSE excluded.prompt END,
+      docs = CASE WHEN json_array_length(excluded.docs) = 0 THEN sessions.docs ELSE excluded.docs END" \
+      >/dev/null; then
+    echo "⚠ registry not updated ($WTS_DB)" >&2
   fi
 }
 
+# Forget sessions, with what the database keeps about them: their brief and
+# the notes their agent left.
 registry_del() {
   registry_available || return 0
-  [[ -s "$WTS_STATE_FILE" ]] || return 0
-  local tmp="${WTS_STATE_FILE}.tmp.$$"
-  if jq --arg n "$1" 'del(.[$n])' "$WTS_STATE_FILE" > "$tmp" 2>/dev/null; then
-    mv "$tmp" "$WTS_STATE_FILE"
-  else
-    rm -f "$tmp"
-  fi
+  [[ -s "$WTS_DB" ]] || return 0
+  local in
+  in=$(sql_list "$@")
+  db_q "BEGIN IMMEDIATE;
+        DELETE FROM sessions WHERE name IN $in;
+        DELETE FROM briefs WHERE session IN $in;
+        DELETE FROM notes WHERE session IN $in;
+        COMMIT;" >/dev/null 2>&1 || true
 }
 
-# Drop the entries whose worktree is gone.
+# Drop the entries whose worktree is gone. One DELETE for all of them: the
+# JSON registry was rewritten once per stale entry.
 registry_prune() {
   registry_available || return 0
-  [[ -s "$WTS_STATE_FILE" ]] || return 0
-  local name worktree s
+  [[ -s "$WTS_DB" ]] || return 0
+  local name worktree
   local -a stale
   stale=()
-  # One field per line: a TAB separator is IFS whitespace, so consecutive
-  # delimiters would merge and swallow empty fields.
-  while IFS= read -r name && IFS= read -r worktree; do
+  while IFS=$'\x1f' read -r -d $'\x1e' name worktree; do
     [[ -n "$name" ]] || continue
     [[ -d "$worktree" ]] || stale+=("$name")
-  done < <(jq -r 'to_entries[] | [.key, (.value.worktree // "")] | .[]' "$WTS_STATE_FILE" 2>/dev/null)
-  for s in "${stale[@]}"; do
-    registry_del "$s"
-  done
+  done < <(db_rows "SELECT name, worktree FROM sessions" 2>/dev/null)
+  (( ${#stale} )) && registry_del "${stale[@]}"
+  return 0
+}
+
+registry_has() {
+  registry_available && db_has_session "$1"
 }
 
 # Claude transcripts directory of a worktree. Claude Code slugifies the working
@@ -178,16 +185,16 @@ attach_or_switch() {
 registry_resolve_name() {
   local want="$1"
   registry_available || { print -r -- "$want"; return 0 }
-  [[ -s "$WTS_STATE_FILE" ]] || { print -r -- "$want"; return 0 }
+  [[ -s "$WTS_DB" ]] || { print -r -- "$want"; return 0 }
 
   # Exact match: nothing to do.
-  if jq -e --arg n "$want" 'has($n)' "$WTS_STATE_FILE" >/dev/null 2>&1; then
+  if db_has_session "$want"; then
     print -r -- "$want"
     return 0
   fi
 
   typeset -a keys cands
-  keys=("${(@f)$(jq -r 'keys[]' "$WTS_STATE_FILE" 2>/dev/null)}")
+  keys=("${(@f)$(db_ro 'SELECT name FROM sessions ORDER BY name' 2>/dev/null)}")
   (( ${#keys} )) || { print -r -- "$want"; return 0 }
 
   # Substring either way (covers a typo by omission: "rate-lim" is a prefix
@@ -383,6 +390,66 @@ fi
 # ─── Subcommand: setup ───────────────────────────────────────────────────────
 
 if [[ "$1" == "setup" ]]; then
+  # Both snippets below outlive upgrades: a Homebrew path carries the version
+  # (…/Cellar/wts/0.1.0/…) and would break on the next `brew upgrade`. The opt/
+  # link is stable, so point there instead.
+  libexec="$WTS_LIBEXEC"
+  if [[ "$libexec" =~ '^(.*)/Cellar/wts/[^/]+/(.*)$' ]]; then
+    libexec="${match[1]}/opt/wts/${match[2]}"
+  fi
+
+  # `wts setup claude`: the SessionStart hook that tells every Claude Code
+  # session started in a wts session about the others and about `wts db`.
+  # Without it an agent never learns the shared database exists: nothing in
+  # its context mentions it. User-wide on purpose — the hook is silent outside
+  # a wts session, and a per-repository hook would miss every new repository.
+  if [[ "${2:-}" == "claude" ]]; then
+    claude_settings="${CLAUDE_DIR}/settings.json"
+    hook_cmd="$libexec/wts-context"
+    if [[ "${3:-}" != "--install" ]]; then
+      cat <<EOF
+// ─── wts setup claude (wts $WTS_VERSION) ─────────────────────────────────────
+// A Claude Code SessionStart hook. In a wts session it adds to the agent's
+// context: its session, the other sessions and their last brief, the latest
+// notes the agents left, and how to use \`wts db\`. Anywhere else it prints
+// nothing. It reads the wts database (no git status, no model call).
+//
+// Merge into $claude_settings, or let wts do it (backup kept):
+//   wts setup claude --install
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "$hook_cmd", "timeout": 5 } ] }
+    ]
+  }
+}
+EOF
+      exit 0
+    fi
+    command -v jq >/dev/null 2>&1 || { echo "wts: jq is required for 'setup claude --install'" >&2; exit 1 }
+    mkdir -p "${claude_settings:h}"
+    [[ -s "$claude_settings" ]] || echo '{}' > "$claude_settings"
+    cp "$claude_settings" "$claude_settings.bak"
+    # Idempotent: any earlier wts-context entry (an older install path
+    # included) is dropped before the current one is added; other hooks stay.
+    if jq --arg cmd "$hook_cmd" '
+         .hooks.SessionStart = (
+           [ (.hooks.SessionStart // [])[]
+             | .hooks = [ (.hooks // [])[] | select((.command // "") | endswith("/wts-context") | not) ]
+             | select((.hooks | length) > 0) ]
+           + [ { hooks: [ { type: "command", command: $cmd, timeout: 5 } ] } ])' \
+         "$claude_settings.bak" > "$claude_settings.tmp.$$"; then
+      mv "$claude_settings.tmp.$$" "$claude_settings"
+      echo "→ SessionStart hook installed in $claude_settings (backup: settings.json.bak)"
+      echo "   new Claude sessions pick it up; running ones on their next /clear or /compact"
+    else
+      rm -f "$claude_settings.tmp.$$"
+      echo "wts: $claude_settings is not valid JSON, left untouched" >&2
+      exit 1
+    fi
+    exit 0
+  fi
+
   # `wts setup git`: the two repository settings that keep `git status` fast
   # on a large tree. The collector runs it on every registered worktree at
   # every `wts ls` and switcher tick: 0.5 s per 150k-file worktree without
@@ -403,16 +470,8 @@ EOF
     exit 0
   fi
   if [[ "${2:-}" != "tmux" ]]; then
-    print -u2 "usage: wts setup tmux | git   (then: wts setup tmux >> ~/.tmux.conf)"
+    print -u2 "usage: wts setup tmux | git | claude [--install]   (then: wts setup tmux >> ~/.tmux.conf)"
     exit 2
-  fi
-
-  # tmux.conf outlives upgrades: a Homebrew path carries the version
-  # (…/Cellar/wts/0.1.0/…) and would break on the next `brew upgrade`. The opt/
-  # link is stable, so point there instead.
-  libexec="$WTS_LIBEXEC"
-  if [[ "$libexec" =~ '^(.*)/Cellar/wts/[^/]+/(.*)$' ]]; then
-    libexec="${match[1]}/opt/wts/${match[2]}"
   fi
 
   cat <<EOF
@@ -436,8 +495,8 @@ fi
 # ─── Subcommand: ls / status ─────────────────────────────────────────────────
 
 if [[ "$1" == "ls" || "$1" == "status" ]]; then
-  if ! registry_available; then
-    echo "wts: jq is required for '$1'" >&2
+  if ! registry_available || ! command -v jq >/dev/null 2>&1; then
+    echo "wts: sqlite3 and jq are required for '$1'" >&2
     exit 1
   fi
   registry_init
@@ -454,7 +513,7 @@ if [[ "$1" == "ls" || "$1" == "status" ]]; then
     exec "$WTS_LIBEXEC/wts-status" "${@:---json}"
   fi
 
-  if [[ "$(jq -r 'length' "$WTS_STATE_FILE")" == "0" ]]; then
+  if [[ "$(db_ro 'SELECT count(*) FROM sessions')" == "0" ]]; then
     echo "No registered session."
     exit 0
   fi
@@ -464,8 +523,8 @@ fi
 # ─── Subcommand: brief ───────────────────────────────────────────────────────
 
 if [[ "$1" == "brief" ]]; then
-  if ! registry_available; then
-    echo "wts: jq is required for 'brief'" >&2
+  if ! registry_available || ! command -v jq >/dev/null 2>&1; then
+    echo "wts: sqlite3 and jq are required for 'brief'" >&2
     exit 1
   fi
   registry_init
@@ -491,7 +550,7 @@ fi
 
 if [[ "$1" == "restore" ]]; then
   if ! registry_available; then
-    echo "wts: jq is required for 'restore'" >&2
+    echo "wts: sqlite3 is required for 'restore'" >&2
     exit 1
   fi
   registry_init
@@ -508,8 +567,7 @@ if [[ "$1" == "restore" ]]; then
   restored=0
   ignored=0
 
-  while IFS= read -r name && IFS= read -r profile && IFS= read -r worktree \
-        && IFS= read -r subdir && IFS= read -r context && IFS= read -r docs; do
+  while IFS=$'\x1f' read -r -d $'\x1e' name profile worktree subdir context docs; do
     [[ -n "$name" ]] || continue
 
     if (( ${#wanted} )) && [[ -z "${wanted[(r)$name]:-}" ]]; then
@@ -552,7 +610,7 @@ if [[ "$1" == "restore" ]]; then
     export WTS_DOC=""
     if [[ -n "$docs" && -x "$WTS_LIBEXEC/wts-doc" ]]; then
       WTS_DOC=$("$WTS_LIBEXEC/wts-doc" materialize "$worktree" "$workdir" \
-                  ${(ps:\x1f:)docs} 2>/dev/null) || WTS_DOC=""
+                  ${(s: :)docs} 2>/dev/null) || WTS_DOC=""
     fi
 
     # The layout pre-fills `claude --continue` when there is a conversation to
@@ -571,7 +629,10 @@ if [[ "$1" == "restore" ]]; then
       echo "⚠ $name: tmuxinator failed to start" >&2
       (( ignored++ )) || true
     fi
-  done < <(jq -r 'to_entries | sort_by(.key)[] | [.key, (.value.profile // ""), (.value.worktree // ""), (.value.subdir // ""), (.value.context // ""), ((.value.docs // []) | join("\u001f"))] | .[]' "$WTS_STATE_FILE")
+  # docs: space-separated slugs (a slug has no space), split below.
+  done < <(db_rows "SELECT name, profile, worktree, subdir, context,
+                           (SELECT coalesce(group_concat(value, ' '), '') FROM json_each(docs))
+                    FROM sessions ORDER BY name")
 
   echo "→ $restored session(s) restored, $ignored skipped"
   if (( restored > 0 )); then
@@ -622,8 +683,7 @@ if [[ "$1" == "stop" ]]; then
 
   tmux kill-session -t "=$SESSION"
   echo "→ tmux session '$SESSION' killed"
-  if registry_available && [[ -s "$WTS_STATE_FILE" ]] \
-     && jq -e --arg n "$SESSION" 'has($n)' "$WTS_STATE_FILE" >/dev/null 2>&1; then
+  if registry_has "$SESSION"; then
     echo "→ worktree kept, wts restore $SESSION restarts it"
   fi
   exit 0
@@ -652,7 +712,7 @@ if [[ "$1" == "pr" ]]; then
     exit 1
   fi
 
-  if ! registry_available || [[ ! -s "$WTS_STATE_FILE" ]]; then
+  if ! registry_available || [[ ! -s "$WTS_DB" ]]; then
     echo "wts: '$SESSION' is not a wts session" >&2
     exit 1
   fi
@@ -663,12 +723,12 @@ if [[ "$1" == "pr" ]]; then
   fi
   # The switcher also lists tmux sessions wts never created, and ctrl-o works
   # on any row: say so instead of asking gh about an unknown branch.
-  if ! jq -e --arg n "$SESSION" 'has($n)' "$WTS_STATE_FILE" >/dev/null 2>&1; then
+  if ! db_has_session "$SESSION"; then
     echo "wts: '$SESSION' is not a wts session" >&2
     exit 1
   fi
-  BRANCH=$(jq -r --arg n "$SESSION" '.[$n].branch // ""' "$WTS_STATE_FILE")
-  REPO_ROOT=$(jq -r --arg n "$SESSION" '.[$n].repo_root // ""' "$WTS_STATE_FILE")
+  BRANCH=$(db_session_field "$SESSION" branch)
+  REPO_ROOT=$(db_session_field "$SESSION" repo_root)
   if [[ -z "$BRANCH" || ! -d "$REPO_ROOT" ]]; then
     echo "wts: '$SESSION' has no branch or repository in the registry" >&2
     exit 1
@@ -828,7 +888,7 @@ if [[ "$1" == "doc" ]]; then
       fi
     fi
     DOC_SESSION="${DOC_SESSION//\//-}"
-    if ! registry_available || [[ ! -s "$WTS_STATE_FILE" ]]; then
+    if ! registry_available || [[ ! -s "$WTS_DB" ]]; then
       echo "wts: '$DOC_SESSION' is not a wts session" >&2
       exit 1
     fi
@@ -837,8 +897,8 @@ if [[ "$1" == "doc" ]]; then
     else
       exit 1
     fi
-    DOC_WT=$(jq -r --arg n "$DOC_SESSION" '.[$n].worktree // ""' "$WTS_STATE_FILE")
-    DOC_SUB=$(jq -r --arg n "$DOC_SESSION" '.[$n].subdir // ""' "$WTS_STATE_FILE")
+    DOC_WT=$(db_session_field "$DOC_SESSION" worktree)
+    DOC_SUB=$(db_session_field "$DOC_SESSION" subdir)
     if [[ -z "$DOC_WT" || ! -d "$DOC_WT" ]]; then
       echo "wts: '$DOC_SESSION' has no worktree in the registry" >&2
       exit 1
@@ -850,6 +910,133 @@ if [[ "$1" == "doc" ]]; then
     exec "$WTS_LIBEXEC/wts-doc" use "$DOC_SLUG" "$DOC_SESSION" "$DOC_WT" "$DOC_WD"
   fi
   exec "$WTS_LIBEXEC/wts-doc" "$@"
+fi
+
+# ─── Subcommand: db ──────────────────────────────────────────────────────────
+# The state database, for the Claude agents running in wts sessions (and for
+# you). Everything is readable; the only thing writable from here is `notes`,
+# keyed by the caller's session: the other tables are wts's own, and an agent
+# rewriting them would desynchronize the registry from the worktrees.
+
+if [[ "$1" == "db" ]]; then
+  shift
+  db_available || { echo "wts: sqlite3 is required for 'db'" >&2; exit 1 }
+  db_init || exit 1
+
+  sub="${1:-help}"
+  (( $# )) && shift
+  db_session=""
+  db_json=0
+  db_all=0
+  typeset -a db_args
+  db_args=()
+  while (( $# )); do
+    case "$1" in
+      --session)   db_session="${2:-}"; shift ;;
+      --session=*) db_session="${1#--session=}" ;;
+      --json)      db_json=1 ;;
+      --all)       db_all=1 ;;
+      *)           db_args+=("$1") ;;
+    esac
+    shift
+  done
+
+  # The session a note belongs to: --session, else the one this command runs in.
+  db_need_session() {
+    if [[ -n "$db_session" ]]; then
+      db_has_session "$db_session" && return 0
+      echo "wts db: '$db_session' is not a registered session (wts ls)" >&2
+      exit 1
+    fi
+    db_session=$(db_current_session) && return 0
+    echo "wts db: not inside a wts session; pass --session <name>" >&2
+    exit 1
+  }
+
+  # Output mode: JSON on request, a box for a human, tab-separated with a
+  # header for a program (an agent's Bash tool is not a terminal).
+  typeset -a db_mode
+  if (( db_json )); then db_mode=(-json)
+  elif [[ -t 1 ]]; then db_mode=(-box)
+  else db_mode=(-tabs -header)
+  fi
+
+  case "$sub" in
+    path)
+      print -r -- "$WTS_DB" ;;
+
+    schema)
+      _db -readonly "$WTS_DB" '.schema' ;;
+
+    sql)
+      if (( ${#db_args} != 1 )); then
+        echo 'Usage: wts db sql "<SELECT ...>" [--json]' >&2
+        exit 1
+      fi
+      # -readonly: no write reaches wts's tables. -safe: no .shell, no ATTACH,
+      # no readfile()/writefile(): a query stays a query.
+      _db -readonly -safe "${db_mode[@]}" "$WTS_DB" "${db_args[1]}" ;;
+
+    get)
+      if (( ${#db_args} != 1 )); then
+        echo "Usage: wts db get <key> [--session <name>]" >&2
+        exit 1
+      fi
+      db_need_session
+      db_ro "SELECT value FROM notes WHERE session = $(sql_str "$db_session")
+                                       AND key = $(sql_str "${db_args[1]}")" ;;
+
+    set)
+      if (( ${#db_args} != 2 )); then
+        echo "Usage: wts db set <key> <value|-> [--session <name>]" >&2
+        exit 1
+      fi
+      db_need_session
+      db_value="${db_args[2]}"
+      [[ "$db_value" == - ]] && db_value="$(cat)"
+      db_q "INSERT INTO notes (session, key, value, updated_at)
+            VALUES ($(sql_str "$db_session"), $(sql_str "${db_args[1]}"),
+                    $(sql_str "$db_value"), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            ON CONFLICT(session, key) DO UPDATE SET
+              value = excluded.value, updated_at = excluded.updated_at" >/dev/null
+      echo "→ $db_session/${db_args[1]}" >&2 ;;
+
+    del)
+      if (( ${#db_args} != 1 )); then
+        echo "Usage: wts db del <key> [--session <name>]" >&2
+        exit 1
+      fi
+      db_need_session
+      db_q "DELETE FROM notes WHERE session = $(sql_str "$db_session")
+                                AND key = $(sql_str "${db_args[1]}")" >/dev/null ;;
+
+    notes)
+      if (( db_all )); then
+        db_where="1"
+      else
+        db_need_session
+        db_where="session = $(sql_str "$db_session")"
+      fi
+      _db -readonly "${db_mode[@]}" "$WTS_DB" \
+        "SELECT session, key, value, updated_at FROM notes WHERE $db_where
+         ORDER BY updated_at DESC, session, key" ;;
+
+    help|-h|--help)
+      print -r -- 'Usage: wts db <command>
+  path                          where the database is
+  schema                        its tables
+  sql "<SELECT ...>" [--json]   any read-only query, over every table
+  notes [--all] [--json]        this session'"'"'s notes (--all: every session'"'"'s)
+  get <key>                     one note of this session
+  set <key> <value|->           write a note ('"'"'-'"'"' reads stdin)
+  del <key>                     remove a note
+  --session <name>              act as another session (default: the one you are in)' ;;
+
+    *)
+      echo "wts db: unknown command '$sub' (wts db help)" >&2
+      exit 1 ;;
+  esac
+  exit 0
 fi
 
 # ─── Subcommand: new ─────────────────────────────────────────────────────────
@@ -1088,8 +1275,7 @@ if [[ -z "$NAME" ]]; then
     local b
     b=$(branch_for "$1")
     [[ -e "$worktree_base/$1" ]] && return 0
-    registry_available && [[ -s "$WTS_STATE_FILE" ]] && \
-      jq -e --arg n "$1" 'has($n)' "$WTS_STATE_FILE" >/dev/null 2>&1 && return 0
+    registry_has "$1" && return 0
     tmux has-session -t "=$1" 2>/dev/null && return 0
     git -C "$repo_root" show-ref --verify --quiet "refs/heads/$b" && return 0
     git -C "$repo_root" show-ref --verify --quiet "refs/remotes/origin/$b" && return 0

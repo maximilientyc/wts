@@ -31,9 +31,8 @@ set -uo pipefail
 # agent's own `git add` in that worktree. Every git call here is a read.
 export GIT_OPTIONAL_LOCKS=0
 
-WTS_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wts"
 WTS_BIN="${0:A:h}"
-CACHE_DIR="$WTS_STATE_DIR/brief"
+source "$WTS_BIN/wts-db.zsh"
 CACHE_VERSION=v2
 MODEL="${WTS_MODEL:-haiku}"
 TIMEOUT="${WTS_BRIEF_TIMEOUT:-45}"
@@ -230,14 +229,16 @@ collect() {
   } > "$tmpdir/$idx.fallback"
 
   # --- cache ----------------------------------------------------------------
-  local tr_sig="-" key cache="$CACHE_DIR/$name"
+  local tr_sig="-" key cached_key="" cached_body=""
   if [[ -n "$tr" ]]; then
     tr_sig="$tr:$(zstat +size "$tr" 2>/dev/null):$(zstat +mtime "$tr" 2>/dev/null)"
   fi
   key="$CACHE_VERSION|$MODEL|$head_sha|$(print -r -- "$porcelain" | shasum | cut -d' ' -f1)|$tr_sig|$(print -r -- "$prompt" | shasum | cut -d' ' -f1)"
   print -r -- "$key" > "$tmpdir/$idx.key"
-  if [[ -s "$cache" && "$(head -n 1 "$cache")" == "$key" ]]; then
-    tail -n +2 "$cache" > "$tmpdir/$idx.brief"
+  IFS=$'\x1f' read -r -d $'\x1e' cached_key cached_body \
+    < <(db_rows "SELECT key, body FROM briefs WHERE session = $(sql_str "$name")" 2>/dev/null)
+  if [[ -n "$cached_body" && "$cached_key" == "$key" ]]; then
+    print -r -- "$cached_body" > "$tmpdir/$idx.brief"
   fi
 }
 
@@ -258,8 +259,10 @@ summarize() {
 
   name=${"$(<"$tmpdir/$idx.head")"%%$'\x1f'*}
   printf 'done: %s\nnext: %s\n' "$done_line" "$next_line" > "$tmpdir/$idx.brief"
-  cat "$tmpdir/$idx.key" "$tmpdir/$idx.brief" > "$CACHE_DIR/$name.tmp.$$.$idx" \
-    && mv "$CACHE_DIR/$name.tmp.$$.$idx" "$CACHE_DIR/$name"
+  # Parallel jobs write here at once: the database serializes them.
+  db_q "INSERT OR REPLACE INTO briefs VALUES ($(sql_str "$name"),
+          $(sql_str "$(<"$tmpdir/$idx.key")"), $(sql_str "$(<"$tmpdir/$idx.brief")"),
+          unixepoch())" >/dev/null 2>&1
 }
 
 # ─── Target sessions ─────────────────────────────────────────────────────────
@@ -289,7 +292,7 @@ fi
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/wts-brief.XXXXXX")
 trap 'rm -rf "$tmpdir"' EXIT
-mkdir -p "$CACHE_DIR"
+db_init 2>/dev/null
 
 # ─── Collection (sequential: git and jq are fast) ────────────────────────────
 
