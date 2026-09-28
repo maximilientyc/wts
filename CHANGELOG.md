@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.0.0 — 2026-09-28
+
+Major version: the state moves from files to a SQLite database. The import is
+automatic; see [Upgrading to 1.0](README.md#upgrading-to-10) for the steps and
+the rollback.
+
+- **All state in one SQLite database**, `${XDG_STATE_HOME:-~/.local/state}/wts/wts.db`:
+  the session registry (was `sessions.json`), the `wts brief` cache (was `brief/`),
+  the stale guard's pane hashes (was `panehash/`) and the fetched documents (was
+  `docs/`). The registry was one JSON file rewritten whole with `jq > tmp && mv` by
+  `bin/wts`, `wts gc` and `wts doc use`: two of them at once lost one update, and a
+  killed run left `sessions.json.tmp.<pid>` behind. The database runs in WAL mode,
+  every connection waits up to 5 s for a writer instead of failing, and a
+  prune is one `DELETE` instead of one file rewrite per stale entry.
+- **Automatic import.** The first command after the upgrade imports
+  `sessions.json` and the document cache, renames the old file
+  `sessions.json.migrated` and says so once. The brief cache and pane hashes are
+  dropped (rebuilt on first use).
+- **Agents know about each other.** `wts setup claude [--install]` adds a Claude
+  Code `SessionStart` hook, `wts-context`: in a wts session, every agent starts
+  (and restarts after `/clear` or `/compact`) with its session, the other sessions
+  — same repository first, with their task and last brief — the latest notes the
+  agents left, and how to query the rest. Silent outside a wts session; reads the
+  database only, ~0.1 s.
+- **`wts db`**: `sql` (read-only, sqlite3 safe mode), `schema`, `path`, and
+  `notes`/`get`/`set`/`del` for the one table agents may write: notes keyed by
+  the session the command runs in (found from `$TMUX_PANE`, else the worktree).
+  `wts rm` and `wts gc` drop the notes and brief of the sessions they remove.
+- **sqlite3 is now required** for the registry (macOS ships it). Without it, wts
+  degrades as it did without jq: sessions are created, nothing is registered.
+- Unchanged: `wts status --json` (keys and values), the library in
+  `~/.config/wts/docs.json`, the layouts.
+- Rollback: reinstall 0.4.3 and rename `sessions.json.migrated` back; sessions
+  created since are missing from it.
+
 ## 0.4.3 — 2026-09-24
 
 - **A fetch that fails says why, and the run stays useful.** `wts gc` ran its fetch

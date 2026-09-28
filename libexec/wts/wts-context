@@ -1,0 +1,126 @@
+#!/usr/bin/env zsh
+# wts-context — Claude Code SessionStart hook: tell the agent about the others
+#
+# Installed by `wts setup claude`. Claude Code adds what a SessionStart hook
+# prints to the new conversation's context, at startup and again after
+# /clear, /compact and a resume, so an agent in a wts session learns — without
+# anyone telling it — that other agents work in parallel on this machine, what
+# they are doing, and that `wts db` reads and writes the state they share.
+#
+# Outside a wts session it prints nothing and exits 0: the hook is user-wide,
+# and a Claude started anywhere else must not pay for it or see a word of it.
+#
+# Read from the database: no git status, no wts-status, no model call. A session
+# start must never wait on a `git status` of every worktree; the agent can run
+# `wts status --json` itself when it wants live agent states.
+#
+# Usage: wts-context
+
+set -uo pipefail
+
+WTS_BIN="${0:A:h}"
+WTS_CMD="${0:A:h:h:h}/bin/wts"
+source "$WTS_BIN/wts-db.zsh"
+
+# stdin (the hook's JSON payload) is left unread: the session is found from
+# the pane or the working directory, and draining it would hang a manual run
+# whose stdin never closes.
+
+db_available || exit 0
+[[ -s "$WTS_DB" ]] || exit 0
+me=$(db_current_session) || exit 0
+
+# The agent's Bash tool may not have wts on its PATH (a pane's login shell
+# rebuilds it): name it the way this hook was reached.
+wts="wts"
+if ! command -v wts >/dev/null 2>&1 && [[ -x "$WTS_CMD" ]]; then
+  wts="$WTS_CMD"
+fi
+
+cut80() {
+  local v="${1//[[:cntrl:]]/ }"
+  (( ${#v} > 80 )) && v="${v[1,79]}…"
+  print -r -- "$v"
+}
+
+IFS=$'\x1f' read -r -d $'\x1e' my_branch my_worktree my_repo \
+  < <(db_rows "SELECT branch, worktree, repo_root FROM sessions WHERE name = $(sql_str "$me")")
+
+print -r -- "# wts: you are in session \`$me\` (branch ${my_branch:--}, worktree $my_worktree)"
+print -r -- ""
+print -r -- "This machine runs several Claude Code agents in parallel, one per wts session"
+print -r -- "(a git worktree + a tmux session each). Their shared state is a SQLite"
+print -r -- "database: $WTS_DB"
+
+# Same repository first: those are the sessions whose work can collide with
+# yours. Not a comparison of repo_root: a session created from inside another
+# worktree records that worktree as its root, so the repository is git's
+# common directory — one rev-parse per distinct root, no status, a few ms.
+typeset -A common
+common_of() {  # <repo_root>
+  if [[ -z "${common[$1]+x}" ]]; then
+    common[$1]=$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+    [[ -n "${common[$1]}" ]] || common[$1]="$1"
+  fi
+  print -r -- "${common[$1]}"
+}
+my_common=$(common_of "$my_repo")
+
+# Capped so a machine with fifty sessions does not flood the context.
+typeset -a same_repo other_repo others
+same_repo=() other_repo=()
+while IFS=$'\x1f' read -r -d $'\x1e' name branch root prompt context brief; do
+  [[ -n "$name" ]] || continue
+  line="- $name ($branch)"
+  subject="$prompt"
+  [[ -n "$subject" ]] || subject="$context"
+  [[ -n "$subject" ]] && line+=": $(cut80 "$subject")"
+  [[ -n "$brief" ]] && line+=" — last brief: $(cut80 "$brief")"
+  if [[ "$(common_of "$root")" == "$my_common" ]]; then
+    same_repo+=("$line")
+  else
+    other_repo+=("$line [other repository]")
+  fi
+done < <(db_rows "SELECT s.name, s.branch, s.repo_root, s.prompt, s.context,
+                         coalesce(replace(b.body, char(10), ' / '), '')
+                  FROM sessions s LEFT JOIN briefs b ON b.session = s.name
+                  WHERE s.name != $(sql_str "$me")
+                  ORDER BY s.created_at DESC")
+others=("${same_repo[@]}" "${other_repo[@]}")
+others=("${(@)others[1,15]}")
+
+print -r -- ""
+if (( ${#others} )); then
+  print -r -- "Other sessions (same repository first):"
+  print -rl -- "${others[@]}"
+else
+  print -r -- "No other wts session is registered right now."
+fi
+
+typeset -a notes
+notes=()
+while IFS=$'\x1f' read -r -d $'\x1e' session key value at; do
+  [[ -n "$session" ]] || continue
+  notes+=("- $session/$key ($at): $(cut80 "$value")")
+done < <(db_rows "SELECT session, key, value, updated_at FROM notes
+                  WHERE session != $(sql_str "$me")
+                  ORDER BY updated_at DESC LIMIT 10")
+if (( ${#notes} )); then
+  print -r -- ""
+  print -r -- "Latest notes left by the other agents:"
+  print -rl -- "${notes[@]}"
+fi
+
+cat <<EOF
+
+Query it when your work may overlap another session's (same files, same API,
+a shared migration), or when the user asks what the others are doing:
+  $wts db sql "select name, branch, prompt from sessions" --json
+  $wts db notes --all        # every note the agents left
+  $wts status --json         # live agent states (working, blocked, idle...)
+  $wts db schema             # all tables; everything is readable
+Leave a short note when you change something another session may depend on,
+or to record a decision; it is keyed by your session:
+  $wts db set <key> "<one line>"     # also: $wts db get <key>, $wts db del <key>
+EOF
+exit 0

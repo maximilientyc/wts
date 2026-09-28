@@ -691,12 +691,12 @@ if want 7; then
 section "7. Registry prune, stop/restore, rm"
 say ""
 table_head "command"
-# Five registry entries whose worktree is gone: `registry_prune` rewrites the
-# file once per entry, at the top of ls/status/brief/restore.
-reg="$XDG_STATE_HOME/wts/sessions.json"
-cp "$reg" "$SANDBOX/reg.bak"
+# Five registry entries whose worktree is gone: `registry_prune` drops them in
+# one DELETE, at the top of ls/status/brief/restore.
 for i in 1 2 3 4 5; do
-  jq --arg n "gone-$i" --arg w "$WT/gone-$i" '.[$n] = {profile: "bench", repo_root: "'"$REPO"'", worktree: $w, branch: "feature/gone", subdir: "", context: "", prompt: "", created_at: "2026-01-01T00:00:00Z"}' "$reg" > "$reg.tmp" && mv "$reg.tmp" "$reg"
+  sqlite3 -init /dev/null "$XDG_STATE_HOME/wts/wts.db" \
+    "INSERT INTO sessions (name, profile, repo_root, worktree, branch, created_at)
+     VALUES ('gone-$i', 'bench', '$REPO', '$WT/gone-$i', 'feature/gone', '2026-01-01T00:00:00Z')"
 done
 bench 'wts ls with 5 stale registry entries (first run prunes)' 2 "$WTS" ls
 "$WTS" stop bench-3 >/dev/null 2>&1 </dev/null

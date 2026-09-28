@@ -14,7 +14,7 @@
 #
 # A document is declared once and reused: the same spec no longer has to be
 # pasted into every new agent. Declarations live in a small hand-editable file
-# ($WTS_DOCS_PATH); the fetched content is a cache, in the state directory.
+# ($WTS_DOCS_PATH); the fetched content is a cache, in the state database.
 #
 # A URL is fetched by a headless `claude -p` running with THIS machine's own MCP
 # configuration, and the model picks whatever tool can read it. Nothing about a
@@ -54,10 +54,8 @@ set -uo pipefail
 WTS_SELF="${0:A}"
 WTS_LIBEXEC="${WTS_SELF:h}"
 
-WTS_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wts"
-CACHE_DIR="$WTS_STATE_DIR/docs"
+source "$WTS_LIBEXEC/wts-db.zsh"
 DOCS_FILE="${WTS_DOCS_PATH:-${XDG_CONFIG_HOME:-$HOME/.config}/wts/docs.json}"
-TOOLS_CACHE="$CACHE_DIR/tools.json"
 
 MAX_BYTES="${WTS_DOC_MAX_BYTES:-200000}"
 TTL="${WTS_DOC_TTL:-86400}"
@@ -146,47 +144,52 @@ doc_del() {
 }
 
 # ─── Cache ───────────────────────────────────────────────────────────────────
-# One pair of files per document rather than one index: writes are independent,
-# so two wts runs attaching different documents never collide, and a corrupted
-# document cannot take the whole library down.
+# The doc_cache table of the state database (wts-db.zsh): one row per document,
+# so two wts runs attaching different documents write different rows, and the
+# database serializes them. The library itself stays in docs.json: it is the
+# user's configuration, not state.
 
-body_file() { print -r -- "$CACHE_DIR/$1.md" }
-meta_file() { print -r -- "$CACHE_DIR/$1.json" }
-
-meta_field() {  # <slug> <field>
-  local f
-  f=$(meta_file "$1")
-  [[ -s "$f" ]] || return 1
-  jq -r --arg k "$2" '.[$k] // ""' "$f" 2>/dev/null
+has_body() {  # <slug>
+  [[ "$(db_ro "SELECT length(body) > 0 FROM doc_cache WHERE slug = $(sql_str "$1")" 2>/dev/null)" == 1 ]]
 }
 
+# The body byte for byte: `-newline ''` keeps sqlite3 from adding a row
+# terminator, so the materialized file ends the way the document does.
+cat_body() {  # <slug>
+  db_ro -newline '' "SELECT body FROM doc_cache WHERE slug = $(sql_str "$1")" 2>/dev/null
+}
+
+meta_field() {  # <slug> <fetched_at|bytes|title|ok|error|truncated>
+  db_ro "SELECT $2 FROM doc_cache WHERE slug = $(sql_str "$1")" 2>/dev/null
+}
+
+# The body goes through a file and readfile(): as a SQL literal, a 200 KB
+# document would be one 200 KB argument.
 cache_store() {  # <slug> <title> <truncated> ; body on stdin
-  mkdir -p "$CACHE_DIR" 2>/dev/null
-  chmod 700 "$CACHE_DIR" 2>/dev/null
-  local slug="$1" bt="$2" trunc="$3"
-  local tmp="$CACHE_DIR/.$slug.md.$$" bytes
+  db_init 2>/dev/null || return 1
+  local slug="$1" bt="$2" trunc="$3" tmp
+  tmp=$(mktemp "${TMPDIR:-/tmp}/wts-doc.XXXXXX") || return 1
   cat > "$tmp" || { rm -f "$tmp"; return 1 }
-  bytes=$(wc -c < "$tmp" | tr -d ' ')
-  mv "$tmp" "$(body_file "$slug")" || { rm -f "$tmp"; return 1 }
-  local mtmp="$CACHE_DIR/.$slug.json.$$"
-  jq -n --argjson at "$(now_epoch)" --argjson b "$bytes" --arg t "$bt" \
-        --argjson trunc "$trunc" \
-        '{fetched_at: $at, bytes: $b, title: $t, ok: true, error: "",
-          truncated: $trunc}' > "$mtmp" 2>/dev/null \
-    && mv "$mtmp" "$(meta_file "$slug")" || rm -f "$mtmp"
+  db_q "INSERT OR REPLACE INTO doc_cache
+          (slug, body, fetched_at, bytes, title, ok, error, truncated)
+        SELECT $(sql_str "$slug"), CAST(b AS TEXT), unixepoch(), length(b),
+               $(sql_str "$bt"), 1, '', $([[ "$trunc" == true ]] && print 1 || print 0)
+        FROM (SELECT readfile($(sql_str "$tmp")) AS b)" >/dev/null 2>&1
+  local rc=$?
+  rm -f "$tmp"
+  return $rc
 }
 
 cache_mark_failed() {  # <slug> <reason>
-  mkdir -p "$CACHE_DIR" 2>/dev/null
-  local mtmp="$CACHE_DIR/.$1.json.$$"
-  jq -n --argjson at "$(now_epoch)" --arg e "$2" \
-        '{fetched_at: $at, bytes: 0, title: "", ok: false, error: $e,
-          truncated: false}' > "$mtmp" 2>/dev/null \
-    && mv "$mtmp" "$(meta_file "$1")" || rm -f "$mtmp"
+  db_init 2>/dev/null || return 1
+  db_q "INSERT OR REPLACE INTO doc_cache
+          (slug, body, fetched_at, bytes, title, ok, error, truncated)
+        VALUES ($(sql_str "$1"), NULL, unixepoch(), 0, '', 0, $(sql_str "$2"), 0)" \
+    >/dev/null 2>&1
 }
 
 cache_del() {
-  rm -f "$(body_file "$1")" "$(meta_file "$1")"
+  db_q "DELETE FROM doc_cache WHERE slug = $(sql_str "$1")" >/dev/null 2>&1
 }
 
 # ─── The allow list ──────────────────────────────────────────────────────────
@@ -221,22 +224,23 @@ allow_list() {  # fills $ALLOW
     ALLOW=(${=WTS_DOC_TOOLS})
   else
     local age at
-    if [[ -s "$TOOLS_CACHE" ]]; then
-      at=$(jq -r '.at // 0' "$TOOLS_CACHE" 2>/dev/null) || at=0
+    local cached
+    cached=$(db_ro "SELECT value FROM kv WHERE key = 'doc.tools'" 2>/dev/null)
+    if [[ -n "$cached" ]]; then
+      at=$(jq -r '.at // 0' <<< "$cached" 2>/dev/null) || at=0
       age=$(( $(now_epoch) - ${at:-0} ))
       if (( age >= 0 && age < ${WTS_DOC_TOOLS_TTL:-86400} )); then
-        ALLOW=(${(f)"$(jq -r '.patterns[]?' "$TOOLS_CACHE" 2>/dev/null)"})
+        ALLOW=(${(f)"$(jq -r '.patterns[]?' <<< "$cached" 2>/dev/null)"})
       fi
     fi
     if (( ${#ALLOW} == 0 )); then
       ALLOW=(${(f)"$(enumerate_servers)"})
       ALLOW=("${(@)ALLOW:#}")
       if (( ${#ALLOW} )); then
-        mkdir -p "$CACHE_DIR" 2>/dev/null
-        local ttmp="$CACHE_DIR/.tools.json.$$"
-        printf '%s\n' "${ALLOW[@]}" | jq -R . | jq -sc --argjson at "$(now_epoch)" \
-          '{at: $at, patterns: .}' > "$ttmp" 2>/dev/null \
-          && mv "$ttmp" "$TOOLS_CACHE" || rm -f "$ttmp"
+        cached=$(printf '%s\n' "${ALLOW[@]}" | jq -R . | jq -sc --argjson at "$(now_epoch)" \
+                   '{at: $at, patterns: .}' 2>/dev/null)
+        [[ -n "$cached" ]] && db_init 2>/dev/null && \
+          db_q "INSERT OR REPLACE INTO kv VALUES ('doc.tools', $(sql_str "$cached"))" >/dev/null 2>&1
       else
         warn "! no MCP server enumerated: only WebFetch will be tried"
         warn "  pin the right one with WTS_DOC_TOOLS='mcp__<server>__*'"
@@ -372,8 +376,9 @@ is_url() { [[ "$1" == (http|https)://* ]] }
 typeset -g CAP_TRUNCATED=false
 
 store_body() {  # <slug> <title> <source> ; body on stdin
-  mkdir -p "$CACHE_DIR" 2>/dev/null
-  local tmp="$CACHE_DIR/.in.$$" capped="$CACHE_DIR/.cap.$$"
+  local tmp capped
+  tmp=$(mktemp "${TMPDIR:-/tmp}/wts-doc-in.XXXXXX") || return 1
+  capped=$(mktemp "${TMPDIR:-/tmp}/wts-doc-cap.XXXXXX") || { rm -f "$tmp"; return 1 }
   cat > "$tmp"
   cap_body "$3" < "$tmp" > "$capped"
   local kept=0
@@ -398,7 +403,7 @@ refresh_file() {  # <slug> <path> [force]
   local title
   if [[ ! -f "$2" ]]; then
     warn "! $1: $2 is gone"
-    [[ -s "$(body_file "$1")" ]] && return 0
+    has_body "$1" && return 0
     return 1
   fi
   title=$(grep -m1 '^# ' "$2" 2>/dev/null | sed 's/^#[[:space:]]*//')
@@ -411,7 +416,7 @@ refresh_file() {  # <slug> <path> [force]
 refresh_url() {  # <slug> <url> [force]
   local raw title
   if ! llm_available; then
-    [[ -s "$(body_file "$1")" ]] && return 0
+    has_body "$1" && return 0
     cache_mark_failed "$1" "no model call (claude unavailable or WTS_NO_LLM=1)"
     return 1
   fi
@@ -420,7 +425,7 @@ refresh_url() {  # <slug> <url> [force]
   if ! parse_answer "$raw"; then
     warn "! $1: $PARSED_ERROR"
     # The cache, when there is one, is worth more than the failure.
-    [[ -s "$(body_file "$1")" ]] && return 0
+    has_body "$1" && return 0
     cache_mark_failed "$1" "$PARSED_ERROR"
     return 1
   fi
@@ -453,7 +458,7 @@ ensure_fresh() {  # <slug>
     file) refresh_doc "$slug"; return $? ;;
     pointer) refresh_doc "$slug" >/dev/null 2>&1; return 0 ;;
   esac
-  if [[ ! -s "$(body_file "$slug")" ]]; then
+  if ! has_body "$slug"; then
     refresh_doc "$slug" >/dev/null || return 0
     return 0
   fi
@@ -515,11 +520,10 @@ materialize() {  # <worktree> <workdir> <slug>…
       title=$(doc_field "$slug" title)
       source=$(doc_field "$slug" source)
       kind=$(doc_field "$slug" kind)
-      body=$(body_file "$slug")
       at=$(meta_field "$slug" fetched_at 2>/dev/null) || at=""
       # A pointer has a metadata timestamp but no content: saying it was
       # "fetched" would tell the agent the opposite of the truth.
-      if [[ -s "$body" && -n "$at" && "$at" != 0 ]]; then
+      if has_body "$slug" && [[ -n "$at" && "$at" != 0 ]]; then
         fetched=$(epoch_iso "$at") || fetched="unknown"
         [[ -n "$fetched" ]] || fetched="unknown"
       else
@@ -532,13 +536,13 @@ materialize() {  # <worktree> <workdir> <slug>…
       print -r -- "- kind: $kind"
       print -r -- "- fetched: $fetched"
       print -r -- ""
-      if [[ -s "$body" ]]; then
-        bytes=$(wc -c < "$body" | tr -d ' ')
+      if has_body "$slug"; then
+        bytes=$(meta_field "$slug" bytes)
         if (( bytes > budget )); then
           print -r -- "[... omitted by wts: the total context cap of $MAX_BYTES bytes"
           print -r -- "     was reached. Read it at: $source ...]"
         else
-          cat "$body"
+          cat_body "$slug"
           budget=$(( budget - bytes ))
         fi
       else
@@ -566,8 +570,10 @@ source_slug() {  # <source> -> the slug already pointing at it, if any
 rename_doc() {  # <from> <to>
   jq --arg a "$1" --arg b "$2" '.docs[$b] = .docs[$a] | del(.docs[$a])' \
      "$DOCS_FILE" 2>/dev/null | docs_write
-  [[ -f "$(body_file "$1")" ]] && mv "$(body_file "$1")" "$(body_file "$2")"
-  [[ -f "$(meta_file "$1")" ]] && mv "$(meta_file "$1")" "$(meta_file "$2")"
+  db_q "BEGIN IMMEDIATE;
+        DELETE FROM doc_cache WHERE slug = $(sql_str "$2");
+        UPDATE doc_cache SET slug = $(sql_str "$2") WHERE slug = $(sql_str "$1");
+        COMMIT;" >/dev/null 2>&1
   return 0
 }
 
@@ -721,27 +727,21 @@ doc_table() {
 
 # ─── Attaching to a running session ──────────────────────────────────────────
 # The registry is bin/wts's, but `wts doc use` must persist what it attaches or
-# `wts restore` would silently drop it. Same jq + tmp + mv discipline, and the
-# same rule: never clobber what is already there.
+# `wts restore` would silently drop it. Same rule as bin/wts: never clobber what
+# is already there — the slug is appended, the others stay.
 
 registry_add_doc() {  # <session> <slug>
-  local file="$WTS_STATE_DIR/sessions.json" tmp
-  [[ -s "$file" ]] || return 1
-  tmp="${file}.tmp.$$"
-  if jq --arg n "$1" --arg d "$2" \
-       'if has($n) then .[$n].docs = (((.[$n].docs // []) + [$d]) | unique) else . end' \
-       "$file" > "$tmp" 2>/dev/null; then
-    mv "$tmp" "$file"
-  else
-    rm -f "$tmp"
-    return 1
-  fi
+  db_available && [[ -s "$WTS_DB" ]] || return 1
+  db_q "UPDATE sessions SET docs = (
+          SELECT json_group_array(value) FROM (
+            SELECT value FROM json_each(sessions.docs)
+            UNION SELECT $(sql_str "$2") ORDER BY 1))
+        WHERE name = $(sql_str "$1")" >/dev/null 2>&1
 }
 
 registry_docs() {  # <session> -> one slug per line
-  local file="$WTS_STATE_DIR/sessions.json"
-  [[ -s "$file" ]] || return 0
-  jq -r --arg n "$1" '.[$n].docs // [] | .[]' "$file" 2>/dev/null
+  db_ro "SELECT value FROM sessions, json_each(sessions.docs)
+         WHERE name = $(sql_str "$1")" 2>/dev/null
 }
 
 # The collector is the single source for an agent's pane (it reads Claude Code's
@@ -826,9 +826,8 @@ case "$cmd" in
       slug="${slugs[1]}"
     fi
     doc_exists "$slug" || die "wts doc: '$slug' is not in the library (wts doc ls)"
-    body=$(body_file "$slug")
-    if [[ -s "$body" ]]; then
-      cat "$body"
+    if has_body "$slug"; then
+      cat_body "$slug"
     else
       print -r -- "$slug: link only, nothing cached — $(doc_field "$slug" source)"
       err=$(meta_field "$slug" error 2>/dev/null) || err=""
@@ -867,9 +866,8 @@ case "$cmd" in
     doc_exists "$slug" || die "wts doc: '$slug' is not in the library (wts doc ls)"
     # The library is the user's: warn about the sessions still pointing at it,
     # remove anyway. A missing slug is skipped on the next materialize.
-    users=$(jq -r --arg d "$slug" \
-              'to_entries[] | select((.value.docs // []) | index($d)) | .key' \
-              "$WTS_STATE_DIR/sessions.json" 2>/dev/null | paste -sd' ' -)
+    users=$(db_ro "SELECT name FROM sessions, json_each(sessions.docs)
+                   WHERE value = $(sql_str "$slug") ORDER BY name" 2>/dev/null | paste -sd' ' -)
     [[ -n "${users// /}" ]] && warn "! still attached to: $users"
     doc_del "$slug"
     cache_del "$slug"
@@ -882,7 +880,7 @@ case "$cmd" in
     ;;
 
   tools)
-    [[ "${1:-}" == "--refresh" ]] && rm -f "$TOOLS_CACHE"
+    [[ "${1:-}" == "--refresh" ]] && db_q "DELETE FROM kv WHERE key = 'doc.tools'" >/dev/null 2>&1
     allow_list
     print -r -- "allowed for the fetch:"
     for t in "${ALLOW[@]}"; do print -r -- "  $t"; done

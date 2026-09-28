@@ -44,8 +44,8 @@ WTS_CMD="${0:A:h:h:h}/bin/wts"
 # little enough for the capture to stay instant.
 SCROLLBACK="${WTS_SWITCH_SCROLLBACK:-2000}"
 
-# Read directly by the skeleton, which must not pay for wts-status.
-WTS_STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/wts/sessions.json"
+# The registry is read directly by the skeleton, which must not pay for wts-status.
+source "$WTS_BIN/wts-db.zsh"
 
 # The session to mark with " *". Global rather than a render_line argument: both
 # producers set it once, and `set -u` would trip on it if it were only local.
@@ -169,7 +169,7 @@ build_skeleton() {
   local known="" name branch subject
   current=$(tmux display-message -p '#S' 2>/dev/null)
 
-  if [[ -s "$WTS_STATE_FILE" ]] && command -v jq >/dev/null 2>&1; then
+  if db_available && command -v jq >/dev/null 2>&1; then
     # Same SUBJECT rule as wts-status, minus the agent's conversation title,
     # which is unknowable without calling claude: at the swap the text only ever
     # gains a title, it never changes width.
@@ -184,7 +184,7 @@ build_skeleton() {
             | map(select(type == "string" and . != "")) | (.[0] // "")
             | gsub("[\\t\\n\\r]"; " ")
             | if length > 50 then .[0:49] + "…" else . end) ]
-      | join("")' "$WTS_STATE_FILE" 2>/dev/null)
+      | join("")' <<< "$(registry_json)" 2>/dev/null)
   fi
 
   unregistered "$known"

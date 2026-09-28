@@ -92,7 +92,7 @@ unset _arg
 # subjecting them to the git check would be a regression compared to typing
 # `wts ls` in a shell.
 case "$1" in
-  ls|status|brief|restore|layouts|setup|help|-h|--help|version|-V|--version)
+  ls|status|brief|restore|db|layouts|setup|help|-h|--help|version|-V|--version)
     passthrough "$@" ;;
 esac
 

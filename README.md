@@ -6,8 +6,11 @@ running several agents on the same repository at once without them stepping on
 each other, and for finding your way back afterwards:
 
 - **Survives reboots.** Every session is recorded as *(name, layout, context)* in a
-  small registry, so `wts restore` rebuilds them all — worktrees survive a reboot,
-  tmux does not.
+  small SQLite database, so `wts restore` rebuilds them all — worktrees survive a
+  reboot, tmux does not.
+- **Lets the agents know about each other.** Each Claude Code agent started in a
+  wts session is told which other sessions are running and what they are on, and
+  can query the shared state and leave notes for the others (`wts db`).
 - **Shows what each agent is doing.** `wts ls` and the fzf switcher (`prefix+s`)
   tell you which Claude Code agent is blocked, idle or working, with a stale guard
   that catches agents claiming to work on a frozen pane.
@@ -25,13 +28,17 @@ each other, and for finding your way back afterwards:
 It is opinionated — zsh, tmux, tmuxinator, Claude Code — because it was built for
 one person's workflow. It is shared in case that workflow is also yours.
 
+> **Upgrading from 0.x?** 1.0 moves the state to SQLite. The import is automatic;
+> see [Upgrading to 1.0](#upgrading-to-10) for the steps and the rollback.
+
 ![wts: a context document added to the library, a session started from a sentence with that document attached, prefix+a jumping straight to the agent that is blocked, the switcher answering it, attaching the document to an agent already running and stopping a finished session, then wts ls, wts brief, wts restore bringing the stopped session back and wts gc](docs/demo.gif)
 
 ## Requirements
 
 - macOS (Linux is untested)
-- zsh, git, tmux, [tmuxinator](https://github.com/tmuxinator/tmuxinator), fzf, jq, perl, curl
-  (jq only ships with recent macOS; Homebrew installs it)
+- zsh, git, tmux, [tmuxinator](https://github.com/tmuxinator/tmuxinator), fzf, jq,
+  sqlite3 (3.38+, JSON built in), perl, curl (macOS ships sqlite3; jq only with
+  recent releases, and Homebrew installs it)
 - Optional: [Claude Code](https://claude.com/claude-code), tested with 2.1.x — agent
   state columns, naming from a phrase, `wts brief`, resume on restore. Without it
   everything else works and the agent columns show `-`.
@@ -83,6 +90,15 @@ The snippet uses absolute paths: tmux runs `command-alias` programs directly,
 without a shell, so neither `~` nor `PATH` lookups are reliable there. Homebrew
 paths point to the stable `opt/wts` location and survive `brew upgrade`.
 
+**Claude Code integration** (optional, recommended): a `SessionStart` hook that
+tells every agent started in a wts session about the other sessions and about
+`wts db` — see [Agents share state](#agents-share-state-wts-db).
+
+```sh
+wts setup claude             # read it first
+wts setup claude --install   # adds it to ~/.claude/settings.json (backup kept)
+```
+
 ## Quick start
 
 ```sh
@@ -111,7 +127,8 @@ wts rm <name> [-f]
 wts gc [--apply] [--no-fetch]
 wts layouts
 wts keys
-wts setup tmux | git
+wts db path | schema | sql "<SELECT ...>" | notes [--all] | get | set | del
+wts setup tmux | git | claude [--install]
 wts help | wts version
 ```
 
@@ -219,7 +236,7 @@ worktree's Claude transcript (title, PR link, your last message, the tail of the
 agent's messages, the starting task). Claude Haiku turns them into two lines, with
 the same isolation as naming, `WTS_BRIEF_JOBS` calls at a time.
 
-Each summary is **cached** in `~/.local/state/wts/brief/<name>`, keyed on HEAD,
+Each summary is **cached** in the state database (table `briefs`), keyed on HEAD,
 uncommitted changes and the transcript's size and date: while nothing moved,
 `wts brief` answers instantly. The transcript used is the live agent's, else the
 most recent one of the worktree — never one older than the session, which would
@@ -456,8 +473,8 @@ wts doc tools [--refresh]                          what the fetch may use
 ```
 
 The library itself is `~/.config/wts/docs.json` (`WTS_DOCS_PATH`), four keys per
-entry and meant to be edited by hand; the fetched content is a cache, under
-`~/.local/state/wts/docs/`.
+entry and meant to be edited by hand; the fetched content is a cache, in the
+state database (table `doc_cache`).
 
 > **Privacy.** `wts doc add` and `wts doc sync` send the document's URL to the
 > model through your own `claude -p`, which then reads the page with your own
@@ -513,22 +530,21 @@ entirely present in it, whatever the merge method, and is deleted with
 ## Persistence and restore
 
 A reboot kills the tmux server, **not the worktrees**. `wts` records every session
-in `${XDG_STATE_HOME:-~/.local/state}/wts/sessions.json`:
+in the `sessions` table of its state database,
+`${XDG_STATE_HOME:-~/.local/state}/wts/wts.db`:
 
-```json
-{
-  "auth-form": {
-    "profile": "feature",
-    "repo_root": "/home/me/code/myapp",
-    "worktree": "/home/me/code/myapp-worktrees/auth-form",
-    "branch": "feature/auth-form",
-    "subdir": "",
-    "context": "",
-    "prompt": "validate the email server-side before sending",
-    "created_at": "2026-09-05T15:12:41Z"
-  }
-}
 ```
+$ wts db sql "select * from sessions where name = 'auth-form'" --json
+[{"name":"auth-form","profile":"feature","repo_root":"/home/me/code/myapp",
+  "worktree":"/home/me/code/myapp-worktrees/auth-form","branch":"feature/auth-form",
+  "subdir":"","context":"","prompt":"validate the email server-side before sending",
+  "docs":"[]","created_at":"2026-09-05T15:12:41Z"}]
+```
+
+The same database holds the `wts brief` cache, the fetched documents, the stale
+guard's pane hashes and the agents' notes. It runs in WAL mode: the switcher and
+any number of agents read while one process writes, and a second writer waits its
+turn instead of overwriting the first — the lost update the old JSON file allowed.
 
 `wts restore [name...]` replays `tmuxinator start --no-attach` for every registered
 session missing from tmux whose worktree still exists — all of them without
@@ -568,6 +584,83 @@ if [[ -z "$TMUX" ]] && ! tmux has-session 2>/dev/null; then
   wts restore >/dev/null 2>&1
 fi
 ```
+
+## Agents share state: `wts db`
+
+Agents running in parallel on one repository used to be blind to each other: two
+of them could rework the same file, or one could change an API another was
+building on, and only you knew. wts already knows every session, so it shares
+that knowledge with the agents themselves.
+
+**Every agent is told, automatically.** `wts setup claude --install` adds a
+Claude Code `SessionStart` hook (user-wide, in `~/.claude/settings.json`). In a
+wts session it puts a short block at the top of the agent's context — again after
+`/clear`, `/compact` and a resume:
+
+```
+# wts: you are in session `auth-form` (branch feature/auth-form, worktree …)
+Other sessions (same repository first):
+- rate-limit (feature/rate-limit): rate-limit the public API per key — last brief: done: … / next: …
+- csv-export (feature/csv-export): export users as csv
+Latest notes left by the other agents:
+- rate-limit/api-contract (2026-09-28T09:12:03Z): /login now answers 429 with Retry-After
+Query it when your work may overlap another session's …
+  wts db sql "select name, branch, prompt from sessions" --json
+  wts db notes --all
+Leave a short note when you change something another session may depend on …
+  wts db set <key> "<one line>"
+```
+
+Anywhere else — a Claude started outside wts — the hook prints nothing. It reads
+the database only: no `git status`, no model call, about 0.1 s.
+
+**What an agent (or you) can do:**
+
+```
+wts db sql "<SELECT ...>" [--json]    read anything: sessions, briefs, notes, doc_cache...
+wts db schema                         the tables
+wts db notes [--all] [--json]         this session's notes, or everyone's
+wts db get <key>                      one note of this session
+wts db set <key> <value|->            write a note ('-' reads stdin)
+wts db del <key>
+wts db path
+```
+
+Reads cover every table. Writes cover **only `notes`**, keyed by the session the
+command runs in — found from the tmux pane (`$TMUX_PANE`), else from the worktree
+containing the working directory; `--session <name>` overrides it. `wts db sql`
+opens the database read-only and in sqlite3's safe mode (no `.shell`, no
+`ATTACH`, no `readfile`), so no query can damage the registry. `wts rm` and
+`wts gc` drop the notes of the sessions they remove.
+
+## Upgrading to 1.0
+
+1.0 moves all of wts's state from files to one SQLite database. Nothing to do by
+hand beyond upgrading, but here is what happens and how to check it.
+
+1. **Upgrade**: `brew update && brew upgrade wts` (or `git pull && make install`).
+   `wts --version` prints `wts 1.0.0`. `sqlite3` must be on the `PATH`: macOS
+   ships it.
+2. **Optional backup**: `cp -R ~/.local/state/wts ~/.local/state/wts.bak-0.x`
+   (or under your `XDG_STATE_HOME`).
+3. **Run any wts command** — `wts ls` will do. The first one imports the old state
+   into `wts.db` and says so:
+   `→ state imported into …/wts/wts.db (8 sessions; old file kept as sessions.json.migrated)`.
+   Imported: the registry (`sessions.json`) and the fetched documents
+   (`docs/*.md`). Dropped, and rebuilt on first use: the `wts brief` cache
+   (`brief/`) and the stale guard's pane hashes (`panehash/`).
+4. **Check**: `wts ls` lists the same sessions as before, and
+   `wts db sql "select count(*) from sessions"` gives their number.
+5. **Let the agents see each other**: `wts setup claude`, read it, then
+   `wts setup claude --install`. Agents already running pick it up at their next
+   `/clear`, `/compact` or restart.
+6. **Scripts** that read `sessions.json` directly: switch to `wts status --json`
+   (unchanged contract) or `wts db sql "…" --json`.
+
+**Rolling back** to 0.4.3: reinstall it, then
+`mv ~/.local/state/wts/sessions.json.migrated ~/.local/state/wts/sessions.json`.
+Sessions created under 1.0 are missing from that file (their worktrees and
+branches are untouched; `wts <name>` in the repository registers one again).
 
 ## Layouts
 

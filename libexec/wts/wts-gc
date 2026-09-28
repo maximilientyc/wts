@@ -77,7 +77,7 @@ repo_name=$(basename "$repo_root")
 parent=$(dirname "$repo_root")
 worktree_base="${WTS_WORKTREES_BASE:-${parent}/${repo_name}-worktrees}"
 
-WTS_STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/wts/sessions.json"
+source "${0:A:h}/wts-db.zsh"
 
 # Base branch (same priority order as the wrapper).
 base="${WTS_BASE_BRANCH:-}"
@@ -349,10 +349,8 @@ is_new_branch() {
 # Registered session for a given worktree (empty if unknown).
 session_for_worktree() {
   local w="$1"
-  [[ -s "$WTS_STATE_FILE" ]] || return 0
-  command -v jq >/dev/null 2>&1 || return 0
-  jq -r --arg w "$w" 'to_entries[] | select(.value.worktree == $w) | .key' \
-    "$WTS_STATE_FILE" 2>/dev/null | head -1
+  db_available || return 0
+  db_ro "SELECT name FROM sessions WHERE worktree = $(sql_str "$w") LIMIT 1" 2>/dev/null
 }
 
 # Busy agents, by worktree: the agent state comes from wts-status, the single
@@ -506,11 +504,11 @@ print ""
 # ─── 5. Orphan registry entries ──────────────────────────────────────────────
 typeset -a orphans
 orphans=()
-if [[ -s "$WTS_STATE_FILE" ]] && command -v jq >/dev/null 2>&1; then
-  while IFS= read -r n && IFS= read -r w; do
+if db_available; then
+  while IFS=$'\x1f' read -r -d $'\x1e' n w; do
     [[ -n "$n" ]] || continue
     [[ -d "$w" ]] || orphans+=("$n")
-  done < <(jq -r 'to_entries[] | [.key, (.value.worktree // "")] | .[]' "$WTS_STATE_FILE" 2>/dev/null)
+  done < <(db_rows "SELECT name, worktree FROM sessions" 2>/dev/null)
 fi
 
 # The entries attached to the worktrees removed in 2. are not orphans at scan
@@ -687,14 +685,18 @@ for rec in "${stale_locks[@]}"; do
 done
 
 purge=("${(@u)purge}")
-if (( ${#purge} )) && [[ -s "$WTS_STATE_FILE" ]] && command -v jq >/dev/null 2>&1; then
-  tmp="${WTS_STATE_FILE}.tmp.$$"
-  if jq --argjson names "$(printf '%s\n' "${purge[@]}" | jq -R . | jq -sc .)" \
-       'delpaths([$names[] | [.]])' "$WTS_STATE_FILE" > "$tmp" 2>/dev/null; then
-    mv "$tmp" "$WTS_STATE_FILE"
-    print "✓ registry: ${#purge} entry(ies) removed"
+# The rows the other tables keep about a session go with it; so do those of
+# sessions removed some other way, and pane hashes no agent has refreshed in a
+# week (Claude session ids are never reused).
+if db_available && [[ -s "$WTS_DB" ]]; then
+  if db_q "BEGIN IMMEDIATE;
+           DELETE FROM sessions WHERE name IN $(sql_list "${purge[@]}");
+           DELETE FROM briefs WHERE session NOT IN (SELECT name FROM sessions);
+           DELETE FROM notes WHERE session NOT IN (SELECT name FROM sessions);
+           DELETE FROM pane_hashes WHERE since < unixepoch() - 7 * 86400;
+           COMMIT;" >/dev/null 2>&1; then
+    (( ${#purge} )) && print "✓ registry: ${#purge} entry(ies) removed"
   else
-    rm -f "$tmp"
     print -u2 "⚠ registry not updated"
   fi
 fi

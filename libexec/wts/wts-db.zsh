@@ -1,0 +1,246 @@
+# wts-db.zsh — the state database, sourced by bin/wts and every helper.
+#
+# All wts state lives in one SQLite file, ${XDG_STATE_HOME:-~/.local/state}/wts/wts.db:
+#   sessions     the registry (what `wts ls` lists and `wts restore` restarts)
+#   briefs       wts-brief's cache (key line + done/next)
+#   pane_hashes  wts-status's stale watchdog (pane hash, since when)
+#   doc_cache    wts-doc's fetched documents
+#   kv           small caches (wts-doc's connector list)
+#   notes        what the Claude agents leave for each other (`wts db set`)
+#
+# Why a database: the registry used to be one JSON file rewritten whole with
+# `jq … > tmp && mv` by bin/wts, wts-gc and wts-doc. Two writers at once lost one
+# update, and there was no safe way to let every agent write too. WAL mode lets
+# the switcher and any number of agents read while one process writes, and
+# `.timeout` makes a second writer wait instead of failing "database is locked".
+#
+# Sourced, not executed: the switcher is on a hot path and a zsh fork per read
+# would show. The caller sets nothing; everything here is derived from XDG.
+
+WTS_STATE_DIR="${WTS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wts}"
+WTS_DB="${WTS_DB:-$WTS_STATE_DIR/wts.db}"
+WTS_DB_SCHEMA=1
+
+db_available() {
+  (( ${+commands[sqlite3]} ))
+}
+
+# `-init /dev/null`: a user's ~/.sqliterc (`.mode box`, `.headers on`) would
+# change every output this file parses.
+_db() {
+  sqlite3 -init /dev/null -batch -bail -cmd '.timeout 5000' "$@"
+}
+
+# db_q <sql> — read-write. db_ro <sql> — read-only, and silent without a
+# database: a reader never creates one.
+db_q() {
+  _db "$WTS_DB" "$@"
+}
+
+db_ro() {
+  _db_exists || return 0
+  _db -readonly "$WTS_DB" "$@"
+}
+
+# Whether there is a database to read. The first command after an upgrade may
+# well be a reader (`wts pr`, the switcher): it imports the old files then,
+# rather than reporting an empty registry until some writer happens to run.
+_db_exists() {
+  [[ -s "$WTS_DB" ]] && return 0
+  [[ -e "$WTS_STATE_DIR/sessions.json" ]] && db_init 2>/dev/null
+  [[ -s "$WTS_DB" ]]
+}
+
+# db_rows <sql> — read-only, fields separated by \x1f and rows ended by \x1e:
+# prompts are free text, so neither TAB nor newline can delimit. Read with
+#   while IFS=$'\x1f' read -r -d $'\x1e' a b c; do …; done < <(db_rows …)
+db_rows() {
+  _db_exists || return 0
+  _db -readonly -ascii "$WTS_DB" "$@"
+}
+
+# A SQL string literal. SQLite has no backslash escapes, so doubling the single
+# quote is the whole job. Not `.param set`: its value is itself parsed as SQL.
+sql_str() {
+  local q="'"
+  print -r -- "$q${1//$q/$q$q}$q"
+}
+
+# A parenthesized list of literals, for `IN`: sql_list a b c -> ('a','b','c').
+sql_list() {
+  local v out=""
+  for v in "$@"; do out+="${out:+,}$(sql_str "$v")"; done
+  print -r -- "(${out:-NULL})"
+}
+
+# Create the schema and import the pre-1.0 files, once. Fast path: a database
+# already at WTS_DB_SCHEMA costs one sqlite3 call.
+db_init() {
+  db_available || return 1
+  [[ -n "${_WTS_DB_READY:-}" ]] && return 0
+  if [[ -s "$WTS_DB" && "$(db_q 'PRAGMA user_version' 2>/dev/null)" == "$WTS_DB_SCHEMA" ]]; then
+    _WTS_DB_READY=1
+    return 0
+  fi
+  mkdir -p "$WTS_STATE_DIR" 2>/dev/null || return 1
+  # Persistent: every later connection opens in WAL. Outside the transaction,
+  # SQLite refuses to change the journal mode inside one.
+  db_q 'PRAGMA journal_mode=WAL' >/dev/null 2>&1
+
+  local old="$WTS_STATE_DIR/sessions.json" docdir="$WTS_STATE_DIR/docs"
+  local sql f slug imports=""
+  # The import rides in the schema transaction: two first runs at once, one
+  # waits on BEGIN IMMEDIATE, and INSERT OR IGNORE makes its own import a no-op.
+  if [[ -s "$old" ]]; then
+    # A corrupt file must not block the upgrade: it imports nothing and stays
+    # there, renamed like a good one, for the user to inspect.
+    imports+="
+INSERT OR IGNORE INTO sessions
+  SELECT key,
+         coalesce(json_extract(value, '\$.profile'), ''),
+         coalesce(json_extract(value, '\$.repo_root'), ''),
+         coalesce(json_extract(value, '\$.worktree'), ''),
+         coalesce(json_extract(value, '\$.branch'), ''),
+         coalesce(json_extract(value, '\$.subdir'), ''),
+         coalesce(json_extract(value, '\$.context'), ''),
+         coalesce(json_extract(value, '\$.prompt'), ''),
+         coalesce(json_extract(value, '\$.docs'), '[]'),
+         coalesce(json_extract(value, '\$.created_at'),
+                  strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+  FROM json_each(CASE WHEN json_valid(readfile($(sql_str "$old")))
+                      THEN readfile($(sql_str "$old")) ELSE '{}' END)
+  WHERE json_type(value) = 'object';"
+  fi
+  # Fetched documents cost an MCP round trip each: worth carrying over. The
+  # brief and pane-hash caches are not: they rebuild on the next run.
+  for f in "$docdir"/*.json(N); do
+    slug="${f:t:r}"
+    [[ "$slug" == tools ]] && continue
+    imports+="
+INSERT OR IGNORE INTO doc_cache
+  SELECT $(sql_str "$slug"), readfile($(sql_str "$docdir/$slug.md")),
+         json_extract(m, '\$.fetched_at'), json_extract(m, '\$.bytes'),
+         coalesce(json_extract(m, '\$.title'), ''), json_extract(m, '\$.ok'),
+         coalesce(json_extract(m, '\$.error'), ''), json_extract(m, '\$.truncated')
+  FROM (SELECT readfile($(sql_str "$f")) AS m) WHERE json_valid(m);"
+  done
+
+  sql="BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS sessions (
+  name       TEXT PRIMARY KEY,
+  profile    TEXT NOT NULL DEFAULT '',
+  repo_root  TEXT NOT NULL DEFAULT '',
+  worktree   TEXT NOT NULL DEFAULT '',
+  branch     TEXT NOT NULL DEFAULT '',
+  subdir     TEXT NOT NULL DEFAULT '',
+  context    TEXT NOT NULL DEFAULT '',
+  prompt     TEXT NOT NULL DEFAULT '',
+  docs       TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS briefs (
+  session    TEXT PRIMARY KEY,
+  key        TEXT NOT NULL,
+  body       TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pane_hashes (
+  agent_session TEXT PRIMARY KEY,
+  hash          TEXT NOT NULL,
+  since         INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS doc_cache (
+  slug       TEXT PRIMARY KEY,
+  body       TEXT,
+  fetched_at INTEGER,
+  bytes      INTEGER NOT NULL DEFAULT 0,
+  title      TEXT NOT NULL DEFAULT '',
+  ok         INTEGER NOT NULL DEFAULT 0,
+  error      TEXT NOT NULL DEFAULT '',
+  truncated  INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS kv (
+  key   TEXT PRIMARY KEY,
+  value TEXT
+);
+CREATE TABLE IF NOT EXISTS notes (
+  session    TEXT NOT NULL,
+  key        TEXT NOT NULL,
+  value      TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (session, key)
+);
+CREATE INDEX IF NOT EXISTS notes_by_time ON notes(updated_at);
+$imports
+PRAGMA user_version = $WTS_DB_SCHEMA;
+COMMIT;"
+  if ! print -r -- "$sql" | db_q >/dev/null; then
+    print -u2 -r -- "⚠ wts: could not initialize $WTS_DB"
+    return 1
+  fi
+  chmod 600 "$WTS_DB" 2>/dev/null
+
+  if [[ -e "$old" ]]; then
+    mv -f "$old" "$old.migrated" 2>/dev/null
+    print -u2 -r -- "→ state imported into $WTS_DB ($(db_q 'SELECT count(*) FROM sessions') sessions; old file kept as sessions.json.migrated)"
+  fi
+  rm -rf "$WTS_STATE_DIR/brief" "$WTS_STATE_DIR/panehash" 2>/dev/null
+  rm -f "$docdir"/*.{md,json}(N) "$docdir"/.*(N) "$WTS_STATE_DIR"/sessions.json.tmp.*(N) 2>/dev/null
+  rmdir "$docdir" 2>/dev/null
+  _WTS_DB_READY=1
+  return 0
+}
+
+# The registry as one JSON object, in the exact shape of the pre-1.0
+# sessions.json ({name: {profile, repo_root, …, docs: [...]}}): the jq readers
+# kept their filters, only their input changed.
+registry_json() {
+  local out
+  out=$(db_ro "SELECT json_group_object(name, json_object(
+      'profile', profile, 'repo_root', repo_root, 'worktree', worktree,
+      'branch', branch, 'subdir', subdir, 'context', context, 'prompt', prompt,
+      'docs', json(docs), 'created_at', created_at))
+    FROM (SELECT * FROM sessions ORDER BY name)" 2>/dev/null)
+  [[ -n "$out" ]] || out='{}'
+  print -r -- "$out"
+}
+
+db_has_session() {  # <name>
+  [[ "$(db_ro "SELECT 1 FROM sessions WHERE name = $(sql_str "$1")" 2>/dev/null)" == 1 ]]
+}
+
+db_session_field() {  # <name> <column>
+  db_ro "SELECT $2 FROM sessions WHERE name = $(sql_str "$1")" 2>/dev/null
+}
+
+# The wts session the caller runs in, or failure. For `wts db` and the Claude
+# SessionStart hook, both run from an agent's pane:
+#  1. the pane's own session, through $TMUX_PANE. Not a bare `display-message
+#     -p '#S'`: that names the most recently used session, not this one;
+#  2. otherwise the registered worktree that contains the working directory,
+#     the deepest one (a worktree may sit inside another's directory).
+# Only a registered session counts: notes are keyed by it, and gc drops the
+# rows of sessions that no longer exist.
+db_current_session() {
+  local s=""
+  if [[ -n "${TMUX:-}" && -n "${TMUX_PANE:-}" ]]; then
+    s=$(tmux display-message -p -t "$TMUX_PANE" '#S' 2>/dev/null)
+    if [[ -n "$s" ]] && db_has_session "$s"; then
+      print -r -- "$s"
+      return 0
+    fi
+  fi
+  local d
+  for d in "$PWD" "${PWD:A}"; do
+    s=$(db_ro "SELECT name FROM sessions
+               WHERE worktree != '' AND (
+                 $(sql_str "$d") = worktree
+                 OR substr($(sql_str "$d/"), 1, length(worktree) + 1) = worktree || '/')
+               ORDER BY length(worktree) DESC LIMIT 1" 2>/dev/null)
+    if [[ -n "$s" ]]; then
+      print -r -- "$s"
+      return 0
+    fi
+  done
+  return 1
+}
