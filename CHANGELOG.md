@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.3.0 — 2026-09-28
 
 - **`ctrl-t` in the switcher creates a task.** It used to only pull one in from
   Things, and was not bound at all without Things: a task could be created only
