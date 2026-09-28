@@ -87,7 +87,7 @@
 
 set -euo pipefail
 
-WTS_VERSION="1.4.0"
+WTS_VERSION="1.4.1"
 
 # ─── Install layout ──────────────────────────────────────────────────────────
 # Homebrew, `make install` and a git checkout all share the same tree:
@@ -173,7 +173,25 @@ registry_prune() {
     [[ -n "$name" ]] || continue
     [[ -d "$worktree" ]] || stale+=("$name")
   done < <(db_rows "SELECT name, worktree FROM sessions" 2>/dev/null)
-  (( ${#stale} )) && registry_del "${stale[@]}"
+  (( ${#stale} )) || return 0
+  # Archived first. A worktree removed by hand — `rm -rf`, a `git worktree
+  # remove` typed directly — took the registry row, the notes and the task link
+  # with it on the next `wts ls`, silently: the one teardown `wts log` never
+  # heard of. There is no folder left to collect git facts from, so the record
+  # carries what the registry knows, under the outcome `unknown`.
+  if [[ -z "${WTS_NO_ARCHIVE:-}" && -x "$WTS_LIBEXEC/wts-retro" ]]; then
+    local -a rec
+    # base outcome pr title commits files added removed commit_count file_count
+    # transcript session_id bytes mtime — the record `wts-retro collect` writes.
+    rec=("" unknown "" "" "" "" 0 0 0 0 "" "" 0 0)
+    for name in "${stale[@]}"; do
+      if print -rn -- "${(pj:\x1f:)rec}"$'\x1e' \
+         | "$WTS_LIBEXEC/wts-retro" store "$name" 2>/dev/null; then
+        print -u2 -r -- "→ $name: worktree gone, archived (wts log)"
+      fi
+    done
+  fi
+  registry_del "${stale[@]}"
   return 0
 }
 
@@ -186,6 +204,20 @@ registry_has() {
 # ".": `repo__worktrees` is stored under `repo--worktrees`.
 claude_project_dir() {
   print -r -- "$CLAUDE_DIR/projects/${1//[^a-zA-Z0-9]/-}"
+}
+
+# Main worktree of the repository holding <path>: the first entry of `worktree
+# list`, by definition. `git rev-parse --show-toplevel` answers with the CURRENT
+# worktree, so run from inside a wts session (the layout's shell window, the
+# switcher popup) it named the agent's worktree, and the base derived from it
+# (`<worktree>-worktrees/`) nested the next session where gc never looks — or,
+# for `wts rm`, pointed at a folder that does not exist while the registry row
+# was dropped all the same. wts-fresh had this hop; every path has it now.
+main_worktree_of() {  # <path inside a repository>
+  local main
+  main=$(git -C "$1" worktree list --porcelain 2>/dev/null \
+         | awk '/^worktree /{ print substr($0, 10); exit }')
+  print -r -- "${main:-$1}"
 }
 
 # Attach to a session. `tmux attach` refuses to nest sessions when $TMUX is
@@ -204,6 +236,12 @@ attach_or_switch() {
 # cost a round trip of `wts ls` and retyping.
 registry_resolve_name() {
   local want="$1"
+  # The substring match below accepts every session for an empty name and
+  # offered them all in a picker — to `wts rm`.
+  if [[ -z "$want" ]]; then
+    print -u2 "wts: empty session name"
+    return 1
+  fi
   registry_available || { print -r -- "$want"; return 0 }
   [[ -s "$WTS_DB" ]] || { print -r -- "$want"; return 0 }
 
@@ -458,6 +496,11 @@ if [[ "$1" == "setup" ]]; then
 // notes the agents left, and how to use \`wts db\`. Anywhere else it prints
 // nothing. It reads the wts database (no git status, no model call).
 //
+// The permissions let an agent run what the hook asks of it without a prompt:
+// the shared notes (\`wts db\`, read anything, write its own notes only), its
+// task's notes, and the live agent states. Without them the first thing every
+// agent did was wait, blocked, for you to allow \`wts db notes --all\`.
+//
 // Merge into $claude_settings, or let wts do it (backup kept):
 //   wts setup claude --install
 {
@@ -465,6 +508,9 @@ if [[ "$1" == "setup" ]]; then
     "SessionStart": [
       { "hooks": [ { "type": "command", "command": "$hook_cmd", "timeout": 5 } ] }
     ]
+  },
+  "permissions": {
+    "allow": [ "Bash(wts db:*)", "Bash(wts task note:*)", "Bash(wts task show:*)", "Bash(wts status:*)" ]
   }
 }
 EOF
@@ -476,15 +522,21 @@ EOF
     cp "$claude_settings" "$claude_settings.bak"
     # Idempotent: any earlier wts-context entry (an older install path
     # included) is dropped before the current one is added; other hooks stay.
+    # The allow rules are appended once each, in the user's own order.
     if jq --arg cmd "$hook_cmd" '
          .hooks.SessionStart = (
            [ (.hooks.SessionStart // [])[]
              | .hooks = [ (.hooks // [])[] | select((.command // "") | endswith("/wts-context") | not) ]
              | select((.hooks | length) > 0) ]
-           + [ { hooks: [ { type: "command", command: $cmd, timeout: 5 } ] } ])' \
+           + [ { hooks: [ { type: "command", command: $cmd, timeout: 5 } ] } ])
+         | (.permissions.allow // []) as $cur
+         | .permissions.allow = $cur + (
+             ["Bash(wts db:*)", "Bash(wts task note:*)", "Bash(wts task show:*)", "Bash(wts status:*)"]
+             | map(select(. as $r | $cur | index($r) | not)))' \
          "$claude_settings.bak" > "$claude_settings.tmp.$$"; then
       mv "$claude_settings.tmp.$$" "$claude_settings"
       echo "→ SessionStart hook installed in $claude_settings (backup: settings.json.bak)"
+      echo "   permissions.allow: wts db, wts task note, wts task show, wts status (no prompt for what the hook asks)"
       echo "   new Claude sessions pick it up; running ones on their next /clear or /compact"
     else
       rm -f "$claude_settings.tmp.$$"
@@ -822,23 +874,92 @@ if [[ "$1" == "rm" ]]; then
 
   # Session/worktree name: slashes sanitized (e.g. team/foo → team-foo)
   SESSION="${NAME//\//-}"
+  if [[ -z "$SESSION" ]]; then
+    echo "wts: empty session name" >&2
+    exit 1
+  fi
 
-  # Typo tolerance, through the registry.
-  if resolved=$(registry_resolve_name "$SESSION"); then
-    SESSION="$resolved"
+  # Typo tolerance, but never on trust. The resolver matches substrings both
+  # ways, so `wts rm api-v2` with no such session landed on `api` — and `-f`
+  # force-removed it, with one line on stderr for all warning. An exact registry
+  # name goes through; a guess is shown and confirmed, and refused outright when
+  # nobody is there to confirm it (the switcher, a script).
+  if ! registry_has "$SESSION"; then
+    if resolved=$(registry_resolve_name "$SESSION"); then
+      if [[ "$resolved" != "$SESSION" ]]; then
+        if [[ -t 0 && -t 2 ]]; then
+          if ! read -q "?Remove '$resolved' (matched from '$SESSION')? [y/N] "; then
+            print -u2
+            exit 1
+          fi
+          print -u2
+        else
+          echo "wts: no session '$SESSION' — did you mean '$resolved'? (rm takes the exact name when not interactive)" >&2
+          exit 1
+        fi
+        SESSION="$resolved"
+      fi
+    else
+      exit 1
+    fi
+  fi
+
+  # Never the current session: killing it detaches this client and, from the
+  # switcher, closes the popup in the middle of the teardown. Same rule as
+  # `wts stop` and gc. #S is only meaningful under $TMUX.
+  if [[ -n "${TMUX:-}" && "$(tmux display-message -p '#S' 2>/dev/null)" == "$SESSION" ]]; then
+    echo "wts: '$SESSION' is the current session, not removed (switch away first)" >&2
+    exit 1
+  fi
+
+  # Where the worktree is: the registry knows, the current directory does not.
+  # `--show-toplevel` from inside a worktree named that worktree, and the path
+  # derived from it (`<worktree>-worktrees/<name>`) existed nowhere: the tmux
+  # session was killed, "no worktree" printed, and the registry row dropped —
+  # the real worktree and its branch left behind, unlisted. A session of
+  # another repository (the switcher lists them all) went the same way. Only a
+  # name the registry never saw falls back to the repository at hand.
+  REG_BRANCH=""
+  if registry_has "$SESSION"; then
+    worktree_path=$(db_session_field "$SESSION" worktree)
+    repo_root=$(db_session_field "$SESSION" repo_root)
+    REG_BRANCH=$(db_session_field "$SESSION" branch)
+    # The recorded root may itself be a worktree (a session created from inside
+    # another one), possibly gone since: git is asked from whichever of the two
+    # still exists, and every git call below runs from the main worktree.
+    if [[ -d "$worktree_path" ]]; then
+      repo_root=$(main_worktree_of "$worktree_path")
+    elif [[ -d "$repo_root" ]]; then
+      repo_root=$(main_worktree_of "$repo_root")
+    fi
   else
+    if ! git rev-parse --git-dir >/dev/null 2>&1; then
+      echo "wts: '$SESSION' is not a registered session, and $PWD is not a git repository" >&2
+      exit 1
+    fi
+    repo_root=$(main_worktree_of "$(git rev-parse --show-toplevel)")
+    repo_name=$(basename "$repo_root")
+    worktree_base="${WTS_WORKTREES_BASE:-$(dirname "$repo_root")/${repo_name}-worktrees}"
+    worktree_path="${worktree_base:A}/${SESSION}"
+  fi
+
+  if ! registry_has "$SESSION" && [[ ! -d "$worktree_path" ]] \
+     && ! tmux has-session -t "=$SESSION" 2>/dev/null; then
+    echo "wts: no session, worktree or registry entry named '$SESSION'" >&2
     exit 1
   fi
 
-  if ! git rev-parse --git-dir >/dev/null 2>&1; then
-    echo "wts: not a git repository" >&2
-    exit 1
+  # Before anything is killed: `git worktree remove` refuses a worktree with
+  # changes, and learning that once the agent's session was gone left it dead
+  # with its work half torn down. -f is the caller saying the changes go.
+  if [[ -d "$worktree_path" && "$FORCE" != true ]]; then
+    dirty=$(git -C "$worktree_path" --no-optional-locks status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    if (( ${dirty:-0} > 0 )); then
+      echo "wts: $worktree_path has ${dirty} modified or untracked file(s)" >&2
+      echo "     commit or stash them, or: wts rm $SESSION -f" >&2
+      exit 1
+    fi
   fi
-
-  repo_root=$(git rev-parse --show-toplevel)
-  repo_name=$(basename "$repo_root")
-  worktree_base="${WTS_WORKTREES_BASE:-$(dirname "$repo_root")/${repo_name}-worktrees}"
-  worktree_path="${worktree_base}/${SESSION}"
 
   # 1. Kill the tmux session
   if tmux has-session -t "=$SESSION" 2>/dev/null; then
@@ -891,19 +1012,33 @@ if [[ "$1" == "rm" ]]; then
 
     # Deleting a 150k-file worktree takes git ten seconds, silently.
     echo "→ removing worktree $worktree_path…"
+    wt_status=0
     if [[ "$FORCE" == true ]]; then
-      git -C "$repo_root" worktree remove --force "$worktree_path"
+      git -C "$repo_root" worktree remove --force "$worktree_path" || wt_status=$?
     else
-      git -C "$repo_root" worktree remove "$worktree_path"
+      git -C "$repo_root" worktree remove "$worktree_path" || wt_status=$?
+    fi
+    if (( wt_status != 0 )); then
+      # git has said why on stderr (submodules, a lock). The registry row stays:
+      # the session is gone, `wts restore` brings it back on this worktree.
+      echo "⚠ worktree $worktree_path not removed — registry kept, wts restore $SESSION restarts the session" >&2
+      [[ -n "${RETRO_FACTS:-}" ]] && rm -f "$RETRO_FACTS"
+      exit 1
     fi
     echo "→ worktree $worktree_path removed"
   else
     echo "→ no worktree $worktree_path"
-    BRANCH=""
+    # The branch the registry recorded: a worktree deleted by hand leaves a
+    # prunable entry in git and a branch nobody else will clean up. Deleted
+    # under the same rules as below (-d unless -f), so unmerged work is refused.
+    BRANCH="$REG_BRANCH"
+    if [[ -d "$repo_root" ]]; then
+      git -C "$repo_root" worktree prune 2>/dev/null || true
+    fi
   fi
 
   # 3. Delete the branch
-  if [[ -n "$BRANCH" && "$BRANCH" != "HEAD" ]]; then
+  if [[ -n "$BRANCH" && "$BRANCH" != "HEAD" && -d "$repo_root" ]]; then
     if [[ "$FORCE" == true ]]; then
       git -C "$repo_root" branch -D "$BRANCH" 2>/dev/null && \
         echo "→ branch $BRANCH deleted" || \
@@ -1326,9 +1461,17 @@ if ! git rev-parse --git-dir >/dev/null 2>&1; then
   exit 1
 fi
 
-repo_root=$(git rev-parse --show-toplevel)
+repo_root=$(main_worktree_of "$(git rev-parse --show-toplevel)")
+if [[ "$repo_root" != "$(git rev-parse --show-toplevel)" ]]; then
+  echo "→ launched from a worktree, creating from $repo_root"
+fi
 repo_name=$(basename "$repo_root")
 worktree_base="${WTS_WORKTREES_BASE:-$(dirname "$repo_root")/${repo_name}-worktrees}"
+# Canonical: a WTS_WORKTREES_BASE with a trailing slash, or through a symlink,
+# stored a path the collectors then compared as a string with git's canonical
+# one and never matched — the agent column showed `-`, and gc's busy guard did
+# not know an agent was there.
+worktree_base="${worktree_base:A}"
 
 # ─── Base branch ─────────────────────────────────────────────────────────────
 # Priority: $WTS_BASE_BRANCH > origin/HEAD > main > master > current HEAD
@@ -1530,6 +1673,26 @@ BRANCH=$(branch_for "$NAME")
 # Session/worktree name: slashes sanitized (branches like team/foo → team-foo)
 SESSION="${NAME//\//-}"
 worktree_path="${worktree_base}/${SESSION}"
+
+# A name the registry holds for ANOTHER repository is refused, whoever typed
+# it: the row is keyed on the name alone, so registry_put would overwrite the
+# other session's paths, and the "already running, attaching" branch below
+# would then attach to ITS tmux session — nothing started here, and the other
+# worktree gone from the registry. Session names are global to the tmux
+# server. Compared on git's common directory, not on repo_root: a session
+# created from inside another worktree used to record that worktree as its root.
+if registry_has "$SESSION"; then
+  other_root=$(db_session_field "$SESSION" repo_root)
+  if [[ -n "$other_root" && -d "$other_root" ]]; then
+    other_common=$(git -C "$other_root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+    this_common=$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+    if [[ -n "$other_common" && -n "$this_common" && "${other_common:A}" != "${this_common:A}" ]]; then
+      echo "wts: '$SESSION' is already a session of $other_root" >&2
+      echo "     session names are global to the tmux server: pick another one, e.g. ${repo_name}-${SESSION}" >&2
+      exit 1
+    fi
+  fi
+fi
 
 mkdir -p "$worktree_base"
 

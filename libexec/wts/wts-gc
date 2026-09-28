@@ -361,7 +361,10 @@ is_new_branch() {
 session_for_worktree() {
   local w="$1"
   db_available || return 0
-  db_ro "SELECT name FROM sessions WHERE worktree = $(sql_str "$w") LIMIT 1" 2>/dev/null
+  # git hands over the canonical path; the registry may hold the one wts was
+  # given (trailing slash, symlink). Either spelling names the session.
+  db_ro "SELECT name FROM sessions
+         WHERE worktree IN ($(sql_str "$w"), $(sql_str "${w:A}")) LIMIT 1" 2>/dev/null
 }
 
 # gc's own verdict on a branch, mapped to the archive's closed vocabulary
@@ -391,8 +394,11 @@ outcome_of() {
 # for this reason: the other safeguards still apply.
 typeset -A busy_wt
 if [[ -x "${0:A:h}/wts-status" ]] && command -v jq >/dev/null 2>&1; then
+  # Keyed by both spellings of the path, looked up with git's canonical one:
+  # a registry path with a trailing slash or through a symlink never matched,
+  # and a merged branch was torn down under an agent still working on it.
   while IFS=$'\x1f' read -r w st; do
-    [[ -n "$w" ]] && busy_wt[$w]="$st"
+    [[ -n "$w" ]] && busy_wt[$w]="$st" && busy_wt[${w:A}]="$st"
   done < <("${0:A:h}/wts-status" --json 2>/dev/null | jq -r '
     .[]? | select(.stale == true or .agent_state == "working" or .agent_state == "blocked")
     | "\(.worktree)\(if .stale == true then "stuck?" else .agent_state end)"' 2>/dev/null)

@@ -98,8 +98,12 @@ if [[ -n "${my_task:-}" ]]; then
       [[ -n "$task_link" ]] && print -r -- "  $task_link"
     done
   fi
-  print -r -- "Other sessions may serve the same task: \`wts task show\` lists them."
-  print -r -- "Add to it as you learn: \`wts task note \"<what you found>\"\` — it outlives this session."
+  # With the id, always: `wts task show` alone resolves the task through the
+  # Things picker — a read of Things' container and an fzf with no terminal —
+  # and this line is run by an agent, which may not open Things (CLAUDE.md).
+  # `$wts`, not `wts`: the agent's Bash tool may not have it on its PATH.
+  print -r -- "Other sessions may serve the same task: \`$wts task show ${my_task_id:-<id>}\` lists them."
+  print -r -- "Add to it as you learn: \`$wts task note \"<what you found>\"\` — it outlives this session."
   print -r -- ""
 fi
 print -r -- "This machine runs several Claude Code agents in parallel, one per wts session"

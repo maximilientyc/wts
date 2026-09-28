@@ -318,7 +318,15 @@ sessions_of() {  # <task-id>
 
 cmd_show() {
   local id
-  id=$(resolve_task "${1:-}") || return 1
+  # Inside a wts session, no id means this session's task — as for note, edit
+  # and doc. The picker, and its read of Things, is for a human at a terminal
+  # outside any session; an agent told `wts task show` by the SessionStart hook
+  # must never land there.
+  if [[ -z "${1:-}" ]] && id=$(current_task 2>/dev/null) && [[ -n "$id" ]]; then
+    :
+  else
+    id=$(resolve_task "${1:-}") || return 1
+  fi
   [[ -n "$id" ]] || return 1
   db_init 2>/dev/null
   # Only when an id was given: with none, resolve_task went through the picker
@@ -368,6 +376,10 @@ cmd_show() {
     print -r -- "    $name ($state, $outcome)${pr:+  $pr}"
     [[ -n "$retro" ]] && print -r -- "      delivered: $retro"
   done < <(sessions_of "$id")
+  # The loop's status is its last body command's: `[[ -n "$retro" ]] && …` is 1
+  # for a session without a retrospective yet, and `wts task show` exited 1 on
+  # every successful listing that ended on one.
+  return 0
 }
 
 # ─── link / unlink ───────────────────────────────────────────────────────────

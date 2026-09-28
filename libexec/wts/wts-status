@@ -232,9 +232,14 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
   agent_session=null; agent_pane=null; stale=false
   raw=""; sid=""
 
+  # Both spellings of the path: the registry keeps what wts was given (a
+  # WTS_WORKTREES_BASE with a trailing slash, a symlinked folder, /tmp) and the
+  # agent reports the canonical one. Compared as strings only, the agent never
+  # matched — `-` in the column, and gc did not know a worker was there.
   IFS=$'\x1f' read -r raw agent_waiting agent_name agent_session sid < <(
-    print -r -- "$agents_json" | jq -r --arg wt "$worktree" '
-      map(select(.cwd == $wt or (.cwd | startswith($wt + "/")))) | first
+    print -r -- "$agents_json" | jq -r --arg wt "$worktree" --arg wta "${worktree:A}" '
+      map(select(.cwd == $wt or (.cwd | startswith($wt + "/"))
+                 or .cwd == $wta or (.cwd | startswith($wta + "/")))) | first
       | if . == null then empty else
           [ ((.state // .status // "") | ascii_downcase),
             (.waitingFor // null | tojson),

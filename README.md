@@ -143,13 +143,18 @@ wts fix-ABC123 sentry ABC123           # "ABC123" reaches the layout as $WTS_CON
 wts new cors rate-limit csv-export     # three worktrees and sessions at once
 wts review/login-flow                  # an existing origin branch: checked out for review
 wts auth-form "rate-limit it" --doc api-spec   # with a context document attached
-wts rm auth-frm -f                     # typo-tolerant: resolves to auth-form
+wts rm auth-frm -f                     # typo-tolerant: proposes auth-form, asks y/N
 ```
 
 Slashes become `-` in the worktree folder and session name (`review/login-flow` →
 `review-login-flow`); the git branch keeps its full name. `wts rm`, `wts stop` and `wts brief`
 tolerate typos: substring match, then fzf fuzzy match, then edit distance; when
-several sessions match, an fzf picker opens.
+several sessions match, an fzf picker opens. `wts rm` never acts on a guess: an
+exact name goes through, a resolved one is shown and confirmed, and without a
+terminal to ask (a script, the switcher) it is refused. `wts rm` also refuses a
+worktree with uncommitted changes unless `-f`, and the current session — and it
+finds the session's worktree and repository through the registry, so it works
+from any directory, on a session of any repository.
 
 ### Branch resolution
 
@@ -264,7 +269,8 @@ unfolds the whole table — the tmux bindings included, since those are the ones
 you cannot press from inside the popup. `enter` switches, `ctrl-x`
 kills the selected tmux session (`wts stop`, after a y/N prompt: the worktree, the
 branch and the registry entry stay, the popup stays open and the row reads
-`stopped`), `ctrl-d` removes it entirely (`wts rm`), `ctrl-o` opens the branch's
+`stopped`), `ctrl-d` removes it entirely (`wts rm`, after a y/N prompt that names
+the session and its agent state), `ctrl-o` opens the branch's
 pull request on GitHub (`wts pr`, through `gh pr view --web`: without a PR the popup
 says so and stays open; without `gh` the key is neither bound nor listed),
 `ctrl-e` attaches a [context document](#context-documents-wts-doc) to the session
@@ -724,7 +730,8 @@ turn instead of overwriting the first — the lost update the old JSON file allo
 `wts restore [name...]` replays `tmuxinator start --no-attach` for every registered
 session missing from tmux whose worktree still exists — all of them without
 arguments. It never attaches: restoring eight sessions should not steal your
-terminal. `wts ls` purges entries whose worktree is gone. This is a **declarative
+terminal. `wts ls` purges entries whose worktree is gone, after archiving what
+the registry knew about them (outcome `unknown` in `wts log`). This is a **declarative
 replay**, not a snapshot like tmux-resurrect: a wts session is fully described by
 its name, layout and context, so replaying the layout is more faithful.
 
@@ -768,9 +775,12 @@ building on, and only you knew. wts already knows every session, so it shares
 that knowledge with the agents themselves.
 
 **Every agent is told, automatically.** `wts setup claude --install` adds a
-Claude Code `SessionStart` hook (user-wide, in `~/.claude/settings.json`). In a
-wts session it puts a short block at the top of the agent's context — again after
-`/clear`, `/compact` and a resume:
+Claude Code `SessionStart` hook (user-wide, in `~/.claude/settings.json`), and
+the permissions the block below asks the agent to use — `Bash(wts db:*)`,
+`wts task note`, `wts task show`, `wts status` — so no agent starts its work
+blocked on a prompt to allow `wts db notes --all`. In a wts session the hook
+puts a short block at the top of the agent's context — again after `/clear`,
+`/compact` and a resume:
 
 ```
 # wts: you are in session `auth-form` (branch feature/auth-form, worktree …)
@@ -983,7 +993,8 @@ the repository has not enabled them. Measurements and the reasoning are in
 ## Known limitations
 
 - **Session names are global** to the tmux server: two `auth-form` worktrees in two
-  repositories share one session and one registry key. Prefix the name
+  repositories would share one session and one registry key, so `wts auth-form`
+  is refused while another repository has that session. Prefix the name
   (`api-auth-form`).
 - **macOS first.** Linux is untested.
 - **Some Claude Code internals are undocumented**: the `tmux` field of
@@ -992,7 +1003,8 @@ the repository has not enabled them. Measurements and the reasoning are in
   change, the affected columns and summaries degrade to `-` or raw facts; nothing
   else breaks.
 - The restore pre-fill (`print -z`) assumes zsh in the panes.
-- `wts rm` and `wts gc` act on the repository of the current directory.
+- `wts gc` acts on the repository of the current directory (`wts rm` finds the
+  session's repository through the registry).
 - **A document fetched through `WebFetch` is a model's rendering of the page, not
   the page.** That tool summarizes whatever it reads, and asking it not to does not
   change that. A document read through an MCP connector comes back verbatim; check
