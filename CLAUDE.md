@@ -17,6 +17,8 @@ libexec/wts/wts-brief      done/next per session (Claude Haiku, cached)
 libexec/wts/wts-doc        context document library: fetch (any MCP), cache, materialize
 libexec/wts/wts-retro      capture at teardown: collect/store facts, write the retro (Haiku)
 libexec/wts/wts-log        the work journal as one JSON document (archive + Things)
+libexec/wts/wts-task       tasks: local ones and Things snapshots, the notes and
+                           documents kept on them, link/unlink to sessions
 libexec/wts/wts-things     Things 3 reader, read-only: tasks, their notes and links
 libexec/wts/wts-db.zsh     the state database (SQLite): schema, import, helpers; sourced by all
                            also the one renderer for a task's context (task_context_md)
@@ -160,6 +162,30 @@ straight from the checkout. Scripts locate each other from their own path
 - tmuxinator waits for Enter after warning about a tmux release newer than its
   hard-coded list: always pass `--suppress-tmux-version-warning`, and `</dev/null`
   when its output is hidden.
+- `git rev-parse --show-toplevel` answers with the **current** worktree. Run from
+  inside a wts session (the layout's shell window, the switcher popup) that is
+  the agent's worktree, and a path derived from it (`<worktree>-worktrees/`)
+  points nowhere. Resolve the main worktree first (`main_worktree_of` in
+  `bin/wts`, the first entry of `git worktree list`), and for a registered
+  session read `worktree` and `repo_root` from the registry rather than deriving
+  them. This is how `wts rm` once dropped a registry row while the worktree it
+  described stayed on disk.
+- Names typed by a human go through `registry_resolve_name`, which matches
+  substrings **both ways**: `api-v2` resolves to `api`. Fine for `stop` and
+  `brief`; a destructive verb must confirm a non-exact match, and refuse it when
+  stdin is not a terminal.
+- `read -q` reads the **terminal**, never stdin: a y/N cannot be fed from a pipe
+  or a file, and without a tty it fails ("not interactive and can't open
+  terminal") and counts as no. So the smoke test can only check that nothing
+  happened without an answer, and that the prompt is in the source. Under fzf's
+  `execute` the tty is there and the prompt works.
+- `cmd | grep -q` under `pipefail` (the smoke test) fails when `cmd` prints
+  more after the first match: grep quits, the rest hits a closed pipe, and the
+  pipeline's status is that of `cmd`. Capture with `out=$(cmd)` and test `$out`.
+- The status of a `while` loop is that of the last body command: a loop ending
+  on `[[ cond ]] && print …` returns 1 whenever the condition was false on the
+  last row, and a function ending on that loop returns it. `wts task show`
+  exited 1 on every successful listing for that reason. End with `return 0`.
 
 ## Test
 

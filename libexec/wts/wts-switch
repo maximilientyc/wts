@@ -827,8 +827,8 @@ open_pr() { # $1 = session name
 # rather than the empty name: it closes the task (wts task done), which is the
 # only way out of the list a local task has. The name stays the only thing that
 # can reach `wts rm`.
-remove_session() { # $1 = session name, $2 = preview target
-  local name="$1" target="${2:-}"
+remove_session() { # $1 = session name, $2 = preview target, $3 = display line
+  local name="$1" target="${2:-}" line="${3:-}" cur agent=""
   if [[ -z "$name" ]]; then
     [[ "$target" == task:* ]] && close_task "${target#task:}"
     return 0   # otherwise the header, or an empty list
@@ -839,6 +839,26 @@ remove_session() { # $1 = session name, $2 = preview target
     wait_key
     return 0
   fi
+  # Same guard as kill_session: nobody should be asked y/N for a refusal.
+  cur=$(tmux display-message -p '#S' 2>/dev/null)
+  if [[ "$name" == "$cur" ]]; then
+    print -r -- "wts: '$name' is the current session, not removed (switch away first) — any key"
+    wait_key
+    return 0
+  fi
+  # A y/N, as ctrl-x has — and this key does more: the worktree, the branch and
+  # the registry entry go too. The list re-sorts under the cursor every 2 s (it
+  # is kept by index), so the row this fires on is not always the row aimed at;
+  # the prompt names it, with its agent state, before anything is touched.
+  local -a cols=(${=line})
+  case "${cols[2]:-}" in
+    blocked|working|idle|done|failed|stopped|stuck\?|-) agent="${cols[2]}" ;;
+  esac
+  if ! read -q "?Remove session '$name'${agent:+ (agent: $agent)}? Worktree, branch and registry entry go too. [y/N] "; then
+    print
+    return 0
+  fi
+  print
   "$WTS_CMD" rm "$name" || { print -n "press any key"; wait_key }
   return 0
 }
@@ -1182,7 +1202,7 @@ if [[ "${1:-}" == "--pr" ]]; then
 fi
 
 if [[ "${1:-}" == "--rm" ]]; then
-  remove_session "${2:-}" "${3:-}"
+  remove_session "${2:-}" "${3:-}" "${4:-}"
   exit 0
 fi
 
@@ -1371,7 +1391,7 @@ kill_bind=()
 if [[ -n "$WTS_CMD" ]]; then
   # Through --rm and not `wts rm {3}` directly: see remove_session for why an
   # empty {3} must never reach `wts rm`.
-  delete_bind=(--bind="ctrl-d:execute('$self' --rm {3} {2})+reload('$self' --list)")
+  delete_bind=(--bind="ctrl-d:execute('$self' --rm {3} {2} {1})+reload('$self' --list)")
   kill_bind=(--bind="ctrl-x:execute('$self' --kill {3} {1})+reload('$self' --list)")
 fi
 
@@ -1506,7 +1526,10 @@ if [[ -n "$sock" ]]; then
       delay="$REFRESH"
       if [[ -s "$WTS_SWITCH_LAST" ]]; then
         last=$(<"$WTS_SWITCH_LAST")
-        [[ "$last" == <->(.<->|) ]] && (( last > REFRESH )) && delay=$(printf '%.1f' "$last")
+        # LC_ALL=C: under fr_FR (and every comma-decimal locale) printf wrote
+        # `12,3`, `sleep 12,3` failed at once, and the loop ran with no delay at
+        # all — on the very repositories slow enough to reach this line.
+        [[ "$last" == <->(.<->|) ]] && (( last > REFRESH )) && delay=$(LC_ALL=C printf '%.1f' "$last")
       fi
     done
   } &

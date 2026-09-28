@@ -758,6 +758,12 @@ check "setup claude --install is idempotent" \
   jq -e '[.hooks.SessionStart[].hooks[] | select(.command | endswith("/wts-context"))] | length == 1' "$settings"
 check "setup claude --install keeps the other hooks" \
   jq -e '[.hooks.SessionStart[].hooks[] | select(.command == "echo mine")] | length == 1' "$settings"
+# The hook tells the agent to run `wts db …`: without the allow rule the first
+# thing every agent did was wait, blocked, on a permission prompt for it.
+check "setup claude prints the permissions the hook needs" \
+  eval '"$WTS" setup claude | grep -qF "Bash(wts db:*)"'
+check "setup claude --install allows them, once" \
+  jq -e '[.permissions.allow[] | select(. == "Bash(wts db:*)")] | length == 1' "$settings"
 
 "$WTS" rm dbsess -f >/dev/null
 no_notes_left() { [[ "$(q "SELECT count(*) FROM notes WHERE session = 'dbsess'")" == 0 ]] }
@@ -1207,7 +1213,7 @@ unset WTS_SWITCH_REPLY
 # The bind that had to move: `wts rm ""` matches every session by substring and
 # opens a picker offering to delete any of them, and a task row hands it "".
 check "ctrl-d goes through --rm, not straight to wts rm" \
-  grep -qF "ctrl-d:execute('\$self' --rm {3} {2})" "$SWITCH"
+  grep -qF "ctrl-d:execute('\$self' --rm {3} {2} {1})" "$SWITCH"
 check "--rm on a row that is neither a session nor a task does nothing at all" eval '
   n=$(q "select count(*) from sessions")
   "$SWITCH" --rm "" "" >/dev/null 2>&1 </dev/null
@@ -1291,6 +1297,111 @@ q "delete from tasks where id = 'THINGSdone0123456789ab'"
 check "done with no id outside a session says why" eval '
   out=$(cd "$SANDBOX" && tt done 2>&1) && false
   [[ "$out" == *"not inside a wts session"* ]]'
+
+# ─── rm: the destructive verb takes nothing on trust ─────────────────────────
+# Every path here used to reach a deletion nobody asked for: the wrong worktree
+# (or none, with the registry row dropped anyway), a session guessed from a
+# typo, a session of another repository, an agent killed before git refused a
+# dirty worktree. Each check is the regression that would have caught it.
+
+cd "$REPO"
+env WTS_NO_ATTACH=1 "$WTS" safe-a smoke >/dev/null
+env WTS_NO_ATTACH=1 "$WTS" safe-b smoke >/dev/null
+
+# From inside a worktree, `--show-toplevel` is that worktree: rm derived
+# `<worktree>-worktrees/<name>` from it, found nothing there, and forgot the
+# session while its worktree and branch stayed behind.
+check "rm from inside another worktree removes the right worktree" eval '
+  (cd "$WT/safe-a" && "$WTS" rm safe-b -f >/dev/null)
+  [[ ! -e "$WT/safe-b" && -d "$WT/safe-a" ]] \
+  && [[ "$(q "select count(*) from archive where session = '\''safe-b'\''")" == 1 ]]'
+refute "and drops its registry entry" in_registry safe-b
+check "creating from inside a worktree lands in the repository's worktree base" eval '
+  (cd "$WT/safe-a" && env WTS_NO_ATTACH=1 "$WTS" safe-nested smoke >/dev/null)
+  [[ -d "$WT/safe-nested" && ! -e "$WT/safe-a-worktrees" ]]'
+"$WTS" rm safe-nested -f >/dev/null
+
+# A guessed name. The resolver matches substrings both ways: `api-v2` with no
+# such session resolved to `api`, and -f removed it.
+env WTS_NO_ATTACH=1 "$WTS" api smoke >/dev/null
+refute "rm of a name that only resembles a session refuses when not interactive" \
+  eval '"$WTS" rm api-v2 -f </dev/null'
+check "and the session it resembled is intact" eval '[[ -d "$WT/api" ]] && in_registry api'
+refute "rm of an empty name refuses" eval '"$WTS" rm "" -f </dev/null'
+check "with every session still there" eval '[[ -d "$WT/api" && -d "$WT/safe-a" ]]'
+refute "rm of an unknown name fails" eval '"$WTS" rm nothing-like-it -f </dev/null'
+"$WTS" rm api -f >/dev/null
+
+# A dirty worktree: the session was killed first, then git refused, and the
+# agent was dead for nothing.
+env WTS_NO_ATTACH=1 "$WTS" safe-dirty smoke >/dev/null
+print "wip" > "$WT/safe-dirty/wip.txt"
+refute "rm of a dirty worktree refuses without -f" eval '"$WTS" rm safe-dirty </dev/null'
+check "and its session is still running" has_session safe-dirty
+check "rm -f takes the changes with it" eval '
+  "$WTS" rm safe-dirty -f >/dev/null; [[ ! -e "$WT/safe-dirty" ]]'
+
+# Another repository. The switcher lists every session; rm used the repository
+# at hand, found nothing, and forgot the other one's session.
+REPO2="$SANDBOX/code/other"
+WT2="$SANDBOX/code/other-worktrees"
+mkdir -p "$REPO2"
+git -C "$REPO2" init -q
+print other > "$REPO2/README"
+git -C "$REPO2" add README
+git -C "$REPO2" commit -qm init
+(cd "$REPO2" && env WTS_NO_ATTACH=1 "$WTS" other-sess smoke >/dev/null)
+check "rm from another repository removes the session's own worktree" eval '
+  "$WTS" rm other-sess -f >/dev/null
+  [[ ! -e "$WT2/other-sess" ]] \
+  && ! git -C "$REPO2" show-ref --verify --quiet refs/heads/feature/other-sess'
+refute "and its registry entry" in_registry other-sess
+# A name already used by another repository overwrote its registry row, then
+# attached to its tmux session.
+refute "an explicit name that is a session of another repository is refused" \
+  eval '(cd "$REPO2" && env WTS_NO_ATTACH=1 "$WTS" safe-a smoke </dev/null)'
+check "and the registry still points at the first repository" eval '
+  [[ "$(reg_field safe-a worktree)" == "$WT/safe-a" && ! -e "$WT2/safe-a" ]]'
+
+# A worktree removed by hand: `wts ls` dropped the row, the notes and the task
+# link, and no archive row said the work had ever existed.
+env WTS_NO_ATTACH=1 "$WTS" safe-gone smoke >/dev/null
+tmux kill-session -t "=safe-gone"
+rm -rf "$WT/safe-gone"
+check "ls archives a session whose worktree vanished, then forgets it" eval '
+  "$WTS" ls >/dev/null 2>&1
+  [[ "$(q "select outcome from archive where session = '\''safe-gone'\''")" == unknown ]]'
+refute "and the registry entry is gone" in_registry safe-gone
+
+# The hook names the task it tells the agent to look at: a bare `wts task show`
+# opens the Things picker, which an agent may not. Created before the ctrl-d
+# check below, so that this — not safe-a — is the server's most recent session.
+T3=$(tt new "Name the task in the hook")
+env WTS_NO_ATTACH=1 WTS_NO_THINGS=1 "$WTS" safe-task smoke --task "$T3" >/dev/null
+check "the hook says which task to show" eval '
+  out=$(cd "$WT/safe-task" && "$ROOT/libexec/wts/wts-context" </dev/null)
+  [[ "$out" == *"task show $T3"* ]]'
+# Captured, not piped into grep -q: grep quits at the first match, the lines
+# after it hit a closed pipe, and pipefail read that as a failed command.
+check "task show with no id inside a session shows that session's task" eval '
+  out=$(cd "$WT/safe-task" && tt show </dev/null)
+  [[ "$out" == *"Name the task in the hook"* ]]'
+
+# The switcher's ctrl-d asks first, as ctrl-x already did, and names the agent
+# state it shows. `read -q` reads the terminal, never stdin: with none (here),
+# it fails and counts as no, so the only thing to check is that nothing went.
+check "--rm on a session asks y/N before wts rm, and removes nothing unanswered" eval '
+  grep -qF "read -q \"?Remove session" "$SWITCH"
+  out=$("$SWITCH" --rm safe-a "safe-a" "safe-a  idle  feature/safe-a" </dev/null 2>&1)
+  [[ "$out" != *"removed"* ]] && in_registry safe-a && [[ -d "$WT/safe-a" ]]'
+"$WTS" rm safe-task -f >/dev/null
+"$WTS" rm safe-a -f >/dev/null
+
+# The refresher's delay is handed to sleep: formatted with a dot whatever the
+# locale, or under fr_FR it was `12,3` and the loop ran with no delay at all.
+check "the refresh delay is computed under LC_ALL=C" \
+  grep -qF "LC_ALL=C printf '%.1f'" "$SWITCH"
+cd "$REPO"
 
 # gc --apply is the primary capture path: a merged branch is torn down and must
 # leave a row behind, with gc's own verdict on how the work ended.

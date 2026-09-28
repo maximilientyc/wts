@@ -1,5 +1,64 @@
 # Changelog
 
+## 1.4.1 — 2026-09-28
+
+A safety release: every destructive path that could act on a session nobody
+named now refuses, asks, or reads the registry instead of guessing. Found by a
+review of the whole tool; the first five had the same shape — `wts rm` trusted
+its input more than `wts stop` did.
+
+- **`wts rm` finds the worktree through the registry**, not the current
+  directory. `git rev-parse --show-toplevel` from inside a worktree names that
+  worktree, so `rm` derived `<worktree>-worktrees/<name>`, found nothing,
+  killed the tmux session anyway and dropped the registry row — the real
+  worktree and its branch left behind, unlisted. The switcher's `ctrl-d` runs
+  `rm` from wherever the popup opened, so this was one key away. A session of
+  another repository went the same way. Only a name the registry never saw
+  falls back to the repository at hand, and then to its main worktree.
+- **Creating from a shell inside a worktree no longer nests worktrees.** The
+  layout's shell window sits in the worktree; `wts foo` typed there created
+  `<repo>-worktrees/<session>-worktrees/foo`, where gc never looks. The hop to
+  the main worktree that `wts-fresh` had is in `wts` itself now.
+- **A guessed name is confirmed, or refused.** The resolver matches substrings
+  both ways, so `wts rm api-v2` with no such session landed on `api` — and
+  `-f` force-removed it, with one line on stderr for all warning. An exact name
+  goes through; a guess is shown and asked y/N; with no terminal to ask (the
+  switcher, a script) it is refused. An empty name is refused everywhere, and
+  `rm` of a name that is nothing at all exits 1 instead of 0.
+- **`ctrl-d` asks first**, as `ctrl-x` did, and names the agent state it shows:
+  the list re-sorts under the cursor every 2 s, so the row it fires on is not
+  always the row aimed at. `rm` also checks the worktree is clean *before*
+  killing the session: git refused a dirty worktree after the agent was gone,
+  leaving it dead with its work half torn down. `rm` refuses the current
+  session, like `stop` and gc.
+- **An explicit name already used by another repository is refused.** The row
+  is keyed on the name alone: `wts fix-tests` in repo B while A had one created
+  B's worktree, overwrote A's registry row with B's paths, then attached to A's
+  tmux session. Session names are global to the tmux server; the message
+  suggests a prefixed one.
+- **The hook names the task it tells the agent to look at.** It printed
+  `wts task show` with no id, which resolves the task through the Things picker
+  — a read of Things' container and an fzf with no terminal — and an agent may
+  not open Things. `wts task show` with no id inside a session now shows that
+  session's task, as `note`, `edit` and `doc` already did.
+- **`wts setup claude --install` adds the permissions the hook needs**:
+  `Bash(wts db:*)`, `wts task note`, `wts task show`, `wts status`. Without
+  them the first thing every agent did was wait, blocked, for you to allow
+  `wts db notes --all`. Appended once each, in your own order.
+- **Fixed: under `fr_FR` (any comma-decimal locale) the switcher's refresher
+  ran with no delay** on a repository where a pass outlasts the interval:
+  `printf '%.1f'` wrote `12,3`, `sleep 12,3` failed at once, and its error was
+  written onto the popup. Formatted under `LC_ALL=C`.
+- **Fixed: `wts ls` forgot a worktree removed by hand without a trace.** A
+  registry row whose folder is gone is archived first (outcome `unknown`, the
+  facts the registry holds), then dropped: `wts log` now knows the work
+  existed.
+- **Fixed: paths compared as strings.** A `WTS_WORKTREES_BASE` with a trailing
+  slash, or through a symlink, stored a path the collectors never matched
+  against git's canonical one: the agent showed `-`, and gc's busy guard did
+  not know it was there. The base is canonicalized at creation, and every
+  compare accepts both spellings.
+
 ## 1.4.0 — 2026-09-28
 
 A task had a beginning and no end. One created in wts (`ctrl-t`, `wts task new`)
