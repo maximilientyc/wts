@@ -43,11 +43,12 @@ cut80() {
   print -r -- "$v"
 }
 
-IFS=$'\x1f' read -r -d $'\x1e' my_branch my_worktree my_repo my_task my_task_notes my_task_links \
+IFS=$'\x1f' read -r -d $'\x1e' my_branch my_worktree my_repo my_task my_task_notes my_task_links my_task_id \
   < <(db_rows "SELECT s.branch, s.worktree, s.repo_root,
                       coalesce(t.title, ''), coalesce(t.notes, ''),
-                      coalesce((SELECT group_concat(value, ' ') FROM json_each(t.links)
-                                WHERE json_valid(t.links)), '')
+                      coalesce((SELECT group_concat(json_extract(value, '\$.url'), ' ')
+                                FROM json_each(t.links) WHERE json_valid(t.links)), ''),
+                      coalesce(l.task, '')
                FROM sessions s
                LEFT JOIN task_links l ON l.session = s.name
                LEFT JOIN tasks t ON t.id = l.task
@@ -56,17 +57,49 @@ IFS=$'\x1f' read -r -d $'\x1e' my_branch my_worktree my_repo my_task my_task_not
 print -r -- "# wts: you are in session \`$me\` (branch ${my_branch:--}, worktree $my_worktree)"
 print -r -- ""
 
-# The task this session serves, when there is one. Worth the four lines: the
-# notes are where the author keeps the Notion pages, the meeting minutes and the
-# Slack threads for this piece of work, and an agent that knows them does not
-# have to be told to go and look for them. DB-only, like everything in this hook.
+# The task this session serves, when there is one. Worth the lines: the notes are
+# where the author keeps the Notion pages, the meeting minutes and the Slack
+# threads for this piece of work, and an agent that knows them does not have to be
+# told to go and look for them. DB-only, like everything in this hook.
+#
+# This is also the ONLY channel that comes back: the agent's opening prompt and
+# .wts/context.md are read once, and Claude Code re-runs SessionStart after
+# /clear, /compact and a resume. So the task's own context is repeated here
+# rather than assumed to be still in the window.
 if [[ -n "${my_task:-}" ]]; then
   print -r -- "You are working on the task: **$my_task**"
   if [[ -n "${my_task_notes:-}" ]]; then
     print -r -- "Its notes (the author's own, verbatim):"
     print -r -- "${my_task_notes//[[:cntrl:]]/ }" | sed 's/^/  /'
   fi
+  # Notes kept on the task in wts rather than in Things. Newest last, capped like
+  # everything else here: this is the one field in this file a user can grow
+  # without limit, and it is the agent's context window that pays.
+  if [[ -n "${my_task_id:-}" ]]; then
+    task_note_n=0
+    while IFS=$'\x1f' read -r -d $'\x1e' note_at note_body; do
+      [[ -n "$note_body" ]] || continue
+      (( task_note_n++ == 0 )) && print -r -- "Notes added in wts:"
+      print -r -- "  ($note_at) $(cut80 "$note_body")"
+    # The ten most recent, then back in order: DESC alone would print the newest
+    # first, and these read as a running log.
+    done < <(db_rows "SELECT substr(added_at, 1, 10), body FROM (
+                        SELECT added_at, body FROM task_notes
+                        WHERE task = $(sql_str "$my_task_id")
+                        ORDER BY added_at DESC LIMIT 10)
+                      ORDER BY added_at" 2>/dev/null)
+  fi
+  # Selected since the task layer landed and never printed until now: the links
+  # ARE the context, and the agent in this pane can often read a private page the
+  # sandboxed `wts doc` fetch could not.
+  if [[ -n "${my_task_links:-}" ]]; then
+    print -r -- "Links it carries (read the ones you need):"
+    for task_link in ${=my_task_links}; do
+      [[ -n "$task_link" ]] && print -r -- "  $task_link"
+    done
+  fi
   print -r -- "Other sessions may serve the same task: \`wts task show\` lists them."
+  print -r -- "Add to it as you learn: \`wts task note \"<what you found>\"\` — it outlives this session."
   print -r -- ""
 fi
 print -r -- "This machine runs several Claude Code agents in parallel, one per wts session"

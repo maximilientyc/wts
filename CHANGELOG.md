@@ -1,5 +1,69 @@
 # Changelog
 
+## 1.2.0 — 2026-09-28
+
+The task stops being a label and becomes the place context lives — and it reaches
+the switcher, which is the view that gets used. Schema 3, imported automatically
+on the first command; nothing existing changes shape or behaviour.
+
+- **The switcher lists the open tasks that have no session**, under the sessions:
+  `task` in the AGENT column, `N ctx` in DELTA (documents + links + notes), and
+  the task itself as the preview. `enter` on one **starts a session on it** — the
+  popup closes and tmux's command prompt opens pre-filled with
+  `wts <slug> --task <id>`, the name proposed from the title. Pre-filled rather
+  than created outright, for three reasons in this order: creation then goes
+  through the `wts` command-alias and so through `wts-fresh`, which refuses
+  outside a repository and cuts the branch from a freshly fetched
+  `origin/<default>`; the name, the layout and an extra phrase stay editable; and
+  the slug is derived with `WTS_NO_LLM=1`, so the popup still never calls the
+  model. `WTS_SWITCH_TASKS=<n>` caps the list (10), `0` hides it.
+- **`tab` on a task is note mode.** The same machinery that replies to an agent:
+  the prompt becomes `note on <task>>`, and `enter` appends the line to the task's
+  notes instead of sending it to a pane there is none of. What was missing was
+  never the pane — it was a place to type prose without leaving the popup, which
+  this already was.
+- **`ctrl-e` on a task attaches the document to the task**, not to a session, so
+  every later attempt at it inherits the document. **`ctrl-t` pulls a task in from
+  Things** (`wts task add`) — which is what fills the list, since the switcher only
+  ever reads its own database: one query, no Things, no git, no model, because it
+  runs every 2 s.
+- **`wts task note`, `wts task edit`, `wts task doc` and `wts task add`**: free text
+  and context documents kept ON a task, all defaulting to the task of the session
+  you are in. They live in two new tables (`task_notes`, `task_docs`) and not in
+  two more columns on `tasks`, for two independent reasons: `snapshot()`
+  overwrites every column it reads from Things, so a column would be wiped by the
+  next `wts task ls`; and `db_init` only ever runs `CREATE TABLE IF NOT EXISTS`, so
+  a new table migrates itself while a new column would silently never appear.
+- **`--task` now actually hands the task's context over**, through four channels
+  because each fails differently: the **title becomes the agent's opening prompt**
+  when no phrase was typed (`wts fix-audit --task <id>` used to start the agent on
+  nothing at all); the task's **documents** are attached like `--doc` ones;
+  `.wts/context.md` **opens with the task** — title, status, notes, links — which is
+  the only channel read before the agent's first turn; and the `SessionStart` hook
+  **repeats** it, the only one that comes back after `/clear`, `/compact` or a
+  resume. The hook also prints the task's links at last: they had been selected
+  and thrown away since the task layer landed.
+- **Fixed: `ctrl-d` in the switcher could offer to delete any session.** It ran
+  `wts rm {3}` straight from the bind, and `wts rm ''` reaches
+  `registry_resolve_name`, whose substring match (`[[ "$k" == *""* ]]`) matches
+  *every* session and opens a picker over all of them. Only the header row
+  produced an empty `{3}` and `--header-lines` makes it unselectable, so it was
+  unreachable — until a task row, which is selectable. It goes through a guarded
+  `--rm` verb now, like `--kill`, `--pr` and `--doc`.
+- **Fixed: `wts new --task <id>` created sessions linked to nothing.**
+  `strip_doc_args` has read `WTS_TASK_ARG` since the task layer landed, and
+  nothing ever set it. A bare `--task` is resolved once in the parent, so the
+  Things picker does not open once per session of the batch.
+- **Fixed: `wts status --fzf` and `--table` printed `[]` on an empty registry.**
+  Only `--json` has a representation of "nothing"; the switcher read that line as
+  a session named `[]`. Invisible while the registry always had a session in it, a
+  junk row the moment it does not — a fresh install, or tasks queued and no
+  session yet.
+- **Fixed: `wts --task <id>` reported "unknown option '--task'".** An option
+  cannot come first — the stray-option guard runs before any parsing — but that
+  message sends you looking for a typo. `--doc` and `--task` now say that the name
+  comes first.
+
 ## 1.1.0 — 2026-09-28
 
 Teardown stops destroying the evidence. Schema 2, imported automatically on the

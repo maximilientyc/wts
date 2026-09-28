@@ -2,17 +2,20 @@
 # wts-switch — fzf session picker, designed for `tmux display-popup -E`.
 #
 # Sessions known to the registry are listed first, sorted by urgency (stuck or
-# blocked agent > idle > working), with a live preview of the agent's pane.
-# tmux sessions unknown to the registry follow.
+# blocked agent > idle > working), with a live preview of the agent's pane. Then
+# the open TASKS that have no session yet — the work still to start, with what it
+# already carries — and last the tmux sessions unknown to the registry.
 #
-#   enter    switch to the session
+#   enter    switch to the session, or start a session on the task
 #   tab      reply mode: type for the previewed agent, enter sends (fzf >= 0.45)
+#            on a task: note mode, enter appends the line to its notes
 #   esc      leave reply mode, or close the popup
 #   ctrl-r   reload the list by hand
 #   ctrl-d   delete the session (wts rm) and reload
 #   ctrl-x   kill the tmux session only (wts stop), after a y/N prompt
 #   ctrl-o   open the session's pull request on GitHub (wts pr, needs gh)
-#   ctrl-e   attach a context document to the session (wts doc use)
+#   ctrl-e   attach a context document to the session, or to the task
+#   ctrl-t   pull a task in from Things (wts task add, needs Things)
 #   ctrl-f   scroll the preview down half a page
 #   ctrl-b   scroll the preview up half a page
 #   ?        show or hide the full key list in the footer (fzf >= 0.65)
@@ -54,10 +57,19 @@ typeset -g current=""
 # Each line: <display> TAB <preview-target> TAB <session-name>
 # fzf only shows field 1; fields 2 and 3 drive the preview and the switch.
 #
+# Three fields and not four, even now that a row may be a TASK rather than a
+# session: a task row carries `task:<id>` in field 2 and leaves field 3 EMPTY.
+# That is the same "not a session" signal the header row already uses, so every
+# bind that takes {3} — ctrl-x, ctrl-o, ctrl-e, tab — is a no-op on a task
+# without being told about tasks at all, and `wts status --fzf` keeps its shape.
+# ctrl-d was the one exception and is now behind --rm; see there.
+#
 # The producers collect rows with add_row and `emit` lays the table out in one
 # go, every line exactly as wide as the list. The widths come from the rows
 # themselves, so the skeleton below and the collected list — same registry, same
 # tmux server — compute the same widths and the swap redraws nothing shifted.
+# For that reason BOTH producers must list the same tasks, not just the same
+# sessions.
 # The header is the first line of the output (--header-lines=1) rather than a
 # --header fixed at startup, so it is laid out again with the rows when a session
 # appears or is deleted under the popup.
@@ -65,8 +77,8 @@ typeset -ga rows
 rows=()
 SEP=$'\x1f'
 
-add_row() { # <name> <agent> <branch> <delta> <subject> <preview-target>
-  rows+=("$1$SEP$2$SEP$3$SEP$4$SEP${5:-}$SEP$6")
+add_row() { # <name> <agent> <branch> <delta> <subject> <preview-target> [<kind>]
+  rows+=("$1$SEP$2$SEP$3$SEP$4$SEP${5:-}$SEP$6$SEP${7:-}")
 }
 
 # Cut to <width> characters, the last one an ellipsis, into REPLY. zsh counts
@@ -93,7 +105,7 @@ emit() {
   local raw mark name_w=7 branch_w=6
   for raw in "${rows[@]}"; do
     f=("${(@ps:\x1f:)raw}")
-    mark=""; [[ "$f[1]" == "$current" ]] && mark="*"
+    mark=""; [[ -z "${f[7]:-}" && "$f[1]" == "$current" ]] && mark="*"
     (( ${#f[1]} + ${#mark} > name_w )) && name_w=$(( ${#f[1]} + ${#mark} ))
     (( ${#f[3]} > branch_w )) && branch_w=${#f[3]}
   done
@@ -107,10 +119,15 @@ emit() {
 
   # The header first, with an empty field 6 so that it has 3 TAB fields too. The
   # `*` is appended after the cut, so a name too long for its column keeps it.
-  local name agent branch delta subject
-  for raw in "SESSION${SEP}AGENT${SEP}BRANCH${SEP}DELTA${SEP}SUBJECT${SEP}" "${rows[@]}"; do
+  local name agent branch delta subject sess
+  for raw in "SESSION${SEP}AGENT${SEP}BRANCH${SEP}DELTA${SEP}SUBJECT${SEP}${SEP}" "${rows[@]}"; do
     f=("${(@ps:\x1f:)raw}")
-    mark=""; [[ -n "$f[6]" && "$f[1]" == "$current" ]] && mark="*"
+    # Field 3 is the session name, and only a session has one: a task row and
+    # the header both leave it empty. This is what makes `enter` on a task go to
+    # --start instead of switch-client, and every {3} bind a no-op there.
+    sess=""
+    [[ -n "$f[6]" && -z "${f[7]:-}" ]] && sess="$f[1]"
+    mark=""; [[ -n "$sess" && "$f[1]" == "$current" ]] && mark="*"
     fit "$f[1]" $(( name_w - ${#mark} )); name="$REPLY$mark"
     fit "$f[2]" $AGENT_W;    agent=$REPLY
     fit "$f[3]" $branch_w;   branch=$REPLY
@@ -118,8 +135,63 @@ emit() {
     fit "$f[5]" $subject_w;  subject=$REPLY
     printf '%-*s %-*s %-*s %-*s %-*s\t%s\t%s\n' \
       $name_w "$name" $AGENT_W "$agent" $branch_w "$branch" \
-      $DELTA_W "$delta" $subject_w "$subject" "$f[6]" "${f[6]:+$f[1]}"
+      $DELTA_W "$delta" $subject_w "$subject" "$f[6]" "$sess"
   done
+}
+
+# ─── Tasks ───────────────────────────────────────────────────────────────────
+# The work that has no session yet, at the bottom of the same list. Not a second
+# view and not a nested tree: the switcher is the one place that has to stay
+# scannable, and a task is a row like any other — `enter` on it starts a session
+# instead of switching to one.
+#
+# Only tasks with NO live session: a task already being worked on is already on
+# screen as that session's row, with its `*` in SUBJECT. And only tasks wts
+# already holds — one query on its own database, no `wts-things`, no git, no
+# model, because this runs inside the 2-second refresh. `ctrl-t` is how a Things
+# task gets in.
+#
+# ASCII only in the display columns: `emit` pads them to an exact character count
+# and the smoke test asserts it, but a glyph of East Asian Ambiguous width (U+25C6
+# among them) is drawn two columns wide by some terminals — the row would look
+# shifted while measuring correctly. The `task` in AGENT is the marker instead.
+TASK_TITLE_W=30
+
+task_rows() {
+  [[ "${WTS_SWITCH_TASKS:-}" == 0 ]] && return 0
+  db_available || return 0
+  # Checked before it reaches the LIMIT: the only value in this query that is not
+  # a literal comes from the environment, and a non-numeric one would make the
+  # whole statement fail — silently, since the query is quiet by design.
+  local limit="${WTS_SWITCH_TASKS:-10}"
+  [[ "$limit" == <-> ]] || limit=10
+  local id title area ctx att delta subject
+  while IFS=$'\x1f' read -r -d $'\x1e' id title area ctx att; do
+    [[ -n "$id" ]] || continue
+    # Cut before add_row, not in `fit`: name_w is measured from the rows, so an
+    # 80-character task title would push the name column to its cap and re-lay
+    # out every session row the moment a task appeared.
+    (( ${#title} > TASK_TITLE_W )) && title="${title[1,TASK_TITLE_W-1]}…"
+    # Plain assignments and not `$( … && print … )`: this runs on every refresh,
+    # and each command substitution is a fork per row.
+    delta="-"
+    (( ctx )) && delta="$ctx ctx"
+    subject="$area"
+    if [[ -z "$subject" ]] && (( att )); then
+      subject="$att attempt(s)"
+    fi
+    add_row "${title:-$id}" "task" "-" "$delta" "$subject" "task:$id" task
+  done < <(db_rows "
+    SELECT t.id, t.title, t.area,
+           (SELECT count(*) FROM task_docs d WHERE d.task = t.id)
+             + (SELECT count(*) FROM task_notes n WHERE n.task = t.id)
+             + (SELECT count(*) FROM json_each(t.links) WHERE json_valid(t.links)),
+           (SELECT count(*) FROM archive a WHERE a.task = t.id)
+      FROM tasks t
+     WHERE t.status = 'open'
+       AND NOT EXISTS (SELECT 1 FROM task_links l WHERE l.task = t.id)
+     ORDER BY t.synced_at DESC, t.title
+     LIMIT $limit" 2>/dev/null)
 }
 
 # tmux sessions missing from the registry (numbered sessions, other projects...).
@@ -150,6 +222,9 @@ build_list() {
     done < <("$WTS_BIN/wts-status" --fzf "${extra[@]}" 2>/dev/null)
   fi
 
+  # Tasks before the foreign tmux sessions: wts's own objects, and the bottom of
+  # the list is where you look when nothing needs you.
+  task_rows
   unregistered "$known"
   emit
 }
@@ -187,6 +262,10 @@ build_skeleton() {
       | join("")' <<< "$(registry_json)" 2>/dev/null)
   fi
 
+  # The same query as build_list, and not a cheaper one: the two lists are
+  # compared column by column at the swap, so a task missing here would redraw
+  # every row shifted the moment the collector returned.
+  task_rows
   unregistered "$known"
   emit
 }
@@ -206,13 +285,19 @@ build_skeleton() {
 # fzf query. The arrow keys remain, and queries are short here.
 
 # State: <target> then <offset in lines from the bottom>. Changing target resets
-# the offset to zero, so moving the cursor in the list brings the preview back
-# to live without binding the `focus` event.
-read_scroll() { # $1 = target ; prints the offset
-  local target="$1" stored_target stored_off
-  [[ -n "${WTS_SWITCH_SCROLL:-}" && -f "$WTS_SWITCH_SCROLL" ]] || { print 0; return }
+# the offset to the default, so moving the cursor in the list brings the preview
+# back to live without binding the `focus` event.
+#
+# The default is 0 — the bottom — for a pane, where the last line the agent wrote
+# is the one that matters. A task reads the other way round (its title and status
+# are at the top), so its preview passes the top as the default; `scroll` does not
+# need to know, because `preview` clamps and writes the offset back before any
+# key can be pressed on that row.
+read_scroll() { # $1 = target, $2 = default offset ; prints the offset
+  local target="$1" def="${2:-0}" stored_target stored_off
+  [[ -n "${WTS_SWITCH_SCROLL:-}" && -f "$WTS_SWITCH_SCROLL" ]] || { print -r -- "$def"; return }
   { read -r stored_target; read -r stored_off } < "$WTS_SWITCH_SCROLL"
-  [[ "$stored_target" == "$target" ]] || { print 0; return }
+  [[ "$stored_target" == "$target" ]] || { print -r -- "$def"; return }
   print -r -- "${stored_off:-0}"
 }
 
@@ -243,7 +328,9 @@ help_expanded() { [[ -n "${WTS_SWITCH_HELP:-}" && -f "$WTS_SWITCH_HELP" ]] }
 footer_text() {
   local mode=collapsed
   if reply_active; then
-    mode=reply
+    # `enter` appends to a task and sends to an agent: the footer has to say
+    # which, or the one destructive-feeling key in the popup is a guess.
+    if reply_on_task; then mode=note; else mode=reply; fi
   elif help_expanded; then
     mode=expanded
   fi
@@ -281,13 +368,57 @@ keys() { # $1 = verb, $2 = query
 # would silently retarget the reply. A wrong `enter` in list mode only switches
 # to the wrong session; a wrong reply types into the wrong agent's prompt.
 #
-# State: <session name> then <target at entry>. The name is the anchor; the
-# target is a fallback for when the cursor has drifted off that row.
+# The same machinery carries a NOTE on a task. A task row has no pane to type
+# into, but the thing that was missing was never the pane: it was a place to type
+# prose without leaving the popup, which this already is. So `tab` on a task
+# pins the task, and `enter` appends the line to its notes instead of sending it
+# to an agent — which is how the context an author keeps in a task gets there.
+#
+# State: <pinned key> then <target at entry>. The key is a session name, or
+# `task:<id>` for a note: a task has no session name to anchor on (field 3 of its
+# row is empty, deliberately), and the id is what both the preview and the write
+# need. The target is a fallback for when the cursor has drifted off that row.
+
+# The keys reply mode turns off, in ONE place: they used to be two identical
+# string literals in toggle and leave, and a key added to one only was left
+# unbound for the rest of the popup.
+REPLY_UNBIND="ctrl-d,ctrl-x,ctrl-e,ctrl-t"
 
 reply_active() { [[ -n "${WTS_SWITCH_REPLY:-}" && -f "$WTS_SWITCH_REPLY" ]] }
 
 read_reply() { # sets reply_name and reply_target in the caller's scope
   { read -r reply_name; read -r reply_target } < "$WTS_SWITCH_REPLY"
+}
+
+# Whether what is pinned is a task rather than a session, for the footer and for
+# `send`. Cheap enough to ask twice; it is one read of a two-line file.
+reply_on_task() {
+  reply_active || return 1
+  local reply_name reply_target
+  read_reply
+  [[ "$reply_name" == task:* ]]
+}
+
+# What the prompt calls the pinned task. Short: the prompt sits in front of the
+# query on one line.
+task_label() { # $1 = task id
+  local t
+  t=$(db_ro "SELECT title FROM tasks WHERE id = $(sql_str "$1")" 2>/dev/null)
+  t="${t//[[:cntrl:]]/ }"
+  (( ${#t} > 28 )) && t="${t[1,27]}…"
+  print -r -- "${t:-$1}"
+}
+
+# Free text onto the task, dated, through the same table `wts task note` writes.
+# Written here rather than by execing wts-task: this runs inside fzf's
+# `transform`, whose output IS an action chain — a helper printing "→ noted on …"
+# on stdout would be read by fzf as an unknown action and close the popup.
+note_task() { # $1 = task id, $2 = text
+  local id="$1" text="$2"
+  [[ -n "$id" && -n "${text//[[:space:]]/}" ]] || return 0
+  db_q "INSERT INTO task_notes (task, body, added_at)
+        VALUES ($(sql_str "$id"), $(sql_str "$text"),
+                strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))" >/dev/null 2>&1
 }
 
 # Where a preview, a scroll or a reply goes. The cursor's own target wins as
@@ -337,22 +468,33 @@ reply() { # $1 = verb, then verb arguments
   case "$verb" in
     toggle) # <target> <name>
       if reply_active; then reply leave; return; fi
-      [[ -n "${2:-}" ]] || return
-      print -rl -- "$2" "${1:-$2}" > "$WTS_SWITCH_REPLY"
-      # Read after the state file is written: the footer is the reply line.
+      # A session anchors on its name; a task row has none (field 3 is empty by
+      # design) and anchors on its `task:<id>` target instead. Anything else —
+      # the header, an empty list — still pins nothing.
+      local key="${2:-}" label="${2:-}"
+      if [[ -z "$key" && "${1:-}" == task:* ]]; then
+        key="$1"
+        label=$(task_label "${1#task:}")
+      fi
+      [[ -n "$key" ]] || return
+      print -rl -- "$key" "${1:-$key}" > "$WTS_SWITCH_REPLY"
+      # Read after the state file is written: the footer is the reply line, and
+      # it says "append" rather than "send" when what is pinned is a task.
       footer=$(footer_action)
       # `?` goes with ctrl-d and ctrl-x: unbound, it is typed into the reply
       # instead of opening the key list, which is what a reply needs it for.
-      local switched="ctrl-d,ctrl-x,ctrl-e"
+      local switched="$REPLY_UNBIND"
       footer_active && switched="$switched,?"
       # `|` as the argument delimiter: `)` is legal in a tmux session name.
+      local verbing="reply to"
+      [[ "$key" == task:* ]] && verbing="note on"
       chain=(disable-search clear-query "unbind($switched)" refresh-preview
-             ${footer:+"$footer"} "change-prompt|reply to ${2//|/}> |")
+             ${footer:+"$footer"} "change-prompt|$verbing ${label//|/}> |")
       print -rn -- "${(j:+:)chain}"
       ;;
     leave)
       rm -f "$WTS_SWITCH_REPLY"
-      local switched="ctrl-d,ctrl-x,ctrl-e"
+      local switched="$REPLY_UNBIND"
       footer_active && switched="$switched,?"
       # After the reply file is gone, so the footer is the list's again.
       footer=$(footer_action)
@@ -365,16 +507,46 @@ reply() { # $1 = verb, then verb arguments
       ;;
     send) # <query> <cursor target> <cursor name>
       if ! reply_active; then print -r -- "accept"; return; fi
+      local reply_name reply_target
+      read_reply
+      if [[ "$reply_name" == task:* ]]; then
+        note_task "${reply_name#task:}" "${1:-}"
+        # reload-sync as well: the row's `N ctx` count just changed, and
+        # reload-sync keeps the cursor and the query where they are.
+        print -r -- "clear-query+reload-sync('$WTS_BIN/wts-switch' --list)+refresh-preview"
+        return
+      fi
       send_reply "$(resolve_target "${2:-}" "${3:-}")" "${1:-}"
       print -r -- "clear-query+refresh-preview"
       ;;
   esac
 }
 
+# A task has no pane to capture, so the preview is what the task carries: the
+# same block wts writes into a new session's context file, from the same
+# renderer, plus what `enter` will do with it. Reading the task here is the
+# payoff of the whole feature — the popup becomes where you check whether a
+# piece of work is ready to start.
+task_preview() { # $1 = task id
+  local md
+  md=$(task_context_md "$1" 2>/dev/null) || md=""
+  if [[ -z "$md" ]]; then
+    print -r -- "(task $1 is unknown here)"
+    return
+  fi
+  print -r -- "$md"
+  print -r -- "enter starts a session on this task."
+  print -r -- "tab notes on it, ctrl-e attaches a document."
+}
+
 preview() { # $1 = cursor target, $2 = cursor name
   local target capture
   target=$(resolve_target "${1:-}" "${2:-}")
-  capture=$(tmux capture-pane -p -e -S "-$SCROLLBACK" -t "$target" 2>/dev/null)
+  if [[ "$target" == task:* ]]; then
+    capture=$(task_preview "${target#task:}")
+  else
+    capture=$(tmux capture-pane -p -e -S "-$SCROLLBACK" -t "$target" 2>/dev/null)
+  fi
   [[ -n "$capture" ]] || { print -r -- "(no preview)"; return }
 
   # Command substitution already ate the trailing empty lines: the bottom of
@@ -382,12 +554,18 @@ preview() { # $1 = cursor target, $2 = cursor name
   # preview to live.
   local -a lines=("${(@f)capture}")
   local height="${FZF_PREVIEW_LINES:-20}"
-  local off=$(read_scroll "$target")
 
   # Only --preview knows how many lines were actually captured: it clamps the
   # offset and writes it back, so --scroll can count blindly.
   local max=$(( $#lines - height ))
   (( max < 0 )) && max=0
+  # A task opens on its first line, a pane on its last: see read_scroll.
+  local off
+  if [[ "$target" == task:* ]]; then
+    off=$(read_scroll "$target" "$max")
+  else
+    off=$(read_scroll "$target")
+  fi
   (( off > max )) && off=$max
   (( off < 0 )) && off=0
   write_scroll "$target" "$off"
@@ -435,6 +613,9 @@ fit_preview() { # $1 = cursor target, $2 = cursor name ; prints the action, or n
   # In reply mode the preview shows the pinned session, so the window follows
   # that pane rather than the row the cursor drifted to.
   target=$(resolve_target "${1:-}" "${2:-}")
+  # A task has no pane: leave the window where the last session put it rather
+  # than asking tmux about a target it cannot resolve.
+  [[ "$target" == task:* ]] && return 0
   width=$(tmux display-message -p -t "$target" '#{pane_width}' 2>/dev/null)
   # A gone pane, or a fzf without FZF_COLUMNS: leave the window as it is.
   [[ "$width" == <-> && "$cols" == <-> ]] || return 0
@@ -517,24 +698,115 @@ open_pr() { # $1 = session name
   return 0
 }
 
-# ─── Context document ────────────────────────────────────────────────────────
-# ctrl-e: `wts doc use` on the selected row, under `execute` like ctrl-o. With
-# no slug it opens the library picker, an inner fzf: `execute` hands over the
-# alternate screen and blocks this one until it exits — the same terminal
-# kill_session reads its y/N from. It always waits for a key: unlike ctrl-o,
-# nothing else takes the focus, and what was attached is worth reading.
-attach_doc() { # $1 = session name
+# ─── Remove ──────────────────────────────────────────────────────────────────
+# ctrl-d used to be `execute(wts rm {3})` straight from the bind. It cannot be:
+# on a task row {3} is empty, and `wts rm ''` reaches registry_resolve_name,
+# whose substring match (`[[ "$k" == *""* ]]`) matches EVERY session and opens a
+# picker offering to delete any of them. The header row already produced an empty
+# {3}, but --header-lines makes it unselectable; a task row is selectable.
+# So the guard every other verb has, in the same shape.
+remove_session() { # $1 = session name
   local name="$1"
-  [[ -n "$name" ]] || return 0   # `execute` also fires on an empty list
+  [[ -n "$name" ]] || return 0   # a task row, or an empty list
   print -n '\e[2J\e[H'
   if [[ -z "$WTS_CMD" ]]; then
     print -r -- "wts: wts not found next to this helper nor in PATH — any key"
     wait_key
     return 0
   fi
-  "$WTS_CMD" doc use "" "$name"
+  "$WTS_CMD" rm "$name" || { print -n "press any key"; wait_key }
+  return 0
+}
+
+# ─── Context document ────────────────────────────────────────────────────────
+# ctrl-e: `wts doc use` on the selected row, under `execute` like ctrl-o. With
+# no slug it opens the library picker, an inner fzf: `execute` hands over the
+# alternate screen and blocks this one until it exits — the same terminal
+# kill_session reads its y/N from. It always waits for a key: unlike ctrl-o,
+# nothing else takes the focus, and what was attached is worth reading.
+#
+# On a task row the document goes on the TASK instead, which is the difference
+# that matters: attached to a session it is gone at the merge, attached to the
+# task every later attempt at it inherits the document.
+attach_doc() { # $1 = session name, $2 = preview target
+  local name="$1" target="${2:-}"
+  if [[ -z "$name" && "$target" != task:* ]]; then
+    return 0   # the header, or an empty list
+  fi
+  print -n '\e[2J\e[H'
+  if [[ -z "$WTS_CMD" ]]; then
+    print -r -- "wts: wts not found next to this helper nor in PATH — any key"
+    wait_key
+    return 0
+  fi
+  if [[ -z "$name" ]]; then
+    "$WTS_CMD" task doc "${target#task:}"
+  else
+    "$WTS_CMD" doc use "" "$name"
+  fi
   print -n "press any key"
   wait_key
+  return 0
+}
+
+# ─── Pull a task in ──────────────────────────────────────────────────────────
+# ctrl-t: `wts task add`, whose picker is the Things one — another inner fzf
+# under `execute`, exactly like ctrl-e's library picker. This is what fills the
+# tasks section: the switcher itself never opens Things (it runs every 2 s and
+# must stay a single query on wts's own database), so a task gets in here.
+pull_task() {
+  print -n '\e[2J\e[H'
+  if [[ -z "$WTS_CMD" ]]; then
+    print -r -- "wts: wts not found next to this helper nor in PATH — any key"
+    wait_key
+    return 0
+  fi
+  "$WTS_CMD" task add
+  print -n "press any key"
+  wait_key
+  return 0
+}
+
+# ─── Start a session on a task ───────────────────────────────────────────────
+# `enter` on a task row. Not an `execute` bind: the popup has to be gone before
+# tmux's command prompt can be seen, so this runs after fzf has exited, where
+# switch-client already runs for a session.
+#
+# It pre-fills the prompt rather than creating outright, the way prefix+g does.
+# Three reasons, in order of weight: creation then goes through the `wts`
+# command-alias and so through wts-fresh, which refuses outside a repository and
+# cuts the branch from a freshly fetched origin/<default> — re-implementing that
+# here would be the third copy; the name, the layout and an extra phrase stay
+# editable, and the name is only ever a proposal; and the slug is derived with
+# WTS_NO_LLM=1, so the popup never calls the model, which is the rule.
+start_task() { # $1 = task id
+  local id="$1" title slug
+  [[ -n "$id" ]] || return 0
+  title=$(db_ro "SELECT title FROM tasks WHERE id = $(sql_str "$id")" 2>/dev/null)
+
+  slug=""
+  if [[ -n "$title" && -x "$WTS_BIN/wts-name" ]]; then
+    slug=$(WTS_NO_LLM=1 "$WTS_BIN/wts-name" "$title" 2>/dev/null) || slug=""
+  fi
+  # wts-name always answers something, but a title of nothing but stopwords can
+  # come back empty: leave the name for the user to type rather than propose one.
+  [[ "$slug" =~ '^[a-z0-9][a-z0-9-]*$' ]] || slug=""
+
+  # The alias is installed by `wts setup tmux`; without it the prompt would be
+  # pre-filled with a tmux command that does not exist. Then go straight through
+  # wts-fresh, which is what the alias runs anyway.
+  # tmux prints the alias quoted or bare depending on its value
+  # (`command-alias[100] "wts=new-window …"`), so the quote is not part of the
+  # pattern: what must precede `wts=` is anything that is not a name character,
+  # or another alias ending in "wts" would match.
+  if tmux show-options -s command-alias 2>/dev/null | grep -qE '[^a-zA-Z0-9_-]wts='; then
+    tmux command-prompt -T command -I "wts $slug --task $id " 2>/dev/null && return 0
+  fi
+  if [[ -x "$WTS_BIN/wts-fresh" ]]; then
+    tmux new-window -n wts -c '#{pane_current_path}' \
+      "$WTS_BIN/wts-fresh" ${slug:+"$slug"} --task "$id" 2>/dev/null && return 0
+  fi
+  tmux display-message "wts: could not start a session on that task" 2>/dev/null
   return 0
 }
 
@@ -605,8 +877,23 @@ if [[ "${1:-}" == "--pr" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "--rm" ]]; then
+  remove_session "${2:-}"
+  exit 0
+fi
+
 if [[ "${1:-}" == "--doc" ]]; then
-  attach_doc "${2:-}"
+  attach_doc "${2:-}" "${3:-}"
+  exit 0
+fi
+
+if [[ "${1:-}" == "--things" ]]; then
+  pull_task
+  exit 0
+fi
+
+if [[ "${1:-}" == "--start" ]]; then
+  start_task "${2:-}"
   exit 0
 fi
 
@@ -753,23 +1040,6 @@ export WTS_SWITCH_BUSY="${TMPDIR:-/tmp}/wts-switch.$$.busy"
 export WTS_SWITCH_LAST="${TMPDIR:-/tmp}/wts-switch.$$.last"
 rm -f "$WTS_SWITCH_REPLY"
 
-# The footer needs --footer (fzf 0.65) and `transform` (0.45, so `?` can leave
-# the query alone while the list is filtered). Older versions keep the popup
-# exactly as it was, and `wts keys` still prints the same list in a terminal.
-# WTS_SWITCH_FOOTER is what the bind subprocesses read, WTS_SWITCH_HELP is
-# where expanded-or-not is kept; both are exported for them.
-typeset -a footer_opts
-footer_opts=()
-if [[ -x "$WTS_BIN/wts-keys" && -n "$fzf_version" ]] && is-at-least 0.65 "$fzf_version"; then
-  export WTS_SWITCH_FOOTER=1
-  export WTS_SWITCH_HELP="${TMPDIR:-/tmp}/wts-switch.$$.help"
-  rm -f "$WTS_SWITCH_HELP"
-  footer_opts=(
-    --footer="$(footer_text)"
-    --bind="?:transform('$self' --keys toggle {q})"
-  )
-fi
-
 # ctrl-d and ctrl-x: without a resolvable wts, the binds would fail silently in
 # the popup. fzf quotes {1} and {3} itself; {1} is the display line, from which
 # --kill reads the agent state shown to the user.
@@ -777,7 +1047,9 @@ typeset -a delete_bind kill_bind
 delete_bind=()
 kill_bind=()
 if [[ -n "$WTS_CMD" ]]; then
-  delete_bind=(--bind="ctrl-d:execute('$WTS_CMD' rm {3})+reload('$self' --list)")
+  # Through --rm and not `wts rm {3}` directly: see remove_session for why an
+  # empty {3} must never reach `wts rm`.
+  delete_bind=(--bind="ctrl-d:execute('$self' --rm {3})+reload('$self' --list)")
   kill_bind=(--bind="ctrl-x:execute('$self' --kill {3} {1})+reload('$self' --list)")
 fi
 
@@ -799,7 +1071,43 @@ typeset -a doc_bind
 doc_bind=()
 if [[ -n "$WTS_CMD" && -x "$WTS_BIN/wts-doc" ]]; then
   export WTS_SWITCH_DOC=1
-  doc_bind=(--bind="ctrl-e:execute('$self' --doc {3})+refresh-preview")
+  # {2} as well as {3}: on a task row the name is empty and the target carries
+  # the id, and the document goes on the task. The reload is new with that — a
+  # task's `N ctx` count changes, where a session's row does not.
+  doc_bind=(--bind="ctrl-e:execute('$self' --doc {3} {2})+reload('$self' --list)+refresh-preview")
+fi
+
+# ctrl-t: pull a task in from Things. Bound only where Things can be read, and
+# wts-keys reads WTS_SWITCH_THINGS so the footer lists exactly the keys that
+# work — `wts task add` with no Things would open a picker over nothing.
+typeset -a things_bind
+things_bind=()
+if [[ -n "$WTS_CMD" && -x "$WTS_BIN/wts-things" ]] \
+   && "$WTS_BIN/wts-things" db >/dev/null 2>&1; then
+  export WTS_SWITCH_THINGS=1
+  things_bind=(--bind="ctrl-t:execute('$self' --things)+reload('$self' --list)")
+fi
+
+# The footer needs --footer (fzf 0.65) and `transform` (0.45, so `?` can leave
+# the query alone while the list is filtered). Older versions keep the popup
+# exactly as it was, and `wts keys` still prints the same list in a terminal.
+# WTS_SWITCH_FOOTER is what the bind subprocesses read, WTS_SWITCH_HELP is
+# where expanded-or-not is kept; both are exported for them.
+#
+# LAST, after every conditional bind above: footer_text runs wts-keys here and
+# now, and wts-keys drops the keys whose WTS_SWITCH_* flag is unset. Built before
+# them, the FIRST footer drawn listed neither ^o nor ^e nor ^t, and they only
+# appeared once `?` or reply mode rebuilt it in a subprocess that had the exports.
+typeset -a footer_opts
+footer_opts=()
+if [[ -x "$WTS_BIN/wts-keys" && -n "$fzf_version" ]] && is-at-least 0.65 "$fzf_version"; then
+  export WTS_SWITCH_FOOTER=1
+  export WTS_SWITCH_HELP="${TMPDIR:-/tmp}/wts-switch.$$.help"
+  rm -f "$WTS_SWITCH_HELP"
+  footer_opts=(
+    --footer="$(footer_text)"
+    --bind="?:transform('$self' --keys toggle {q})"
+  )
 fi
 
 # ─── Live refresh ────────────────────────────────────────────────────────────
@@ -887,6 +1195,7 @@ selection=$(print -r -- "$list" | fzf \
   "${kill_bind[@]}" \
   "${pr_bind[@]}" \
   "${doc_bind[@]}" \
+  "${things_bind[@]}" \
   --bind="ctrl-f:execute-silent('$self' --scroll {2} {3} down)+refresh-preview" \
   --bind="ctrl-b:execute-silent('$self' --scroll {2} {3} up)+refresh-preview" \
 ) || exit 0
@@ -894,6 +1203,13 @@ selection=$(print -r -- "$list" | fzf \
 [[ -n "$selection" ]] || exit 0
 
 target=$(print -r -- "$selection" | cut -f3)
-[[ -n "$target" ]] || exit 0
+
+# No session name in field 3: either the row is a task, and `enter` starts a
+# session on it, or it is nothing at all. Field 2 is where the id is.
+if [[ -z "$target" ]]; then
+  ptarget=$(print -r -- "$selection" | cut -f2)
+  [[ "$ptarget" == task:* ]] && start_task "${ptarget#task:}"
+  exit 0
+fi
 
 tmux switch-client -t "$target" 2>/dev/null || tmux attach -t "$target"

@@ -6,12 +6,28 @@
 #        wts task link [<id|url|words>] [<session>]
 #        wts task unlink [<session>]
 #        wts task new "<title>"
+#        wts task add [<id|words>]
+#        wts task note [<id>] "<text>" | [<id>] --clear
+#        wts task edit [<id>]
+#        wts task doc [<id>] [<url|path|slug>] | [<id>] --rm <slug>
 #
 # A task lives for months and gets one to N sessions; a session lives for days
 # and dies at the merge. So the task is the durable identity and the session is
 # one attempt at it — which is what lets `wts log` say "three attempts over five
 # weeks" instead of showing three unrelated branches, and what carries the Notion
 # pages, Slack threads and meeting notes that live in the task's own notes.
+#
+# `note`, `edit` and `doc` are how a task carries context on a machine where the
+# notes do not come from Things: they write task_notes and task_docs, which
+# snapshot() never touches, and `wts <name> --task <id>` turns both into the new
+# session's opening context. Every one of them takes the task of the session you
+# are in when no id is given.
+#
+# Where the id is optional, position 1 is only read as a task when it IS one —
+# a `local:` id, a `things:` link, or a row wts already has. Anything else is the
+# text or the document, so `wts task note "the spec moved"` needs no id and
+# `wts task note <15-character word>` is not mistaken for a Things uuid. Point
+# wts at a Things task once with `wts task add` and it becomes a known row.
 #
 # A task is a LABEL, not a folder: `wts ls` and the switcher stay one flat list
 # of sessions with a `*` on the linked ones, because the switcher is
@@ -27,10 +43,59 @@ WTS_BIN="${0:A:h}"
 source "$WTS_BIN/wts-db.zsh"
 
 THINGS="$WTS_BIN/wts-things"
+DOC="$WTS_BIN/wts-doc"
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 now_iso() { db_ro "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now')" 2>/dev/null }
+
+# Whether an argument IS a task, for the verbs whose id is optional. Deliberately
+# stricter than resolve_task: no bare-uuid guess and no word search, because here
+# a false positive would read the note as an id and lose the text.
+is_task_arg() {  # <arg>
+  [[ -n "${1:-}" ]] || return 1
+  [[ "$1" == local:* || "$1" == things:* ]] && return 0
+  [[ "$(db_ro "SELECT 1 FROM tasks WHERE id = $(sql_str "$1")" 2>/dev/null)" == 1 ]]
+}
+
+# The task of the session the caller is in, for `wts task note` typed inside a
+# worktree. Fails with the reason rather than silently writing nowhere.
+current_task() {
+  local s t
+  s=$(db_current_session) || {
+    print -u2 -r -- "wts task: not inside a wts session, name a task"
+    return 1
+  }
+  t=$(db_task_of_session "$s")
+  [[ -n "$t" ]] || {
+    print -u2 -r -- "wts task: '$s' serves no task (wts task link)"
+    return 1
+  }
+  print -r -- "$t"
+}
+
+# Shared by note / edit / doc: peel an optional leading task id off the
+# arguments. Answers in two globals rather than on stdout, because a command
+# substitution runs in a subshell and REPLY_ARGS set there would never reach the
+# caller — the arguments would silently vanish and every note be written empty.
+typeset -g REPLY_TASK=""
+typeset -ga REPLY_ARGS=()
+take_task_arg() {  # <args…>  -> REPLY_TASK, REPLY_ARGS
+  REPLY_TASK=""
+  REPLY_ARGS=()
+  if is_task_arg "${1:-}"; then
+    REPLY_TASK=$(resolve_task "$1") || return 1
+    shift
+  else
+    REPLY_TASK=$(current_task) || return 1
+  fi
+  [[ -n "$REPLY_TASK" ]] || return 1
+  REPLY_ARGS=("$@")
+}
+
+task_exists() {  # <id>
+  [[ "$(db_ro "SELECT 1 FROM tasks WHERE id = $(sql_str "$1")" 2>/dev/null)" == 1 ]]
+}
 
 # Snapshot a Things task into `tasks`. Last writer wins, with no merge logic at
 # all: nothing is ever written back to Things, so there is no conflict to resolve
@@ -224,10 +289,28 @@ cmd_show() {
     print -r -- "  notes:"
     print -r -- "$notes" | sed 's/^/    /'
   fi
+  # Its own block, and labelled: these are wts's, they survive a Things refresh
+  # and the source document knows nothing about them.
+  local at body
+  integer wn=0
+  while IFS=$'\x1f' read -r -d $'\x1e' at body; do
+    [[ -n "$body" ]] || continue
+    (( wn++ == 0 )) && print -r -- "  notes added in wts:"
+    print -r -- "    ($at) $body" | sed '2,$s/^/      /'
+  done < <(db_rows "SELECT substr(added_at, 1, 10), body FROM task_notes
+                    WHERE task = $(sql_str "$id") ORDER BY added_at" 2>/dev/null)
   if [[ -n "${links:-}" && "${links:-}" != "[]" ]] && command -v jq >/dev/null 2>&1; then
     print -r -- "  links:"
     print -r -- "$links" | jq -r '.[] | "    [\(.kind)] \(.url)"' 2>/dev/null
   fi
+  local slug
+  integer wd=0
+  while IFS=$'\x1f' read -r -d $'\x1e' slug; do
+    [[ -n "$slug" ]] || continue
+    (( wd++ == 0 )) && print -r -- "  documents:"
+    print -r -- "    $slug"
+  done < <(db_rows "SELECT slug FROM task_docs WHERE task = $(sql_str "$id")
+                    ORDER BY added_at" 2>/dev/null)
   print -r -- "  sessions:"
   local name state outcome pr added removed retro
   while IFS=$'\x1f' read -r -d $'\x1e' name state outcome pr added removed retro; do
@@ -324,6 +407,172 @@ cmd_new() {
   print -r -- "$id"
 }
 
+# ─── add ─────────────────────────────────────────────────────────────────────
+
+# Put a task on wts's list without creating anything: it is the snapshot that
+# makes a Things task visible to `wts task ls` and to the switcher, which read
+# the database and never open Things on their own.
+cmd_add() {
+  local id
+  db_init 2>/dev/null
+  id=$(resolve_task "${1:-}") || return 1
+  [[ -n "$id" ]] || { print -u2 -r -- "wts task add: no task chosen"; return 1 }
+  snapshot "$id" 2>/dev/null
+  if ! task_exists "$id"; then
+    print -u2 -r -- "wts task add: $id could not be read from Things"
+    return 1
+  fi
+  print -r -- "→ $(task_title "$id")"
+  print -r -- "  $id — start a session on it with: wts <name> --task $id"
+}
+
+# ─── note / edit ─────────────────────────────────────────────────────────────
+
+# Free text kept ON the task, so the second session on it starts where the first
+# left off. Appended, never merged into the Things notes: those are refreshed
+# from Things and anything written over them is lost on the next `wts task ls`.
+cmd_note() {
+  local id text
+  db_init 2>/dev/null
+  take_task_arg "$@" || return 1
+  id="$REPLY_TASK"
+  set -- "${REPLY_ARGS[@]}"
+
+  if [[ "${1:-}" == "--clear" ]]; then
+    db_q "DELETE FROM task_notes WHERE task = $(sql_str "$id")" >/dev/null 2>&1
+    print -r -- "→ notes cleared on “$(task_title "$id")”"
+    return 0
+  fi
+
+  text="$*"
+  if [[ -z "${text//[[:space:]]/}" ]]; then
+    print -u2 -r -- 'wts task note: give it some text (or --clear)'
+    return 1
+  fi
+  db_q "INSERT INTO task_notes (task, body, added_at)
+        VALUES ($(sql_str "$id"), $(sql_str "$text"), $(sql_str "$(now_iso)"))" \
+    >/dev/null 2>&1 || {
+    print -u2 -r -- "wts task note: could not write the note"
+    return 1
+  }
+  print -r -- "→ noted on “$(task_title "$id")”"
+}
+
+# The same notes in an editor, for context longer than a command line. Replaces
+# them with one row: this is the verb that rewrites, `note` is the one that adds.
+cmd_edit() {
+  local id tmp editor
+  db_init 2>/dev/null
+  take_task_arg "$@" || return 1
+  id="$REPLY_TASK"
+
+  editor="${VISUAL:-${EDITOR:-}}"
+  if [[ -z "$editor" ]]; then
+    if command -v vi >/dev/null 2>&1; then editor=vi; else
+      print -u2 -r -- "wts task edit: no \$VISUAL, no \$EDITOR and no vi (use: wts task note)"
+      return 1
+    fi
+  fi
+  # An editor needs the terminal. Under fzf's `execute` it has one; in a pipe or
+  # a hook it does not, and vi on a pipe leaves the terminal in a broken state.
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    print -u2 -r -- "wts task edit: needs a terminal (use: wts task note \"<text>\")"
+    return 1
+  fi
+
+  tmp=$(mktemp "${TMPDIR:-/tmp}/wts-task-note.XXXXXX.md") || return 1
+  # db_rows TERMINATES each row with \x1e, so deleting it would run the notes
+  # together ("…company_idrewritten by the editor"). Turned into a newline
+  # instead. A note that already holds newlines blurs into the next one in the
+  # buffer, which is harmless: this verb saves the whole buffer as ONE note, so
+  # after the first edit there is only ever one.
+  db_rows "SELECT body FROM task_notes WHERE task = $(sql_str "$id") ORDER BY added_at" \
+    2>/dev/null | tr '\036' '\n' > "$tmp"
+
+  if ! ${=editor} "$tmp"; then
+    rm -f "$tmp"
+    print -u2 -r -- "wts task edit: $editor exited non-zero, nothing written"
+    return 1
+  fi
+
+  local body
+  body=$(<"$tmp")
+  rm -f "$tmp"
+  # One transaction: an interrupted edit must not leave the task with no notes
+  # at all, which is what a DELETE followed by a failed INSERT would do.
+  if [[ -z "${body//[[:space:]]/}" ]]; then
+    db_q "DELETE FROM task_notes WHERE task = $(sql_str "$id")" >/dev/null 2>&1
+    print -r -- "→ notes cleared on “$(task_title "$id")”"
+    return 0
+  fi
+  print -r -- "BEGIN IMMEDIATE;
+DELETE FROM task_notes WHERE task = $(sql_str "$id");
+INSERT INTO task_notes (task, body, added_at)
+  VALUES ($(sql_str "$id"), $(sql_str "$body"), $(sql_str "$(now_iso)"));
+COMMIT;" | db_q >/dev/null 2>&1 || {
+    print -u2 -r -- "wts task edit: could not write the notes"
+    return 1
+  }
+  print -r -- "→ notes rewritten on “$(task_title "$id")” (${#body} characters)"
+}
+
+# ─── doc ─────────────────────────────────────────────────────────────────────
+
+# A context document on the TASK rather than on one of its sessions: every
+# session started on it inherits the document, instead of the author attaching
+# the same spec to the third attempt as to the first.
+#
+# The slug is stored, not the URL: it is what `wts doc sync` refreshes and what
+# materialize takes, so this is the same object as a document on a session.
+cmd_doc() {
+  local id slug
+  db_init 2>/dev/null
+  take_task_arg "$@" || return 1
+  id="$REPLY_TASK"
+  set -- "${REPLY_ARGS[@]}"
+
+  if [[ ! -x "$DOC" ]]; then
+    print -u2 -r -- "wts task doc: the wts-doc helper is missing"
+    return 1
+  fi
+
+  if [[ "${1:-}" == "--rm" ]]; then
+    [[ -n "${2:-}" ]] || { print -u2 -r -- "wts task doc: --rm needs a slug"; return 1 }
+    db_q "DELETE FROM task_docs WHERE task = $(sql_str "$id")
+            AND slug = $(sql_str "$2")" >/dev/null 2>&1
+    print -r -- "→ $2 detached from “$(task_title "$id")”"
+    return 0
+  fi
+
+  if [[ -n "${1:-}" ]]; then
+    slug=$("$DOC" resolve "$1") || return 1
+  else
+    slug=$("$DOC" pick) || return 1
+  fi
+  [[ -n "$slug" ]] || { print -u2 -r -- "wts task doc: no document chosen"; return 1 }
+
+  db_q "INSERT INTO task_docs (task, slug, added_at)
+        VALUES ($(sql_str "$id"), $(sql_str "$slug"), $(sql_str "$(now_iso)"))
+        ON CONFLICT(task, slug) DO UPDATE SET added_at = excluded.added_at" \
+    >/dev/null 2>&1 || {
+    print -u2 -r -- "wts task doc: could not attach $slug"
+    return 1
+  }
+  print -r -- "→ $slug attached to “$(task_title "$id")”"
+
+  # The sessions already running on this task do not get it: their context file
+  # was written when they started. Name the one command that fixes that rather
+  # than rewriting files under a working agent from here.
+  local -a live
+  live=("${(@f)$(db_ro "SELECT session FROM task_links WHERE task = $(sql_str "$id")" 2>/dev/null)}")
+  live=("${(@)live:#}")
+  if (( ${#live} )); then
+    print -r -- "  ${#live} session(s) already running; tell them with:"
+    local s
+    for s in "${live[@]}"; do print -r -- "    wts doc use $slug $s"; done
+  fi
+}
+
 # ─── Dispatch ────────────────────────────────────────────────────────────────
 
 case "${1:-ls}" in
@@ -332,6 +581,10 @@ case "${1:-ls}" in
   link)   shift; cmd_link "$@" ;;
   unlink) shift; cmd_unlink "$@" ;;
   new)    shift; cmd_new "$@" ;;
+  add)    shift; cmd_add "$@" ;;
+  note)   shift; cmd_note "$@" ;;
+  edit)   shift; cmd_edit "$@" ;;
+  doc)    shift; cmd_doc "$@" ;;
   # Not a user-facing verb: how `wts <name> --task …` turns what was typed into
   # an id, before it creates anything. Prints the id, or fails having said why.
   resolve)
@@ -358,5 +611,13 @@ case "${1:-ls}" in
     db_ro "SELECT links FROM tasks WHERE id = $(sql_str "${1:-}")" 2>/dev/null \
       | jq -r '.[]?.url // empty' 2>/dev/null
     ;;
-  *) print -u2 "usage: wts task ls|show|link|unlink|new …"; exit 2 ;;
+  # Internal, beside `links`: the library slugs the author attached to the task.
+  # Already-fetched documents, so `wts <name> --task` adds them with no fetch.
+  docs)
+    shift
+    db_init 2>/dev/null
+    db_ro "SELECT slug FROM task_docs WHERE task = $(sql_str "${1:-}")
+           ORDER BY added_at" 2>/dev/null
+    ;;
+  *) print -u2 "usage: wts task ls|show|link|unlink|new|add|note|edit|doc …"; exit 2 ;;
 esac

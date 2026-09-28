@@ -27,12 +27,13 @@ SEP=$'\x1f'
 # footer has on a half-popup list.
 typeset -ga KEYS
 KEYS=(
-  "enter${SEP}switch${SEP}switch to the highlighted session"
-  "tab${SEP}reply${SEP}reply to the agent, enter sends"
+  "enter${SEP}switch${SEP}switch, or start the task"
+  "tab${SEP}reply${SEP}reply to the agent, or note a task"
   "^x${SEP}stop${SEP}stop the session, keep the worktree"
   "^d${SEP}rm${SEP}remove session, worktree and branch"
   "^o${SEP}pr${SEP}open the pull request on GitHub"
   "^e${SEP}doc${SEP}attach a context document"
+  "^t${SEP}task${SEP}pull a task in from Things"
   "^f/^b${SEP}scroll${SEP}scroll the preview half a page"
   "^r${SEP}reload${SEP}reload the list now"
   "esc${SEP}close${SEP}close, or leave reply mode"
@@ -59,12 +60,22 @@ has_doc() {
     [[ -x "$WTS_KEYS_DIR/wts-doc" ]]
   fi
 }
+# ctrl-t only where Things can be read: `wts task add` with no Things would open
+# a picker over nothing. In a terminal, ask the helper; it answers in one glob.
+has_things() {
+  if (( IN_FOOTER )); then
+    [[ "${WTS_SWITCH_THINGS:-}" == 1 ]]
+  else
+    [[ -x "$WTS_KEYS_DIR/wts-things" ]] && "$WTS_KEYS_DIR/wts-things" db >/dev/null 2>&1
+  fi
+}
 prune_keys() {
   local raw drop
   local -a kept
   drop=()
-  has_pr  || drop+=("^o")
-  has_doc || drop+=("^e")
+  has_pr     || drop+=("^o")
+  has_doc    || drop+=("^e")
+  has_things || drop+=("^t")
   (( ${#drop} )) || return 0
   kept=()
   for raw in "${KEYS[@]}"; do
@@ -183,10 +194,22 @@ expanded() {
 
 # Reply mode: enter no longer switches and ^d / ^x are unbound, so the list's
 # line would be a lie. Also the only footer shown while `?` itself is unbound.
+#
+# Two wordings, because `enter` does two different things and the footer is the
+# only place that says which: it sends a line into an agent's pane, or it appends
+# one to a task's notes. "send" on a task would read as "send it somewhere".
 reply_line() {
   local w line="enter send · tab/esc back to the list · ^f/^b scroll"
   w=$(footer_width)
   (( ${#line} > w )) && line="enter send · esc back"
+  print -r -- "$line"
+}
+
+note_line() {
+  local w line="enter append to the task · tab/esc back to the list · ^f/^b scroll"
+  w=$(footer_width)
+  (( ${#line} > w )) && line="enter append · tab/esc back to the list"
+  (( ${#line} > w )) && line="enter append · esc back"
   print -r -- "$line"
 }
 
@@ -202,8 +225,9 @@ text() {
   # Names the command behind each key, and only the keys actually bound.
   local -a behind
   behind=("ctrl-x is 'wts stop'" "ctrl-d is 'wts rm'")
-  has_pr  && behind+=("ctrl-o is 'wts pr'")
-  has_doc && behind+=("ctrl-e is 'wts doc use'")
+  has_pr     && behind+=("ctrl-o is 'wts pr'")
+  has_doc    && behind+=("ctrl-e is 'wts doc use', or 'wts task doc' on a task")
+  has_things && behind+=("ctrl-t is 'wts task add'")
   print -r -- "  ${(j:, :)behind}."
   print -r -- ""
   print -r -- "tmux (from 'wts setup tmux')"
@@ -220,13 +244,14 @@ if [[ "${1:-}" == "--footer" ]]; then
   case "${2:-collapsed}" in
     expanded) expanded ;;
     reply)    reply_line ;;
+    note)     note_line ;;
     *)        collapsed ;;
   esac
   exit 0
 fi
 
 if [[ -n "${1:-}" && "$1" != "--text" ]]; then
-  print -u2 -r -- "usage: wts-keys [--text | --footer [collapsed|expanded|reply]]"
+  print -u2 -r -- "usage: wts-keys [--text | --footer [collapsed|expanded|reply|note]]"
   exit 2
 fi
 

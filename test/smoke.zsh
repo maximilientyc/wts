@@ -289,7 +289,7 @@ check "an empty reply sends a bare Enter" \
 check "a drifted cursor does not retarget the reply" pane_shows auth-form wts-reply-pinned
 chain=$("$SWITCH" --reply esc)
 check "esc leaves reply mode" \
-  eval 'print -r -- "$chain" | grep -q "^enable-search+.*rebind(ctrl-d,ctrl-x,ctrl-e)" && [[ ! -e "$WTS_SWITCH_REPLY" ]]'
+  eval 'print -r -- "$chain" | grep -q "^enable-search+.*rebind(ctrl-d,ctrl-x,ctrl-e,ctrl-t)" && [[ ! -e "$WTS_SWITCH_REPLY" ]]'
 check "fzf parses the leave chain" fzf_parses "$chain"
 check "tab toggles back out too" \
   eval '"$SWITCH" --reply toggle auth-form auth-form >/dev/null && "$SWITCH" --reply toggle auth-form auth-form | grep -q "^enable-search" && [[ ! -e "$WTS_SWITCH_REPLY" ]]'
@@ -345,12 +345,12 @@ check "? collapses it again" \
   eval '"$SWITCH" --keys toggle "" >/dev/null && [[ ! -e "$WTS_SWITCH_HELP" ]]'
 chain=$("$SWITCH" --reply toggle auth-form auth-form)
 check "reply mode unbinds ? and repaints the footer" \
-  eval 'print -r -- "$chain" | grep -qF "unbind(ctrl-d,ctrl-x,ctrl-e,?)" &&
+  eval 'print -r -- "$chain" | grep -qF "unbind(ctrl-d,ctrl-x,ctrl-e,ctrl-t,?)" &&
         print -r -- "$chain" | grep -qF "change-footer|enter send"'
 check "fzf parses the reply chain with its footer" fzf_parses "$chain"
 chain=$("$SWITCH" --reply esc)
 check "leaving reply mode rebinds ? and puts the list's keys back" \
-  eval 'print -r -- "$chain" | grep -qF "rebind(ctrl-d,ctrl-x,ctrl-e,?)" &&
+  eval 'print -r -- "$chain" | grep -qF "rebind(ctrl-d,ctrl-x,ctrl-e,ctrl-t,?)" &&
         print -r -- "$chain" | grep -qF "change-footer|enter switch"'
 check "fzf parses the leave chain with its footer" fzf_parses "$chain"
 unset WTS_SWITCH_FOOTER
@@ -1031,6 +1031,142 @@ check "unlink detaches without removing the session" eval '
   && "$(q "select count(*) from sessions where name = '\''tsess2'\''")" == 1 ]]'
 "$WTS" rm tsess2 -f >/dev/null
 
+# ─── Context kept ON the task ────────────────────────────────────────────────
+# The point of task_notes and task_docs: they are what a task carries between
+# its sessions, so they must survive both a Things refresh and a teardown.
+
+tt() { env WTS_NO_THINGS=1 "$WTS" task "$@" }
+
+check "task note appends, dated" eval '
+  tt note "$TASK" "the audit table needs an index" >/dev/null
+  tt note "$TASK" "finance wants a CSV export" >/dev/null
+  [[ "$(q "select count(*) from task_notes where task = '\''$TASK'\''")" == 2 ]]'
+check "task show prints them, labelled as added in wts" eval '
+  out=$(tt show "$TASK")
+  [[ "$out" == *"notes added in wts"* && "$out" == *"CSV export"* ]]'
+# The regression these two tables exist to prevent: snapshot() overwrites every
+# column it reads from Things, so notes kept in a column would be wiped by the
+# next `wts task ls`. Simulated by writing the columns snapshot() writes.
+check "a refresh of the task does not wipe them" eval '
+  q "update tasks set notes = '\''rewritten from Things'\'', links = json('\''[]'\'') where id = \"$TASK\"" >/dev/null
+  [[ "$(q "select count(*) from task_notes where task = '\''$TASK'\''")" == 2 ]]'
+# Named explicitly: `wts doc add` derives a slug from the document's own title,
+# and the point here is the task↔slug row, not the naming.
+"$WTS" doc add "$SPEC" --name taskspec >/dev/null
+# `edit` needs a terminal and the smoke test has none, so what is asserted here is
+# the refusal — a vi opened on a pipe leaves the terminal unusable, which is worse
+# than not editing. The buffer it builds is covered by the separator: db_rows
+# TERMINATES rows with \x1e, and stripping it ran the notes together.
+check "task edit without a terminal refuses, and says what to use" eval '
+  out=$(tt edit "$TASK" 2>&1 </dev/null) && false
+  [[ "$out" == *"needs a terminal"* && "$out" == *"wts task note"* ]]'
+check "task doc attaches a library slug to the task" eval '
+  tt doc "$TASK" taskspec >/dev/null
+  [[ "$(q "select slug from task_docs where task = '\''$TASK'\''")" == taskspec ]]'
+check "task docs lists it for the creation path" eval '
+  [[ "$(tt docs "$TASK")" == taskspec ]]'
+check "attaching it twice does not list it twice" eval '
+  tt doc "$TASK" taskspec >/dev/null
+  [[ "$(q "select count(*) from task_docs where task = '\''$TASK'\''")" == 1 ]]'
+check "task doc --rm detaches it again" eval '
+  tt doc "$TASK" --rm taskspec >/dev/null
+  [[ "$(q "select count(*) from task_docs where task = '\''$TASK'\''")" == 0 ]]
+  tt doc "$TASK" taskspec >/dev/null'
+
+# All four channels at once: this is what "creating a session from a task
+# inherits its context" means.
+env WTS_NO_ATTACH=1 WTS_NO_THINGS=1 "$WTS" tctx smoke --task "$TASK" >/dev/null
+check "the task title becomes the prompt when no phrase was typed" eval '
+  [[ "$(reg_field tctx prompt)" == "Ship the audit trail" ]]'
+check "the task section opens the context file" eval '
+  grep -qF "## Task: Ship the audit trail" "$WT/tctx/.wts/context.md"'
+check "the notes kept in wts are in it" eval '
+  grep -qF "finance wants a CSV export" "$WT/tctx/.wts/context.md"'
+check "the documents attached to the task are in it" eval '
+  grep -qF "idempotent" "$WT/tctx/.wts/context.md" \
+  && [[ "$(q "select json_array_length(docs) from sessions where name = '\''tctx'\''")" -ge 1 ]]'
+# The one channel that survives /clear and /compact, so the one that has to
+# repeat what the other three said once.
+check "the SessionStart hook repeats the task context" eval '
+  out=$(cd "$WT/tctx" && "$ROOT/libexec/wts/wts-context" </dev/null)
+  [[ "$out" == *"Ship the audit trail"* && "$out" == *"CSV export"* ]]'
+check "a task with notes but no document still gets a context file" eval '
+  T2=$(tt new "Rate-limit the public API")
+  tt note "$T2" "per key, not per IP" >/dev/null
+  env WTS_NO_ATTACH=1 WTS_NO_THINGS=1 "$WTS" tnodoc smoke --task "$T2" >/dev/null
+  grep -qF "per key, not per IP" "$WT/tnodoc/.wts/context.md"'
+"$WTS" rm tnodoc -f >/dev/null
+check "the context they carry outlives the session" eval '
+  "$WTS" rm tctx -f >/dev/null
+  [[ "$(q "select count(*) from task_notes where task = '\''$TASK'\''")" == 2 \
+  && "$(q "select count(*) from task_docs  where task = '\''$TASK'\''")" == 1 ]]'
+# --task through `wts new`: strip_doc_args has always read WTS_TASK_ARG, and
+# nothing ever set it, so every batch session was created linked to nothing.
+check "wts new --task links every session it creates" eval '
+  env WTS_NO_ATTACH=1 WTS_NO_THINGS=1 "$WTS" new -p smoke tbatch1 tbatch2 --task "$TASK" >/dev/null
+  [[ "$(q "select count(*) from task_links where task = '\''$TASK'\''")" == 2 ]]'
+"$WTS" rm tbatch1 -f >/dev/null
+"$WTS" rm tbatch2 -f >/dev/null
+# An option cannot come first — the stray-option guard runs before any parsing —
+# and `wts --task <id>` is the obvious thing to try. It must say which, not
+# report an unknown option, and it must create nothing.
+check "--task first is named, not reported as unknown" eval '
+  out=$(env WTS_NO_ATTACH=1 WTS_NO_THINGS=1 "$WTS" --task "$TASK" 2>&1) && false
+  [[ "$out" == *"does not name one"* && "$out" != *"unknown option"* ]]'
+refute "and it creates nothing" test -e "$WT/--task"
+
+# ─── Tasks in the switcher ───────────────────────────────────────────────────
+# The task rows share the session table, so every layout invariant asserted
+# above has to hold with one on screen — and a task must never be mistaken for a
+# session by the binds that take field 3.
+check "an open task with no session is listed" eval '
+  "$SWITCH" --list | cut -f2 | grep -q "^task:"'
+check "both producers list it, or the swap would shift every row" eval '
+  diff <("$SWITCH" --list-fast | cut -f2 | sort) <("$SWITCH" --list | cut -f2 | sort)'
+check "a task row carries no session name" eval '
+  "$SWITCH" --list | awk -F "\t" "\$2 ~ /^task:/ && \$3 != \"\" { exit 1 }"'
+check "the rows are still 3 TAB fields with a task among them" eval '
+  "$SWITCH" --list | awk -F "\t" "NF != 3 { exit 1 }" \
+  && "$SWITCH" --list-fast | awk -F "\t" "NF != 3 { exit 1 }"'
+check "and still padded to the list width" eval '
+  WTS_SWITCH_COLS=60 "$SWITCH" --list | same_width 60 \
+  && WTS_SWITCH_COLS=60 "$SWITCH" --list-fast | same_width 60'
+check "the task preview is what the task carries" eval '
+  tid=$("$SWITCH" --list | awk -F "\t" "\$2 ~ /^task:/ { print substr(\$2, 6); exit }")
+  out=$("$SWITCH" --preview "task:$tid" "")
+  [[ "$out" == *"## Task:"* && "$out" == *"enter starts a session"* ]]'
+check "WTS_SWITCH_TASKS=0 keeps them out" eval '
+  ! env WTS_SWITCH_TASKS=0 "$SWITCH" --list | cut -f2 | grep -q "^task:"'
+# tab on a task pins the task, and enter appends to its notes instead of typing
+# into a pane there is none of.
+export WTS_SWITCH_REPLY="$SANDBOX/reply-task"
+rm -f "$WTS_SWITCH_REPLY"
+check "tab on a task enters note mode" eval '
+  chain=$("$SWITCH" --reply toggle "task:$TASK" "")
+  [[ "$chain" == *"change-prompt|note on Ship the audit trail> |"* ]] \
+  && [[ "$(head -1 "$WTS_SWITCH_REPLY")" == "task:$TASK" ]]'
+check "enter appends the line to the task" eval '
+  "$SWITCH" --reply send "typed from the switcher" "task:$TASK" "" >/dev/null
+  [[ -n "$(q "select 1 from task_notes where task = '\''$TASK'\'' and body = '\''typed from the switcher'\''")" ]]'
+check "the footer says append, not send" eval '
+  [[ "$(env WTS_SWITCH_COLS=120 "$ROOT/libexec/wts/wts-keys" --footer note)" == *"enter append"* ]]'
+"$SWITCH" --reply esc >/dev/null
+unset WTS_SWITCH_REPLY
+# The bind that had to move: `wts rm ""` matches every session by substring and
+# opens a picker offering to delete any of them, and a task row hands it "".
+check "ctrl-d goes through --rm, not straight to wts rm" \
+  grep -qF "ctrl-d:execute('\$self' --rm {3})" "$SWITCH"
+check "--rm on a task row does nothing at all" eval '
+  "$SWITCH" --rm "" >/dev/null 2>&1
+  [[ "$(q "select count(*) from sessions")" == "$(q "select count(*) from sessions")" ]]'
+check "fzf accepts the ctrl-t bind" \
+  eval 'printf "x\n" | fzf --bind="ctrl-t:execute(true)+reload(true)" --filter=x'
+check "wts keys lists ^t when the switcher bound it" eval '
+  env WTS_SWITCH_THINGS=1 WTS_SWITCH_COLS=120 "$ROOT/libexec/wts/wts-keys" --footer expanded \
+    | grep -qF "pull a task in from Things"'
+refute "and drops it when it did not" eval '
+  env WTS_SWITCH_COLS=120 "$ROOT/libexec/wts/wts-keys" --footer expanded | grep -qF "^t "'
+
 # gc --apply is the primary capture path: a merged branch is torn down and must
 # leave a row behind, with gc's own verdict on how the work ended.
 # The merge is pushed: gc compares against origin/<base>, not the local one, so a
@@ -1059,8 +1195,8 @@ check "the base it was compared against is recorded" eval '
   [[ "$(q "select base from archive where session = '"'"'gcarch'"'"'")" == main ]]'
 check "the worktree really is gone" eval '[[ ! -e "$WT/gcarch" ]]'
 
-check "the schema is at version 2" eval '
-  [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 2 ]]'
+check "the schema is at version 3" eval '
+  [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 3 ]]'
 check "log and retro are info commands for wts-fresh" eval '
   grep -qE "ls\|status\|brief\|restore\|db\|log\|retro\|" "$ROOT/libexec/wts/wts-fresh"'
 
