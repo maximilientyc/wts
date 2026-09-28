@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.1 — 2026-09-28
+
+- **The `SessionStart` hook now asks for something.** `wts-context` listed the
+  other sessions and the `wts db` commands, and an agent read it as ambient
+  noise: awareness without an action. Its output ends with a MANDATORY block
+  naming the two moments that matter — check the siblings and `wts db notes
+  --all` before touching a file, migration, schema or API; `wts db set` right
+  after a change another session may depend on. No extra work at session start:
+  same single read of the database, no git status, no model call.
+
 ## 1.0.0 — 2026-09-28
 
 Major version: the state moves from files to a SQLite database. The import is
