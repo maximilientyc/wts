@@ -46,7 +46,12 @@
       # and whose charset is checked above. That keeps every string here free
       # of backslashes: shellescape's ones would be read as escapes by the YAML
       # double-quoted scalar and the file would stop parsing.
-      if ENV['WTS_RESUME'].to_s == '1'
+      # WTS_RESUME_ID is the agent's own conversation, recorded by the hooks:
+      # `--continue` would take the most recent one in the directory, which
+      # may be a side chat. Only hex and dashes get here (checked by wts too).
+      if ENV['WTS_RESUME_ID'].to_s =~ /\A[0-9a-f-]+\z/
+        %Q{" print -z 'claude --resume #{ENV['WTS_RESUME_ID']}'"}
+      elsif ENV['WTS_RESUME'].to_s == '1'
         %q{" print -z 'claude --continue'"}
       elsif doc.empty?
         %q{" print -z claude"}

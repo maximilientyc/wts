@@ -23,6 +23,8 @@ libexec/wts/wts-things     Things 3 reader, read-only: tasks, their notes and li
 libexec/wts/wts-db.zsh     the state database (SQLite): schema, import, helpers; sourced by all
                            also the one renderer for a task's context (task_context_md)
 libexec/wts/wts-context    Claude Code SessionStart hook: tells an agent about the other sessions
+libexec/wts/wts-hook       Claude Code UserPromptSubmit/Stop/Notification/SessionEnd hooks:
+                           records agent_events, rings the bell, posts the banner
 share/wts/layouts/         built-in layouts (default.yml)
 examples/layouts/          richer layouts, not installed as built-ins
 completions/_wts           zsh completion
@@ -44,7 +46,13 @@ straight from the checkout. Scripts locate each other from their own path
 - Comments explain *why* (the failure that motivated the code), not what.
 - `wts status --json` is a public contract: keys and `agent_state` values
   (`blocked working idle done failed stopped`, plus `stale`) do not change
-  without a version bump and a CHANGELOG entry. So is `wts log`: its payload
+  without a version bump and a CHANGELOG entry (1.5.0 added `agent_since` and
+  `agent_source`; adding a key is fine that way, renaming one is not).
+- A Claude Code hook never prints on stdout and always exits 0: Claude Code
+  adds a `UserPromptSubmit` hook's stdout to the conversation, and reads a
+  non-zero `Stop` hook as "block the turn, hand stderr to the model". `wts-hook`
+  does `exec >/dev/null` right after reading its payload for that reason;
+  `wts-context` is the one hook whose stdout is the point. So is `wts log`: its payload
   carries `version`, and the `outcome` vocabulary (`merged squashed
   remote-deleted removed abandoned in-progress unknown`) is closed — a seventh
   value breaks whatever agent is reading the corpus.
@@ -174,6 +182,10 @@ straight from the checkout. Scripts locate each other from their own path
   substrings **both ways**: `api-v2` resolves to `api`. Fine for `stop` and
   `brief`; a destructive verb must confirm a non-exact match, and refuse it when
   stdin is not a terminal.
+- `$name:stop` is not "the value of name, then `:stop`": zsh reads `:s` as the
+  substitution modifier (`${a[$name:stop]}` → "bad substitution"), and `:h`,
+  `:t`, `:r`, `:e`, `:p` are modifiers too. Brace the parameter in a compound
+  key: `${a[${name}:stop]}`.
 - `read -q` reads the **terminal**, never stdin: a y/N cannot be fed from a pipe
   or a file, and without a tty it fails ("not interactive and can't open
   terminal") and counts as no. So the smoke test can only check that nothing

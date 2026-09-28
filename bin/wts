@@ -87,7 +87,7 @@
 
 set -euo pipefail
 
-WTS_VERSION="1.4.1"
+WTS_VERSION="1.5.0"
 
 # ─── Install layout ──────────────────────────────────────────────────────────
 # Homebrew, `make install` and a git checkout all share the same tree:
@@ -158,6 +158,7 @@ registry_del() {
         DELETE FROM briefs WHERE session IN $in;
         DELETE FROM notes WHERE session IN $in;
         DELETE FROM task_links WHERE session IN $in;
+        DELETE FROM agent_events WHERE session IN $in;
         COMMIT;" >/dev/null 2>&1 || true
 }
 
@@ -488,13 +489,19 @@ if [[ "$1" == "setup" ]]; then
   if [[ "${2:-}" == "claude" ]]; then
     claude_settings="${CLAUDE_DIR}/settings.json"
     hook_cmd="$libexec/wts-context"
+    event_cmd="$libexec/wts-hook"
     if [[ "${3:-}" != "--install" ]]; then
       cat <<EOF
 // ─── wts setup claude (wts $WTS_VERSION) ─────────────────────────────────────
-// A Claude Code SessionStart hook. In a wts session it adds to the agent's
-// context: its session, the other sessions and their last brief, the latest
-// notes the agents left, and how to use \`wts db\`. Anywhere else it prints
-// nothing. It reads the wts database (no git status, no model call).
+// Five Claude Code hooks. SessionStart (wts-context): in a wts session it adds
+// to the agent's context its session, the other sessions and their last
+// brief, the latest notes the agents left, and how to use \`wts db\`. The four
+// others (wts-hook) record what the agent reports about itself — a turn
+// starts, ends, waits for a permission or an answer, the agent quits — which
+// is what dates the states in \`wts ls\` and the switcher, feeds the status
+// line, and rings the pane's bell and posts a banner when an agent needs you
+// (WTS_NOTIFY=0 to turn that off). Anywhere outside a wts session every hook
+// is silent. They read and write the wts database only: no git, no model.
 //
 // The permissions let an agent run what the hook asks of it without a prompt:
 // the shared notes (\`wts db\`, read anything, write its own notes only), its
@@ -507,6 +514,18 @@ if [[ "$1" == "setup" ]]; then
   "hooks": {
     "SessionStart": [
       { "hooks": [ { "type": "command", "command": "$hook_cmd", "timeout": 5 } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "$event_cmd prompt", "timeout": 10 } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "$event_cmd stop", "timeout": 10 } ] }
+    ],
+    "Notification": [
+      { "hooks": [ { "type": "command", "command": "$event_cmd notification", "timeout": 10 } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "$event_cmd end", "timeout": 10 } ] }
     ]
   },
   "permissions": {
@@ -520,22 +539,28 @@ EOF
     mkdir -p "${claude_settings:h}"
     [[ -s "$claude_settings" ]] || echo '{}' > "$claude_settings"
     cp "$claude_settings" "$claude_settings.bak"
-    # Idempotent: any earlier wts-context entry (an older install path
+    # Idempotent: on each event, any earlier wts entry (an older install path
     # included) is dropped before the current one is added; other hooks stay.
     # The allow rules are appended once each, in the user's own order.
-    if jq --arg cmd "$hook_cmd" '
-         .hooks.SessionStart = (
-           [ (.hooks.SessionStart // [])[]
-             | .hooks = [ (.hooks // [])[] | select((.command // "") | endswith("/wts-context") | not) ]
-             | select((.hooks | length) > 0) ]
-           + [ { hooks: [ { type: "command", command: $cmd, timeout: 5 } ] } ])
+    if jq --arg cmd "$hook_cmd" --arg ev "$event_cmd" '
+         def wts_free(e): [ (.hooks[e] // [])[]
+           | .hooks = [ (.hooks // [])[]
+                        | select((.command // "") | test("/wts-(context|hook)( |$)") | not) ]
+           | select((.hooks | length) > 0) ];
+         def add(e; c; t): .hooks[e] = (wts_free(e) + [ { hooks: [ { type: "command", command: c, timeout: t } ] } ]);
+         add("SessionStart"; $cmd; 5)
+         | add("UserPromptSubmit"; $ev + " prompt"; 10)
+         | add("Stop"; $ev + " stop"; 10)
+         | add("Notification"; $ev + " notification"; 10)
+         | add("SessionEnd"; $ev + " end"; 10)
          | (.permissions.allow // []) as $cur
          | .permissions.allow = $cur + (
              ["Bash(wts db:*)", "Bash(wts task note:*)", "Bash(wts task show:*)", "Bash(wts status:*)"]
              | map(select(. as $r | $cur | index($r) | not)))' \
          "$claude_settings.bak" > "$claude_settings.tmp.$$"; then
       mv "$claude_settings.tmp.$$" "$claude_settings"
-      echo "→ SessionStart hook installed in $claude_settings (backup: settings.json.bak)"
+      echo "→ hooks installed in $claude_settings (backup: settings.json.bak):"
+      echo "   SessionStart (wts-context), UserPromptSubmit, Stop, Notification, SessionEnd (wts-hook)"
       echo "   permissions.allow: wts db, wts task note, wts task show, wts status (no prompt for what the hook asks)"
       echo "   new Claude sessions pick it up; running ones on their next /clear or /compact"
     else
@@ -576,7 +601,7 @@ EOF
 # prefix+s: session switcher (fzf popup, agents that need you first).
 # Replaces tmux's default choose-tree on prefix+s.
 bind s display-popup -E -w 85% -h 70% "$libexec/wts-switch"
-# prefix+a: jump to the next agent waiting for you.
+# prefix+a: jump to the agent that has waited for you the longest.
 bind a run-shell "$libexec/wts-switch --next"
 # \`C-b :\` then \`wts <name> …\`: create a session from a freshly fetched base.
 # Absolute path on purpose: tmux execs the alias directly, without a shell, so
@@ -584,6 +609,11 @@ bind a run-shell "$libexec/wts-switch --next"
 set -s command-alias[100] 'wts=new-window -n wts -c "#{pane_current_path}" $libexec/wts-fresh'
 # prefix+g: the same prompt, pre-filled.
 bind -N "wts: new session from a fresh origin base" g command-prompt -T command -I "wts "
+# Status line: "wts: 2 blocked · 1 idle" when agents need you, nothing when
+# none does, refreshed every status-interval (15 s by default). Appended to
+# status-right: keep this after the lines that set status-right (a theme's),
+# or they overwrite it.
+set -ag status-right ' #($libexec/wts-status --line)'
 EOF
   exit 0
 fi
@@ -723,6 +753,19 @@ if [[ "$1" == "restore" ]]; then
     # fail). Reset on every iteration: the export would leak into the next one.
     export WTS_RESUME=""
     if [[ -n "$(print -rl -- "$(claude_project_dir "$workdir")"/*.jsonl(N))" ]]; then
+      WTS_RESUME=1
+    fi
+    # The exact conversation, when the hooks recorded its id: `--continue`
+    # resumes the most recent one in the directory, which may be a side chat
+    # rather than the agent's. Only an id whose transcript is still there, and
+    # only the characters `--resume` and the layout's quoting expect.
+    export WTS_RESUME_ID=""
+    resume_id=$(db_ro "SELECT claude_session FROM agent_events
+                       WHERE session = $(sql_str "$name") AND claude_session != ''
+                       ORDER BY at DESC, id DESC LIMIT 1" 2>/dev/null) || resume_id=""
+    if [[ "$resume_id" =~ '^[0-9a-f-]+$' \
+          && -f "$(claude_project_dir "$workdir")/$resume_id.jsonl" ]]; then
+      WTS_RESUME_ID="$resume_id"
       WTS_RESUME=1
     fi
 

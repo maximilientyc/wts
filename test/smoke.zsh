@@ -23,6 +23,8 @@ export CLAUDE_CONFIG_DIR="$SANDBOX/claude"
 export GIT_CONFIG_GLOBAL="$SANDBOX/gitconfig"
 export GIT_CONFIG_NOSYSTEM=1
 export WTS_NO_LLM=1
+# The hooks record events here; they must not ring a bell or post a banner.
+export WTS_NOTIFY=0
 unset TMUX WTS_LAYOUTS_PATH WTS_BRANCH_PREFIX WTS_BASE_BRANCH WTS_SUBDIR WTS_WORKTREES_BASE
 mkdir -p "$TMUX_TMPDIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME/wts/layouts" "$CLAUDE_CONFIG_DIR" "$SANDBOX/bin"
 
@@ -191,7 +193,7 @@ check "WTS_NO_LLM stays silent" eval '
 
 check "ls shows the session" eval '"$WTS" ls | grep -q "^auth-form "'
 check "status --json" eval '"$WTS" status --json | jq -e "length == 2 and all(.[]; .exists and .tmux_alive)"'
-check "status --fzf has 7 fields" eval '"$WTS" status --fzf | awk -F "\037" "NF != 7 { exit 1 }"'
+check "status --fzf has 9 fields" eval '"$WTS" status --fzf | awk -F "\037" "NF != 9 { exit 1 }"'
 
 # An interactive agent waiting for an answer needs a human: blocked, sorted first.
 jq -n --arg cwd "$WT/export-users-csv" \
@@ -484,8 +486,8 @@ check "one pass runs branch --merged once per repository" \
   eval '[[ "$(grep -c -- "--merged" "$WTS_SMOKE_BRANCHLOG")" == 1 ]]'
 
 # --no-git: agent and tmux columns only, git columns "-", same field count.
-check "status --fzf --no-git keeps 7 fields" \
-  eval '"$ROOT/libexec/wts/wts-status" --fzf --no-git | awk -F "\037" "NF != 7 { exit 1 }"'
+check "status --fzf --no-git keeps 9 fields" \
+  eval '"$ROOT/libexec/wts/wts-status" --fzf --no-git | awk -F "\037" "NF != 9 { exit 1 }"'
 check "status --fzf --no-git shows - for delta and dirty" \
   eval '"$ROOT/libexec/wts/wts-status" --fzf --no-git | awk -F "\037" "\$4 != \"-\" || \$5 != \"-\" { exit 1 }"'
 check "status --json --no-git lists every session with zeroed git columns" \
@@ -764,6 +766,16 @@ check "setup claude prints the permissions the hook needs" \
   eval '"$WTS" setup claude | grep -qF "Bash(wts db:*)"'
 check "setup claude --install allows them, once" \
   jq -e '[.permissions.allow[] | select(. == "Bash(wts db:*)")] | length == 1' "$settings"
+check "setup claude prints the four event hooks" eval '
+  out=$("$WTS" setup claude)
+  [[ "$out" == *"wts-hook prompt"* && "$out" == *"wts-hook stop"* \
+  && "$out" == *"wts-hook notification"* && "$out" == *"wts-hook end"* ]]'
+check "setup claude --install adds each event hook once" \
+  jq -e '[ .hooks.UserPromptSubmit[].hooks[], .hooks.Stop[].hooks[],
+           .hooks.Notification[].hooks[], .hooks.SessionEnd[].hooks[]
+         | select(.command | test("/wts-hook ")) ] | length == 4' "$settings"
+check "setup tmux adds the status line segment" \
+  eval '"$WTS" setup tmux | grep -qF "wts-status --line"'
 
 "$WTS" rm dbsess -f >/dev/null
 no_notes_left() { [[ "$(q "SELECT count(*) FROM notes WHERE session = 'dbsess'")" == 0 ]] }
@@ -1403,6 +1415,90 @@ check "the refresh delay is computed under LC_ALL=C" \
   grep -qF "LC_ALL=C printf '%.1f'" "$SWITCH"
 cd "$REPO"
 
+# ─── Agent events: wts-hook ──────────────────────────────────────────────────
+# What the agent reports about itself through the four Claude Code hooks: the
+# state when claude cannot be asked (the stand-in `claude agents` answers []),
+# since when, and what it waits for. WTS_NOTIFY=0 above: no bell, no banner.
+
+HOOK="$ROOT/libexec/wts/wts-hook"
+cd "$REPO"
+env WTS_NO_ATTACH=1 "$WTS" evsess smoke >/dev/null
+ev() { # <verb> <json> — the hook as Claude Code runs it: from the worktree, payload on stdin
+  (cd "$WT/evsess" && print -r -- "$2" | "$HOOK" "$1")
+}
+ev_state() { "$WTS" status --json --no-git | jq -r '.[] | select(.name == "evsess") | .agent_state // "null"' }
+
+check "a prompt event is recorded, and the hook prints nothing" eval '
+  out=$(ev prompt "{\"session_id\":\"abc-123\",\"cwd\":\"$WT/evsess\"}")
+  [[ -z "$out" ]] \
+  && [[ "$(q "select count(*) from agent_events where session = '\''evsess'\'' and event = '\''prompt'\''")" == 1 ]]'
+check "without claude agents, the state comes from the events" eval '
+  "$WTS" status --json --no-git | jq -e "
+    .[] | select(.name == \"evsess\")
+    | .agent_state == \"working\" and .agent_source == \"events\" and (.agent_since | type) == \"number\""'
+check "a notification that needs a human makes it blocked, with the question" eval '
+  ev notification "{\"session_id\":\"abc-123\",\"notification_type\":\"permission_prompt\",\"message\":\"Bash: rm -rf dist\"}"
+  "$WTS" status --json --no-git | jq -e "
+    .[] | select(.name == \"evsess\")
+    | .agent_state == \"blocked\" and .agent_waiting_for == \"Bash: rm -rf dist\""'
+check "the status line counts it" eval '
+  [[ "$("$ROOT/libexec/wts/wts-status" --line)" == *"1 blocked"* ]]'
+check "the switcher preview opens on the state and the question" eval '
+  export WTS_SWITCH_META="$SANDBOX/switch-meta"
+  "$SWITCH" --list >/dev/null
+  out=$("$SWITCH" --preview evsess evsess)
+  l=("${(@f)out}")
+  [[ "${l[1]}" == "blocked "*": Bash: rm -rf dist" ]]'
+unset WTS_SWITCH_META
+# Among the blocked, the oldest question first: that is where prefix+a lands.
+env WTS_NO_ATTACH=1 "$WTS" evold smoke >/dev/null
+q "insert into agent_events (session, claude_session, event, kind, message, at)
+   values ('evold', 'old-1', 'notification', 'permission_prompt', 'older question', strftime('%s','now') - 600)"
+check "among the blocked, the one waiting longest comes first" eval '
+  [[ "$("$WTS" status --json --no-git | jq -r "map(select(.agent_state == \"blocked\")) | .[0].name")" == evold ]]'
+check "a stop makes it idle" eval '
+  ev stop "{\"session_id\":\"abc-123\"}"
+  [[ "$(ev_state)" == idle ]]'
+check "and the status line says so" eval '
+  line=$("$ROOT/libexec/wts/wts-status" --line)
+  [[ "$line" == *"1 blocked"* && "$line" == *"1 idle"* ]]'
+check "an end event leaves no state behind" eval '
+  ev end "{\"session_id\":\"abc-123\",\"reason\":\"other\"}"
+  [[ "$(ev_state)" == null ]]'
+check "outside a wts session the hook records nothing and exits 0" eval '
+  n=$(q "select count(*) from agent_events")
+  (cd "$SANDBOX" && print "{}" | "$HOOK" prompt) \
+  && [[ "$(q "select count(*) from agent_events")" == "$n" ]]'
+check "rm drops the session's events" eval '
+  "$WTS" rm evsess -f >/dev/null
+  [[ "$(q "select count(*) from agent_events where session = '\''evsess'\''")" == 0 ]]'
+"$WTS" rm evold -f >/dev/null
+
+# Restore resumes the conversation the hooks recorded, not the latest one in
+# the directory, when its transcript is still there.
+cat > "$XDG_CONFIG_HOME/wts/layouts/resume.yml" <<'EOF'
+name: <%= ENV['WTS_NAME'] %>
+root: <%= ENV['WTS_WORKDIR'] %>
+tmux_options: -f /dev/null
+windows:
+  - main: echo "RESUME=<%= ENV['WTS_RESUME_ID'] %>/<%= ENV['WTS_RESUME'] %>"
+EOF
+env WTS_NO_ATTACH=1 "$WTS" evresume resume >/dev/null
+(cd "$WT/evresume" && print -r -- '{"session_id":"0123abcd-ef01-2345-6789-abcdef012345"}' | "$HOOK" prompt)
+"$WTS" stop evresume >/dev/null
+proj="$CLAUDE_CONFIG_DIR/projects/$(print -r -- "$WT/evresume" | sed 's/[^a-zA-Z0-9]/-/g')"
+mkdir -p "$proj" && print '{}' > "$proj/0123abcd-ef01-2345-6789-abcdef012345.jsonl"
+"$WTS" restore evresume >/dev/null
+check "restore pre-fills the conversation the hooks recorded" \
+  pane_shows evresume "RESUME=0123abcd-ef01-2345-6789-abcdef012345/1"
+check "the default layout renders a --resume pre-fill" eval '
+  env WTS_NAME=render WTS_ROOT="$SANDBOX" WTS_WORKDIR="$SANDBOX" WTS_RESTORE=1 WTS_RESUME=1 \
+    WTS_RESUME_ID=0123abcd-ef01-2345-6789-abcdef012345 WTS_DOC="" WTS_PROMPT="" \
+    tmuxinator debug --project-config "$ROOT/share/wts/layouts/default.yml" \
+  | grep -qF "resume\\ 0123abcd-ef01-2345-6789-abcdef012345"'
+"$WTS" rm evresume -f >/dev/null
+cd "$REPO"
+
 # gc --apply is the primary capture path: a merged branch is torn down and must
 # leave a row behind, with gc's own verdict on how the work ended.
 # The merge is pushed: gc compares against origin/<base>, not the local one, so a
@@ -1431,8 +1527,8 @@ check "the base it was compared against is recorded" eval '
   [[ "$(q "select base from archive where session = '"'"'gcarch'"'"'")" == main ]]'
 check "the worktree really is gone" eval '[[ ! -e "$WT/gcarch" ]]'
 
-check "the schema is at version 3" eval '
-  [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 3 ]]'
+check "the schema is at version 4" eval '
+  [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 4 ]]'
 check "log and retro are info commands for wts-fresh" eval '
   grep -qE "ls\|status\|brief\|restore\|db\|log\|retro\|" "$ROOT/libexec/wts/wts-fresh"'
 

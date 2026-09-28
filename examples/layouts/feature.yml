@@ -13,7 +13,13 @@
   task = clean.(ENV['WTS_PROMPT']).sub(/;+\z/, '').strip
   claude_cmd =
     if restore
-      ENV['WTS_RESUME'].to_s == '1' ? %q{" print -z 'claude --continue'"} : %q{" print -z claude"}
+      if ENV['WTS_RESUME_ID'].to_s =~ /\A[0-9a-f-]+\z/
+        %Q{" print -z 'claude --resume #{ENV['WTS_RESUME_ID']}'"}
+      elsif ENV['WTS_RESUME'].to_s == '1'
+        %q{" print -z 'claude --continue'"}
+      else
+        %q{" print -z claude"}
+      end
     elsif task.empty?
       'claude'
     else

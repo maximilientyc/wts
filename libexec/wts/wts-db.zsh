@@ -24,7 +24,7 @@
 
 WTS_STATE_DIR="${WTS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wts}"
 WTS_DB="${WTS_DB:-$WTS_STATE_DIR/wts.db}"
-WTS_DB_SCHEMA=3
+WTS_DB_SCHEMA=4
 
 db_available() {
   (( ${+commands[sqlite3]} ))
@@ -199,6 +199,22 @@ CREATE TABLE IF NOT EXISTS notes (
   PRIMARY KEY (session, key)
 );
 CREATE INDEX IF NOT EXISTS notes_by_time ON notes(updated_at);
+-- What the agent itself reported, through the Claude Code hooks wts-hook is
+-- installed on: prompt (UserPromptSubmit), stop (Stop), notification
+-- (Notification, kind = its notification_type, message = its text) and end
+-- (SessionEnd, kind = its reason). Written by the hook only, read by
+-- wts-status for since-when and waiting-for, and as the state itself when
+-- claude agents cannot be asked. Kept a week; gc drops removed sessions.
+CREATE TABLE IF NOT EXISTS agent_events (
+  id             INTEGER PRIMARY KEY,
+  session        TEXT NOT NULL,
+  claude_session TEXT NOT NULL DEFAULT '',
+  event          TEXT NOT NULL,
+  kind           TEXT NOT NULL DEFAULT '',
+  message        TEXT NOT NULL DEFAULT '',
+  at             INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS agent_events_by_session ON agent_events(session, at);
 -- A durable unit of work above the session: a task lives for months and gets
 -- 1..N sessions, a session lives for days. NOT a mirror of the Things database,
 -- which wts-log reads live: only the tasks wts was pointed at are here. A
