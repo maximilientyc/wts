@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.3.1 — 2026-09-28
+
+- **Fixed: opening the switcher raised a macOS privacy dialog** — "iTerm would
+  like to access data from other apps", on every single popup open. Reading
+  Things' container is a privileged operation on macOS 15+, and the switcher
+  asked `wts-things db` at startup — a real glob into that container, and a
+  real SQLite open — only to decide how to word one footer line. The verdict of
+  a probe is now cached in wts's own database under `kv['things.db']`, and the
+  switcher and `wts keys` ask `wts-things available`, which reads that and
+  nothing else. Only the commands that genuinely read Things (`wts task add`,
+  `wts log`, `ctrl-t` on an empty title) still reach for it, and each one
+  refreshes the cache. Until one of them has run, `ctrl-t` on an empty title
+  still opens the Things picker — that key press is the probe — and the footer
+  stays silent about Things rather than promising it.
+
 ## 1.3.0 — 2026-09-28
 
 - **`ctrl-t` in the switcher creates a task.** It used to only pull one in from

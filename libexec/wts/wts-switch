@@ -581,7 +581,10 @@ new_task_chain() { # $1 = title
   title="${title##[[:space:]]##}"
   title="${title%%[[:space:]]##}"
   if [[ -z "$title" ]]; then
-    if [[ "${WTS_SWITCH_THINGS:-}" == 1 ]]; then
+    # Non-empty and not just `1`: `maybe` means Things was never probed, and a
+    # key the user pressed is exactly the right place to find out — the picker
+    # says why if there is nothing to pick from, and the answer is cached.
+    if [[ -n "${WTS_SWITCH_THINGS:-}" ]]; then
       print -rn -- "$(reply leave)+execute('$self' --things)+reload('$self' --list)"
     else
       reply leave
@@ -1361,11 +1364,21 @@ fi
 # task". Things only decides what an empty title does, and wts-keys reads
 # WTS_SWITCH_THINGS so the footer says so only where it is true. Below fzf 0.45
 # the key keeps its old meaning — pull a task in from Things — where there is one.
+#
+# `available` and never `db`: reading Things' container is privileged on macOS
+# 15+ and `db` raised "iTerm would like to access data from other apps" on every
+# single popup open. The answer comes from wts's own database instead, and the
+# two values are not the same claim — `1` is "read once, say so in the footer",
+# `maybe` is "never probed, so let ctrl-t itself find out".
 typeset -a things_bind
 things_bind=()
 if [[ -n "$WTS_CMD" && -x "$WTS_BIN/wts-things" ]] \
-   && "$WTS_BIN/wts-things" db >/dev/null 2>&1; then
-  export WTS_SWITCH_THINGS=1
+   && "$WTS_BIN/wts-things" available --maybe; then
+  if "$WTS_BIN/wts-things" available; then
+    export WTS_SWITCH_THINGS=1
+  else
+    export WTS_SWITCH_THINGS=maybe
+  fi
   things_bind=(--bind="ctrl-t:execute('$self' --things)+reload('$self' --list)")
 fi
 if [[ -n "$fzf_version" ]] && is-at-least 0.45 "$fzf_version"; then

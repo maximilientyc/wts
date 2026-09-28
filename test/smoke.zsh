@@ -981,6 +981,24 @@ check "WTS_NO_THINGS is reported as the reason" eval '
   env WTS_NO_THINGS=1 "$WTS" log --since 2020-01-01 \
     | jq -e ".sources.things.reason | test(\"WTS_NO_THINGS\")" >/dev/null'
 
+# `available`: the question the switcher and the footer ask, answered from the
+# cached verdict alone. Reading Things itself is privileged on macOS ("iTerm
+# would like to access data from other apps"), so no test here may probe for
+# real either — the rows are seeded by hand, exactly as a real probe leaves them.
+THINGSBIN="$ROOT/libexec/wts/wts-things"
+q "delete from kv where key = 'things.db'"
+check "never probed: no for the footer, yes for the key that will find out" eval '
+  ! "$THINGSBIN" available && "$THINGSBIN" available --maybe'
+q "insert or replace into kv values ('things.db', '')"
+check "a probe that failed is a no for both: denied once, never asked again" eval '
+  ! "$THINGSBIN" available && ! "$THINGSBIN" available --maybe'
+q "insert or replace into kv values ('things.db', '/nowhere/main.sqlite')"
+check "a probe that succeeded is a yes, without looking at the path again" eval '
+  "$THINGSBIN" available && "$THINGSBIN" available --maybe'
+check "WTS_NO_THINGS overrides the cache" eval '
+  ! env WTS_NO_THINGS=1 "$THINGSBIN" available --maybe'
+q "delete from kv where key = 'things.db'"
+
 # The task layer. A local task, because the sandbox has no Things.
 TASK=$(env WTS_NO_THINGS=1 "$WTS" task new "Ship the audit trail")
 check "wts task new prints a local id" eval '[[ "$TASK" == local:* ]]'
@@ -1192,6 +1210,9 @@ check "an empty title without Things only leaves the mode" eval '
 "$SWITCH" --reply new >/dev/null
 check "an empty title with Things opens its picker" eval '
   [[ "$(env WTS_SWITCH_THINGS=1 "$SWITCH" --reply send "" "" "")" == *"execute("*"--things)"* ]]'
+"$SWITCH" --reply new >/dev/null
+check "and so does an unprobed Things, which is what finds out" eval '
+  [[ "$(env WTS_SWITCH_THINGS=maybe "$SWITCH" --reply send "" "" "")" == *"execute("*"--things)"* ]]'
 unset WTS_SWITCH_REPLY WTS_SWITCH_FOCUS
 check "wts keys lists ^t as a new task, Things or not" eval '
   env WTS_SWITCH_COLS=120 "$ROOT/libexec/wts/wts-keys" --footer expanded | grep -qF "new task"'
