@@ -1,9 +1,17 @@
 #!/usr/bin/env zsh
 # wts-gc — garbage collector for worktrees, branches and registry entries.
 #
-# Usage: wts gc [--apply] [--no-fetch]
+# Usage: wts gc [--apply] [--no-fetch] [--no-retro]
 #
 # Default: DRY RUN. Nothing is deleted without --apply.
+#
+# --apply also ARCHIVES what it tears down, into the `archive` table that
+# `wts log` reports: a session is only tellable once it is finished, and this
+# used to be the moment wts forgot it. The facts are collected while the
+# worktree still exists, the row is written only once the teardown succeeded,
+# and the retrospective — the one model call here — comes last, after every
+# destructive step, so a hang or a Ctrl-C costs nothing but text that
+# `wts retro` writes later. --no-retro skips that call; so does WTS_NO_LLM.
 #
 # Six categories, all restricted to the current repository:
 #   1. husk folders        — `git worktree remove` does NOT delete git-ignored
@@ -57,12 +65,15 @@ set -uo pipefail
 
 APPLY=false
 FETCH=true
+RETRO=true
+WTS_BIN="${0:A:h}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --apply)    APPLY=true ;;
     --no-fetch) FETCH=false ;;
+    --no-retro) RETRO=false ;;
     --dry-run)  ;;
-    *) print -u2 "wts gc: unknown option '$1' (--apply, --no-fetch)"; exit 2 ;;
+    *) print -u2 "wts gc: unknown option '$1' (--apply, --no-fetch, --no-retro)"; exit 2 ;;
   esac
   shift
 done
@@ -353,6 +364,26 @@ session_for_worktree() {
   db_ro "SELECT name FROM sessions WHERE worktree = $(sql_str "$w") LIMIT 1" 2>/dev/null
 }
 
+# gc's own verdict on a branch, mapped to the archive's closed vocabulary
+# (merged squashed remote-deleted removed abandoned unknown). Whether the work
+# shipped is the single most load-bearing fact of a performance review, so it is
+# stored as one of six values rather than as gc's free-text reason. "merged" and
+# "squashed" win over a deleted remote: how the work landed says more than how
+# its branch was cleaned up.
+outcome_of() {
+  case "$1" in
+    merged*)   print -r -- "merged" ;;
+    squashed*) print -r -- "squashed" ;;
+    *)
+      if [[ "$1" == *"remote deleted"* || "$1" == *gone* ]]; then
+        print -r -- "remote-deleted"
+      else
+        print -r -- "unknown"
+      fi
+      ;;
+  esac
+}
+
 # Busy agents, by worktree: the agent state comes from wts-status, the single
 # collector of it — not duplicated here. A merged branch whose agent is still
 # working (or waiting for a permission, or looks stuck) is not torn down under
@@ -613,6 +644,19 @@ fi
 print ""
 
 # ─── Execution ───────────────────────────────────────────────────────────────
+# Announced even in dry run, and only announced: --apply INSERTs into `archive`,
+# and a dry run that quietly wrote to the database would be a surprise the first
+# time someone noticed it.
+integer to_archive=0
+for rec in "${teardown[@]}"; do
+  IFS=$'\x1f' read -r b wt sess why <<< "$rec"
+  [[ -n "$sess" ]] && (( ++to_archive ))
+done
+if (( to_archive )); then
+  print "To archive (kept for wts log): $to_archive session(s)"
+  print ""
+fi
+
 if ! $APPLY; then
   if (( ${#husks} + ${#teardown} + ${#free_branches} + ${#orphans} + ${#stale_locks} > 0 )); then
     print "Nothing was deleted. Run again with: wts gc --apply"
@@ -625,6 +669,11 @@ fi
 # plus those whose worktree is going away right now.
 typeset -a purge
 purge=("${orphans[@]}")
+# The sessions whose archive row was written: what the retro phase works on.
+typeset -a archived
+archived=()
+retro_tmp=$(mktemp -d "${TMPDIR:-/tmp}/wts-gc-retro.XXXXXX") || retro_tmp=""
+[[ -n "$retro_tmp" ]] && trap 'rm -rf "$retro_tmp"' EXIT
 
 for rec in "${teardown[@]}"; do
   IFS=$'\x1f' read -r b wt sess why <<< "$rec"
@@ -635,6 +684,14 @@ for rec in "${teardown[@]}"; do
       tmux kill-session -t "=$sess" 2>/dev/null && print "✓ session $sess killed"
     fi
   fi
+  # Before anything is removed: the facts live in the worktree and the branch,
+  # both of which are about to go. `why` is already gc's own verdict on how the
+  # work ended, so it becomes the archive's outcome.
+  if [[ -n "$sess" && -n "$retro_tmp" && -z "${WTS_NO_ARCHIVE:-}" && -x "$WTS_BIN/wts-retro" ]]; then
+    "$WTS_BIN/wts-retro" collect "$sess" "$wt" "$b" "$base" "$(outcome_of "$why")" \
+      > "$retro_tmp/$sess.facts" 2>/dev/null \
+      || print -u2 "⚠ $sess: facts not collected, archiving what the registry knows"
+  fi
   # .wts/ holds the session's context documents and is git-ignored, so git
   # leaves it behind and the folder becomes a husk (category 1) on the very
   # next pass. Never a symlink, never anything but that folder.
@@ -643,6 +700,15 @@ for rec in "${teardown[@]}"; do
   fi
   if git -C "$repo_root" worktree remove "$wt" 2>/dev/null; then
     print "✓ worktree $wt removed"
+    # Only now: an archive row means "this work ended", and a worktree that
+    # could not be removed has not ended.
+    if [[ -n "$sess" && -s "$retro_tmp/$sess.facts" ]]; then
+      if "$WTS_BIN/wts-retro" store "$sess" < "$retro_tmp/$sess.facts" 2>/dev/null; then
+        archived+=("$sess")
+      else
+        print -u2 "⚠ $sess: not archived"
+      fi
+    fi
     [[ -n "$sess" ]] && purge+=("$sess")
     if git -C "$repo_root" branch -D "$b" >/dev/null 2>&1; then
       print "✓ branch $b deleted"
@@ -653,6 +719,7 @@ for rec in "${teardown[@]}"; do
     print -u2 "⚠ worktree $wt not removed (branch $b kept)"
   fi
 done
+(( ${#archived} )) && print "✓ archived ${#archived} session(s) (wts log)"
 
 # `-D` and not `-d`: a squashed branch is not "merged" in git's sense, while
 # its content is indeed in the base — which is what was checked above.
@@ -693,6 +760,7 @@ if db_available && [[ -s "$WTS_DB" ]]; then
            DELETE FROM sessions WHERE name IN $(sql_list "${purge[@]}");
            DELETE FROM briefs WHERE session NOT IN (SELECT name FROM sessions);
            DELETE FROM notes WHERE session NOT IN (SELECT name FROM sessions);
+           DELETE FROM task_links WHERE session NOT IN (SELECT name FROM sessions);
            DELETE FROM pane_hashes WHERE since < unixepoch() - 7 * 86400;
            COMMIT;" >/dev/null 2>&1; then
     (( ${#purge} )) && print "✓ registry: ${#purge} entry(ies) removed"
@@ -702,3 +770,17 @@ if db_available && [[ -s "$WTS_DB" ]]; then
 fi
 
 git -C "$repo_root" worktree prune 2>/dev/null
+
+# Last on purpose, and the only place gc calls the model. Every destructive step
+# above has finished and been reported, so a missing claude, a timeout or a
+# Ctrl-C here costs only four lines of text, which `wts retro` writes later from
+# rows already in the database. Summarizing earlier — while the facts were still
+# live — would instead put a model call per session in front of the deletions
+# and lose the whole run to one hang.
+if (( ${#archived} )) && $RETRO && [[ -z "${WTS_NO_LLM:-}" ]] \
+   && command -v claude >/dev/null 2>&1 && [[ -x "$WTS_BIN/wts-retro" ]]; then
+  print ""
+  "$WTS_BIN/wts-retro" write "${archived[@]}"
+elif (( ${#archived} )); then
+  print "  (no retrospective written: run wts retro when you want them)"
+fi

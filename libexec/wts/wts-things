@@ -1,0 +1,267 @@
+#!/usr/bin/env zsh
+# wts-things — the Things 3 task list, read from its own database.
+#
+# Usage: wts-things db                       the database it will read, or why not
+#        wts-things tasks [--status open|completed|all]
+#                         [--since <iso>] [--until <iso>] [--limit N]
+#        wts-things show <uuid>              one task as a JSON object
+#        wts-things links <uuid>             the URLs in its notes, one per line
+#        wts-things pick [--completed]       fzf over the plausible tasks -> a uuid
+#
+# READ-ONLY, by design and not by omission: wts is the corpus and Things is the
+# input, so a wts that wrote back would own the same fact twice. This helper
+# opens the database with -readonly and has no write verb. If you are tempted to
+# add one, two things to know first: the only legal channel is the things:///
+# URL scheme — never SQLite, because Things Cloud resolves the conflict by
+# discarding the local edit — and it raises the app to the foreground, which
+# rules out the one caller that would have wanted it (`wts gc --apply`).
+#
+# The schema is undocumented and Cultured Code changes it between releases, so
+# every query here names its columns and they are checked before use: a Things
+# that no longer matches degrades to "not available", with a reason, rather than
+# answering something subtly wrong. Facts verified on databaseVersion 29:
+#   * creationDate / userModificationDate / stopDate are plain Unix epoch REALs,
+#     NOT the Core Data 2001 epoch (which reads five decades into the future);
+#   * startDate / deadline are bit-packed: y = v>>16, m = (v>>12)&15, d = (v>>7)&31;
+#   * status: 0 open, 2 canceled, 3 completed. type: 0 task, 1 project, 2 heading.
+#
+# Variables: WTS_THINGS_DB (override the path; how the test suite gets a
+#            fixture), WTS_NO_THINGS=1 (behave as if Things were not installed)
+
+set -uo pipefail
+
+WTS_BIN="${0:A:h}"
+source "$WTS_BIN/wts-db.zsh"
+
+# The columns every query below names. Nine on databaseVersion 29.
+THINGS_COLUMNS=(uuid title notes status stopDate trashed type area creationDate)
+
+# ─── Locating ────────────────────────────────────────────────────────────────
+
+# The ThingsData-XXXXX segment is per-machine, so it is globbed, never
+# hardcoded. (N) because it may match nothing — zsh would otherwise print "no
+# matches found" — and (.Om) to take the newest when a machine holds more than
+# one container.
+things_db() {
+  if [[ -n "${WTS_NO_THINGS:-}" ]]; then
+    print -u2 -r -- "Things not read (WTS_NO_THINGS)"
+    return 1
+  fi
+  if [[ -n "${WTS_THINGS_DB:-}" ]]; then
+    if [[ -s "$WTS_THINGS_DB" ]]; then
+      print -r -- "$WTS_THINGS_DB"
+      return 0
+    fi
+    print -u2 -r -- "WTS_THINGS_DB points at nothing readable: $WTS_THINGS_DB"
+    return 1
+  fi
+  db_available || { print -u2 -r -- "sqlite3 not found"; return 1 }
+  local -a c
+  c=("$HOME/Library/Group Containers/JLMPQHK86H.com.culturedcode.ThingsMac"/ThingsData-*/"Things Database.thingsdatabase"/main.sqlite(N.Om))
+  if (( ${#c} == 0 )); then
+    print -u2 -r -- "Things 3 not found on this machine"
+    return 1
+  fi
+  print -r -- "${c[1]}"
+}
+
+# Read-only, always. A user's ~/.sqliterc would otherwise reformat every answer,
+# and .timeout keeps a concurrent Things write from failing the read outright.
+tq() {
+  sqlite3 -init /dev/null -readonly -batch -cmd '.timeout 5000' "$THINGS" "$@"
+}
+
+# The compatibility guard: assert the columns, then assert that the dates mean
+# what this file thinks they mean. One cheap query each, and together they turn a
+# future silent wrong answer into a named degradation.
+things_compatible() {
+  local n missing newest
+  n=$(tq "SELECT count(*) FROM pragma_table_info('TMTask')
+          WHERE name IN ($(things_col_list))" 2>/dev/null)
+  if [[ "$n" != "${#THINGS_COLUMNS}" ]]; then
+    missing=$(tq "SELECT group_concat(c) FROM (
+                    SELECT value AS c FROM json_each($(sql_str "$(things_col_json)"))
+                    WHERE value NOT IN (SELECT name FROM pragma_table_info('TMTask')))" 2>/dev/null)
+    print -u2 -r -- "this Things version has a schema wts does not know (missing: ${missing:-unknown})"
+    return 1
+  fi
+  # A completed task whose stopDate lands outside a plausible range means the
+  # epoch changed under us — exactly the failure the Core Data offset produces.
+  newest=$(tq "SELECT cast(strftime('%Y', max(stopDate), 'unixepoch') AS int)
+               FROM TMTask WHERE trashed = 0 AND status = 3 AND stopDate IS NOT NULL" 2>/dev/null)
+  if [[ -n "$newest" && "$newest" == <-> ]] && (( newest < 2000 || newest > 2100 )); then
+    print -u2 -r -- "Things dates are no longer a Unix epoch (newest completion reads as year $newest)"
+    return 1
+  fi
+  return 0
+}
+
+things_col_list() {
+  local c out=""
+  for c in "${THINGS_COLUMNS[@]}"; do out+="${out:+,}$(sql_str "$c")"; done
+  print -r -- "$out"
+}
+
+things_col_json() {
+  local c out=""
+  for c in "${THINGS_COLUMNS[@]}"; do out+="${out:+,}\"$c\""; done
+  print -r -- "[$out]"
+}
+
+# ─── Tasks ───────────────────────────────────────────────────────────────────
+
+# One statement for the whole export half. json_object escapes the notes once and
+# correctly, which matters: they are the user's own free text and hold newlines,
+# quotes and URLs.
+tasks_json() {
+  local where="$1" limit="$2"
+  tq "SELECT coalesce(json_group_array(json_object(
+        'id', uuid,
+        'source', 'things',
+        'title', coalesce(title, ''),
+        'notes', coalesce(notes, ''),
+        'status', CASE status WHEN 0 THEN 'open' WHEN 2 THEN 'canceled'
+                              WHEN 3 THEN 'completed' ELSE 'unknown' END,
+        'created_at', coalesce(strftime('%Y-%m-%dT%H:%M:%SZ', creationDate, 'unixepoch'), ''),
+        'completed_at', CASE WHEN stopDate IS NULL THEN ''
+                             ELSE strftime('%Y-%m-%dT%H:%M:%SZ', stopDate, 'unixepoch') END,
+        'modified_at', coalesce(strftime('%Y-%m-%dT%H:%M:%SZ', userModificationDate, 'unixepoch'), ''),
+        'scheduled', CASE WHEN startDate IS NULL OR startDate = 0 THEN ''
+                          ELSE printf('%04d-%02d-%02d', startDate >> 16,
+                                      (startDate >> 12) & 15, (startDate >> 7) & 31) END,
+        'area', coalesce((SELECT title FROM TMArea WHERE uuid = t.area), ''),
+        'tags', (SELECT coalesce(json_group_array(g.title), json('[]'))
+                 FROM TMTaskTag tt JOIN TMTag g ON g.uuid = tt.tags
+                 WHERE tt.tasks = t.uuid))), json('[]'))
+      FROM (SELECT * FROM TMTask
+            WHERE trashed = 0 AND type = 0 AND $where
+            ORDER BY coalesce(stopDate, userModificationDate) DESC
+            LIMIT $limit) t" 2>/dev/null
+}
+
+# The URLs in the notes become `links`, classified by host. Not a decoration: on
+# the database this was built against, 365 days of completed tasks carry 57
+# github.com links and 55 pennylane-org.slack.com ones, so the mix is itself the
+# answer to "how much of this work was not code" — which is the half a
+# code-only corpus silently drops.
+add_links() {
+  jq 'map(. + {links: [
+        (.notes | [scan("https?://[^\\s)\"'"'"'<>\\]]+")] // [])[]
+        | {url: .,
+           host: (capture("^https?://(?<h>[^/]+)").h // ""),
+           kind: (if test("github\\.com/[^/]+/[^/]+/pull/") then "pr"
+                  elif test("github\\.com/[^/]+/[^/]+/issues/") then "issue"
+                  elif test("github\\.com") then "code"
+                  elif test("slack\\.com") then "slack"
+                  elif test("notion\\.(so|com)") then "notion"
+                  elif test("figma\\.com") then "figma"
+                  elif test("sentry\\.io") then "sentry"
+                  elif test("datadoghq\\.com") then "datadog"
+                  elif test("linear\\.app|atlassian\\.net") then "ticket"
+                  elif test("docs\\.google\\.com|excalidraw") then "doc"
+                  else "other" end)}]})'
+}
+
+# ─── Verbs ───────────────────────────────────────────────────────────────────
+
+cmd_tasks() {
+  local want_status=completed since_iso="" until_iso="" limit=2000 expect=""
+  local a
+  for a in "$@"; do
+    if [[ -n "$expect" ]]; then
+      case "$expect" in
+        status) want_status="$a" ;; since) since_iso="$a" ;; until) until_iso="$a" ;; limit) limit="$a" ;;
+      esac
+      expect=""
+      continue
+    fi
+    case "$a" in
+      --status) expect=status ;; --status=*) want_status="${a#*=}" ;;
+      --since)  expect=since ;;  --since=*)  since_iso="${a#*=}" ;;
+      --until)  expect=until ;;  --until=*)  until_iso="${a#*=}" ;;
+      --limit)  expect=limit ;;  --limit=*)  limit="${a#*=}" ;;
+      *) print -u2 -r -- "wts-things tasks: unknown option $a"; return 2 ;;
+    esac
+  done
+  limit="${limit//[^0-9]/}"; : ${limit:=2000}
+
+  local where
+  case "$want_status" in
+    open)      where="status = 0" ;;
+    completed) where="status = 3" ;;
+    all)       where="1 = 1" ;;
+    *) print -u2 -r -- "wts-things tasks: --status is open, completed or all"; return 2 ;;
+  esac
+  # The window applies to the completion date, the only reliable axis: every
+  # completed task has a stopDate, and none of the other dates survives an edit.
+  [[ -n "$since_iso" ]] && where+=" AND stopDate >= strftime('%s', $(sql_str "$since_iso"))"
+  [[ -n "$until_iso" ]] && where+=" AND stopDate <= strftime('%s', $(sql_str "$until_iso"))"
+
+  local out
+  out=$(tasks_json "$where" "$limit")
+  [[ -n "$out" ]] || out='[]'
+  if command -v jq >/dev/null 2>&1; then
+    print -r -- "$out" | add_links
+  else
+    print -r -- "$out"
+  fi
+}
+
+cmd_show() {
+  local out
+  out=$(tasks_json "uuid = $(sql_str "$1")" 1)
+  [[ -n "$out" ]] || out='[]'
+  if command -v jq >/dev/null 2>&1; then
+    print -r -- "$out" | add_links | jq '.[0] // empty'
+  else
+    print -r -- "$out"
+  fi
+}
+
+cmd_links() {
+  cmd_show "$1" | jq -r '.links[]?.url' 2>/dev/null
+}
+
+# The picker. Not a flat list: on the database this was built against there are
+# 132 open tasks, of which 9 are scheduled and 11 were created in the last 90
+# days, so "everything, alphabetically" is unusable. Today and the inbox first,
+# then whatever was touched recently, and fzf to search the rest.
+cmd_pick() {
+  local want_status=open
+  [[ "${1:-}" == "--completed" ]] && want_status=completed
+  command -v fzf >/dev/null 2>&1 || { print -u2 -r -- "fzf not found"; return 1 }
+  command -v jq >/dev/null 2>&1 || { print -u2 -r -- "jq not found"; return 1 }
+
+  local rows
+  rows=$(cmd_tasks --status "$want_status" --limit 400 | jq -r '
+    sort_by((if .scheduled != "" then "0" else "1" end) + (.modified_at // ""))
+    | reverse
+    | .[]
+    | [.id,
+       ((if .scheduled != "" then "▪ " else "  " end) + .title),
+       (if (.links | length) > 0 then "\(.links | length) link(s)" else "" end),
+       (.area // "")]
+    | @tsv')
+  [[ -n "$rows" ]] || { print -u2 -r -- "no $want_status task in Things"; return 1 }
+
+  # fzf draws on /dev/tty, so this works with stdout captured by a command
+  # substitution — which is how every caller reads the answer.
+  print -r -- "$rows" \
+    | fzf --with-nth=2,3,4 --delimiter=$'\t' --height=60% --reverse \
+          --prompt="things> " --header="a task for this session" \
+    | cut -f1
+}
+
+# ─── Dispatch ────────────────────────────────────────────────────────────────
+
+THINGS=$(things_db) || exit 1
+things_compatible || exit 1
+
+case "${1:-}" in
+  db)    print -r -- "$THINGS" ;;
+  tasks) shift; cmd_tasks "$@" ;;
+  show)  shift; (( $# == 1 )) || { print -u2 "usage: wts-things show <uuid>"; exit 2 }; cmd_show "$1" ;;
+  links) shift; (( $# == 1 )) || { print -u2 "usage: wts-things links <uuid>"; exit 2 }; cmd_links "$1" ;;
+  pick)  shift; cmd_pick "$@" ;;
+  *) print -u2 "usage: wts-things db|tasks|show|links|pick …"; exit 2 ;;
+esac

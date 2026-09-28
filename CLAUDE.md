@@ -15,6 +15,9 @@ libexec/wts/wts-name       slug from a phrase (Claude Haiku, local fallback)
 libexec/wts/wts-keys       the key table: switcher footer and `wts keys`
 libexec/wts/wts-brief      done/next per session (Claude Haiku, cached)
 libexec/wts/wts-doc        context document library: fetch (any MCP), cache, materialize
+libexec/wts/wts-retro      capture at teardown: collect/store facts, write the retro (Haiku)
+libexec/wts/wts-log        the work journal as one JSON document (archive + Things)
+libexec/wts/wts-things     Things 3 reader, read-only: tasks, their notes and links
 libexec/wts/wts-db.zsh     the state database (SQLite): schema, import, helpers; sourced by all
 libexec/wts/wts-context    Claude Code SessionStart hook: tells an agent about the other sessions
 share/wts/layouts/         built-in layouts (default.yml)
@@ -36,13 +39,20 @@ straight from the checkout. Scripts locate each other from their own path
 - Comments explain *why* (the failure that motivated the code), not what.
 - `wts status --json` is a public contract: keys and `agent_state` values
   (`blocked working idle done failed stopped`, plus `stale`) do not change
-  without a version bump and a CHANGELOG entry.
+  without a version bump and a CHANGELOG entry. So is `wts log`: its payload
+  carries `version`, and the `outcome` vocabulary (`merged squashed
+  remote-deleted removed abandoned in-progress unknown`) is closed — a seventh
+  value breaks whatever agent is reading the corpus.
 - Degrade, don't die: without `claude`, `jq`, `curl` or a tmux server, the
   affected columns show `-` and the rest works. Helpers use `set -uo pipefail`
   without `-e` for that reason; `bin/wts` uses `set -euo pipefail`.
 - The model is only called on explicit commands (`wts "<phrase>"`, `wts brief`,
-  `wts doc add|sync`), never from `ls`, the switcher or hooks. `WTS_NO_LLM=1`
-  disables it. `wts-name` and `wts-brief` call it with MCP and tools **off**;
+  `wts doc add|sync`, `wts retro`, and `wts gc --apply`), never from `ls`, the
+  switcher or hooks. `WTS_NO_LLM=1` disables it. `gc` is the widest of these and
+  the one to be careful with: it earns the call because a retrospective is only
+  writable while the transcript exists, and it places it **after** the last
+  destructive step, so interrupting it loses nothing but text. `wts-name`,
+  `wts-brief` and `wts-retro` call the model with MCP and tools **off**;
   `wts-doc` is the one exception and says why in its header — fetching a page is
   precisely a job for the machine's own connectors, whose names differ from one
   machine to the next, so the allow list is enumerated, never hardcoded.
@@ -82,6 +92,18 @@ straight from the checkout. Scripts locate each other from their own path
 - Outside a tmux client, `tmux display-message -p '#S'` returns the most recently
   used session, not "none": only trust it when `$TMUX` is set.
 - Unix socket paths are capped at 104 bytes on macOS (fzf `--listen`, tmux).
+- The schema block in `db_init` is one **double-quoted** zsh string (it
+  interpolates the imports), so no comment in it may carry a backtick, a double
+  quote or a `$`. A backtick runs as a command substitution — one of them really
+  did create a worktree and a tmux session — and a double quote closes the
+  string, after which the next newline ends the assignment and the rest of the
+  schema is read as commands. Single quotes are safe.
+- `local a="$1" b="$a"` does not work: `local` declares every name before it
+  assigns, so `$a` is read while still unset and `set -u` fails. Split it.
+- In `bin/wts` (`set -e`), a bare `[[ cond ]] && cmd` as a whole statement exits
+  the script when the condition is false — the statement's own status is 1. Use
+  an `if`. Helpers have no `-e`, which is why the same line is fine there. This
+  broke `wts rm` once, silently, for every repository without `origin/HEAD`.
 - `sqlite3`: always `-init /dev/null` (a user's `~/.sqliterc` with `.mode box`
   changes every output), and `.timeout` on every connection, or a concurrent
   writer fails with "database is locked". Rows with free text (prompts span

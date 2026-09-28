@@ -1,0 +1,362 @@
+#!/usr/bin/env zsh
+# wts-task — the durable unit of work above a session.
+#
+# Usage: wts task ls [--all]
+#        wts task show <id>
+#        wts task link [<id|url|words>] [<session>]
+#        wts task unlink [<session>]
+#        wts task new "<title>"
+#
+# A task lives for months and gets one to N sessions; a session lives for days
+# and dies at the merge. So the task is the durable identity and the session is
+# one attempt at it — which is what lets `wts log` say "three attempts over five
+# weeks" instead of showing three unrelated branches, and what carries the Notion
+# pages, Slack threads and meeting notes that live in the task's own notes.
+#
+# A task is a LABEL, not a folder: `wts ls` and the switcher stay one flat list
+# of sessions with a `*` on the linked ones, because the switcher is
+# width-constrained and nesting would cost the one view that has to stay
+# scannable. The grouped view is this command.
+#
+# The link itself is per-session and dies with the session (see task_links in
+# wts-db.zsh); the durable one is the archive row, which `wts log` reads.
+
+set -uo pipefail
+
+WTS_BIN="${0:A:h}"
+source "$WTS_BIN/wts-db.zsh"
+
+THINGS="$WTS_BIN/wts-things"
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+now_iso() { db_ro "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now')" 2>/dev/null }
+
+# Snapshot a Things task into `tasks`. Last writer wins, with no merge logic at
+# all: nothing is ever written back to Things, so there is no conflict to resolve
+# — and the snapshot exists only so the archive can still name the work when
+# Things is absent, on another machine, or the task since edited.
+snapshot() {  # <uuid>
+  local id="$1" json
+  [[ -x "$THINGS" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  json=$("$THINGS" show "$id" 2>/dev/null) || return 1
+  [[ -n "$json" ]] || return 1
+
+  local title notes links st area created completed
+  # A \u001e terminator, read with -d: a task's notes are the user's own free
+  # text and hold newlines, so a plain `read` stops at the first one and loses
+  # every field after `notes`.
+  IFS=$'\x1f' read -r -d $'\x1e' title notes links st area created completed < <(
+    print -r -- "$json" | jq -r '[.title, .notes, (.links | tojson), .status,
+      .area, .created_at, .completed_at] | join("\u001f") + "\u001e"' 2>/dev/null)
+
+  db_q "INSERT INTO tasks
+          (id, source, title, notes, links, status, area, created_at, completed_at, synced_at)
+        VALUES ($(sql_str "$id"), 'things', $(sql_str "${title:-}"),
+                $(sql_str "${notes:-}"), json($(sql_str "${links:-[]}")),
+                $(sql_str "${st:-open}"), $(sql_str "${area:-}"),
+                $(sql_str "${created:-}"), $(sql_str "${completed:-}"),
+                strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        ON CONFLICT(id) DO UPDATE SET
+          title = excluded.title, notes = excluded.notes, links = excluded.links,
+          status = excluded.status, area = excluded.area,
+          completed_at = excluded.completed_at, synced_at = excluded.synced_at" \
+    >/dev/null 2>&1
+}
+
+# Title of a task, from the snapshot then from Things.
+task_title() {  # <id>
+  local t
+  t=$(db_ro "SELECT title FROM tasks WHERE id = $(sql_str "$1")" 2>/dev/null)
+  if [[ -z "$t" && -x "$THINGS" ]] && command -v jq >/dev/null 2>&1; then
+    t=$("$THINGS" show "$1" 2>/dev/null | jq -r '.title // empty' 2>/dev/null)
+  fi
+  print -r -- "$t"
+}
+
+# Turn what the user typed into a task id. A Things "Copy Link" gives
+# things:///show?id=<uuid>, so that shape is accepted whole; bare words are
+# searched in the open tasks; nothing at all opens the picker.
+resolve_task() {  # [<id|url|words>]
+  local want="${1:-}"
+  if [[ -z "$want" ]]; then
+    [[ -x "$THINGS" ]] || { print -u2 -r -- "wts task: no Things on this machine, pass an id"; return 1 }
+    "$THINGS" pick
+    return
+  fi
+  # things:///show?id=<uuid> — and any other query parameter order.
+  if [[ "$want" == things:* ]]; then
+    if [[ "$want" =~ 'id=([A-Za-z0-9-]+)' ]]; then
+      print -r -- "${match[1]}"
+      return 0
+    fi
+    print -u2 -r -- "wts task: no id in that Things link"
+    return 1
+  fi
+  # A known snapshot, or a plausible Things uuid.
+  if [[ "$(db_ro "SELECT 1 FROM tasks WHERE id = $(sql_str "$want")" 2>/dev/null)" == 1 ]]; then
+    print -r -- "$want"
+    return 0
+  fi
+  # A regex and not a glob: the (#cN,M) count form needs EXTENDED_GLOB, which a
+  # sourced helper cannot assume. Things Cloud ids are 22 alphanumerics today.
+  if [[ "$want" =~ '^[A-Za-z0-9]{15,30}$' ]] && [[ -x "$THINGS" ]] \
+     && command -v jq >/dev/null 2>&1 \
+     && [[ -n "$("$THINGS" show "$want" 2>/dev/null | jq -r '.id // empty' 2>/dev/null)" ]]; then
+    print -r -- "$want"
+    return 0
+  fi
+  # Words: search the open tasks, then every task.
+  if [[ ! -x "$THINGS" ]] || ! command -v jq >/dev/null 2>&1; then
+    print -u2 -r -- "wts task: '$want' is not a known task id"
+    return 1
+  fi
+  local -a hits
+  local st
+  for st in open all; do
+    hits=("${(@f)$("$THINGS" tasks --status "$st" --limit 500 2>/dev/null \
+      | jq -r --arg w "$want" '.[] | select(.title | ascii_downcase
+            | contains($w | ascii_downcase)) | "\(.id)\u001f\(.title)"' 2>/dev/null)}")
+    hits=("${(@)hits:#}")
+    (( ${#hits} )) && break
+  done
+  if (( ${#hits} == 0 )); then
+    print -u2 -r -- "wts task: no task matching '$want'"
+    return 1
+  fi
+  if (( ${#hits} == 1 )); then
+    print -r -- "${hits[1]%%$'\x1f'*}"
+    return 0
+  fi
+  print -u2 -r -- "wts task: '$want' matches ${#hits} tasks:"
+  local h
+  for h in "${hits[@]}"; do
+    print -u2 -r -- "  ${h%%$'\x1f'*}  ${h#*$'\x1f'}"
+  done
+  return 1
+}
+
+# ─── ls ──────────────────────────────────────────────────────────────────────
+
+cmd_ls() {
+  local all=false
+  [[ "${1:-}" == "--all" ]] && all=true
+  db_init 2>/dev/null
+
+  # Refresh the snapshots wts holds, so titles do not drift from Things.
+  local id
+  if [[ -x "$THINGS" ]]; then
+    while IFS=$'\x1f' read -r -d $'\x1e' id; do
+      [[ -n "$id" ]] && snapshot "$id"
+    done < <(db_rows "SELECT id FROM tasks WHERE source = 'things'" 2>/dev/null)
+  fi
+
+  local bold="" dim="" reset=""
+  if [[ -t 1 ]]; then bold=$'\e[1m' dim=$'\e[2m' reset=$'\e[0m'; fi
+
+  local task title st done_at n
+  integer shown=0
+  while IFS=$'\x1f' read -r -d $'\x1e' task title st done_at n; do
+    [[ -n "$task" ]] || continue
+    (( ++shown ))
+    print -r -- "${bold}◆ ${title:-$task}${reset}  ${dim}${st}${done_at:+ $done_at}  $n session(s)${reset}"
+    local name outcome pr added removed retro state
+    while IFS=$'\x1f' read -r -d $'\x1e' name state outcome pr added removed retro; do
+      [[ -n "$name" ]] || continue
+      local prl=""
+      [[ "$pr" =~ '/pull/([0-9]+)' ]] && prl="PR #${match[1]}"
+      printf '    %-26s %-12s %-12s %-14s %s\n' \
+        "$name" "$outcome" "$prl" "+$added/-$removed" \
+        "$([[ -n "$retro" ]] && print -r -- "retro ✓" || print -r -- "—")"
+    done < <(sessions_of "$task")
+  done < <(tasks_rows "$all")
+
+  (( shown )) || print -r -- "No task linked yet. Link one with: wts task link"
+}
+
+tasks_rows() {  # <all?>
+  local all="$1" having=""
+  $all || having="HAVING n > 0"
+  db_rows "
+    SELECT t.id, t.title,
+           CASE WHEN t.status = '' THEN 'unknown' ELSE t.status END,
+           substr(t.completed_at, 1, 10),
+           (SELECT count(*) FROM (
+              SELECT session FROM task_links WHERE task = t.id
+              UNION SELECT session FROM archive WHERE task = t.id)) AS n
+    FROM tasks t
+    GROUP BY t.id $having
+    ORDER BY t.completed_at DESC, t.title" 2>/dev/null
+}
+
+sessions_of() {  # <task-id>
+  db_rows "
+    SELECT session, 'archived', outcome, pr_url, added, removed, retro_delivered
+      FROM archive WHERE task = $(sql_str "$1")
+    UNION ALL
+    SELECT s.name, 'live', 'in-progress', '', 0, 0, ''
+      FROM task_links l JOIN sessions s ON s.name = l.session
+     WHERE l.task = $(sql_str "$1")
+    " 2>/dev/null
+}
+
+# ─── show ────────────────────────────────────────────────────────────────────
+
+cmd_show() {
+  local id
+  id=$(resolve_task "${1:-}") || return 1
+  [[ -n "$id" ]] || return 1
+  db_init 2>/dev/null
+  snapshot "$id" 2>/dev/null
+
+  local title notes links st
+  IFS=$'\x1f' read -r -d $'\x1e' title notes links st < <(db_rows "
+    SELECT title, notes, links, status FROM tasks WHERE id = $(sql_str "$id")" 2>/dev/null)
+  if [[ -z "${title:-}" ]]; then
+    print -u2 -r -- "wts task: $id is unknown here"
+    return 1
+  fi
+  print -r -- "$title"
+  print -r -- "  id:     $id"
+  print -r -- "  status: ${st:-unknown}"
+  if [[ -n "${notes:-}" ]]; then
+    print -r -- "  notes:"
+    print -r -- "$notes" | sed 's/^/    /'
+  fi
+  if [[ -n "${links:-}" && "${links:-}" != "[]" ]] && command -v jq >/dev/null 2>&1; then
+    print -r -- "  links:"
+    print -r -- "$links" | jq -r '.[] | "    [\(.kind)] \(.url)"' 2>/dev/null
+  fi
+  print -r -- "  sessions:"
+  local name state outcome pr added removed retro
+  while IFS=$'\x1f' read -r -d $'\x1e' name state outcome pr added removed retro; do
+    [[ -n "$name" ]] || continue
+    print -r -- "    $name ($state, $outcome)${pr:+  $pr}"
+    [[ -n "$retro" ]] && print -r -- "      delivered: $retro"
+  done < <(sessions_of "$id")
+}
+
+# ─── link / unlink ───────────────────────────────────────────────────────────
+
+cmd_link() {
+  local want="" session=""
+  local a
+  for a in "$@"; do
+    if [[ -z "$want" ]]; then want="$a"; else session="$a"; fi
+  done
+  db_init 2>/dev/null
+
+  # A task id looks nothing like a session name, but the argument order is
+  # <task> <session>: when only one is given and it names a session, take it as
+  # the session and open the picker for the task.
+  if [[ -z "$session" && -n "$want" ]] && db_has_session "$want"; then
+    session="$want"; want=""
+  fi
+  [[ -n "$session" ]] || session=$(db_current_session) || {
+    print -u2 -r -- "wts task link: not inside a wts session, name one"
+    return 1
+  }
+  db_has_session "$session" || {
+    print -u2 -r -- "wts task link: '$session' is not a registered session"
+    return 1
+  }
+
+  local id
+  id=$(resolve_task "$want") || return 1
+  [[ -n "$id" ]] || { print -u2 -r -- "wts task link: no task chosen"; return 1 }
+
+  snapshot "$id" 2>/dev/null
+  db_q "INSERT INTO task_links (session, task, linked_at)
+        VALUES ($(sql_str "$session"), $(sql_str "$id"), $(sql_str "$(now_iso)"))
+        ON CONFLICT(session) DO UPDATE SET
+          task = excluded.task, linked_at = excluded.linked_at" >/dev/null 2>&1 || {
+    print -u2 -r -- "wts task link: could not write the link"
+    return 1
+  }
+  print -r -- "→ $session serves “$(task_title "$id")”"
+
+  # The URLs the task carries are exactly the context an agent starting on it
+  # would otherwise be told to go and find. Printed rather than attached: making
+  # `wts doc` fetch one to three pages per link would put minutes in front of a
+  # session, and `wts doc use` is the one command that knows how to tell a live
+  # agent about a new document.
+  local links
+  links=$(db_ro "SELECT links FROM tasks WHERE id = $(sql_str "$id")" 2>/dev/null)
+  if [[ -n "$links" && "$links" != "[]" ]] && command -v jq >/dev/null 2>&1; then
+    local n
+    n=$(print -r -- "$links" | jq 'length' 2>/dev/null)
+    if [[ "$n" == <-> ]] && (( n > 0 )); then
+      print -r -- "  $n link(s) in its notes; attach one with:"
+      print -r -- "$links" | jq -r --arg s "$session" \
+        '.[] | "    wts doc use \(.url) \($s)"' 2>/dev/null
+    fi
+  fi
+}
+
+cmd_unlink() {
+  local session="${1:-}"
+  db_init 2>/dev/null
+  [[ -n "$session" ]] || session=$(db_current_session) || {
+    print -u2 -r -- "wts task unlink: not inside a wts session, name one"
+    return 1
+  }
+  db_q "DELETE FROM task_links WHERE session = $(sql_str "$session")" >/dev/null 2>&1
+  print -r -- "→ $session serves no task"
+}
+
+# ─── new ─────────────────────────────────────────────────────────────────────
+
+# A task that exists only in wts, for a machine without Things. Its id is
+# prefixed so it can never collide with a Things Cloud uuid.
+cmd_new() {
+  local title="$*"
+  [[ -n "$title" ]] || { print -u2 -r -- 'wts task new: give it a title'; return 1 }
+  db_init 2>/dev/null
+  local id="local:$(db_ro "SELECT lower(hex(randomblob(8)))" 2>/dev/null)"
+  db_q "INSERT INTO tasks (id, source, title, status, created_at, synced_at)
+        VALUES ($(sql_str "$id"), 'local', $(sql_str "$title"), 'open',
+                strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))" >/dev/null 2>&1 || {
+    print -u2 -r -- "wts task new: could not write the task"
+    return 1
+  }
+  print -r -- "$id"
+}
+
+# ─── Dispatch ────────────────────────────────────────────────────────────────
+
+case "${1:-ls}" in
+  ls)     shift 2>/dev/null; cmd_ls "$@" ;;
+  show)   shift; cmd_show "$@" ;;
+  link)   shift; cmd_link "$@" ;;
+  unlink) shift; cmd_unlink "$@" ;;
+  new)    shift; cmd_new "$@" ;;
+  # Not a user-facing verb: how `wts <name> --task …` turns what was typed into
+  # an id, before it creates anything. Prints the id, or fails having said why.
+  resolve)
+    shift
+    db_init 2>/dev/null
+    id=$(resolve_task "${1:-}") || exit 1
+    [[ -n "$id" ]] || exit 1
+    snapshot "$id" 2>/dev/null
+    print -r -- "$id"
+    ;;
+  # Also internal: the one line `wts <name> --task` prints once it has linked.
+  title)
+    shift
+    db_init 2>/dev/null
+    task_title "${1:-}"
+    ;;
+  # The URLs the task carries, one per line. From the snapshot and not from
+  # Things, so a local task works too and a machine without Things still has
+  # whatever was recorded when the task was last seen.
+  links)
+    shift
+    db_init 2>/dev/null
+    command -v jq >/dev/null 2>&1 || exit 0
+    db_ro "SELECT links FROM tasks WHERE id = $(sql_str "${1:-}")" 2>/dev/null \
+      | jq -r '.[]?.url // empty' 2>/dev/null
+    ;;
+  *) print -u2 "usage: wts task ls|show|link|unlink|new …"; exit 2 ;;
+esac

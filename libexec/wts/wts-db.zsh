@@ -7,6 +7,9 @@
 #   doc_cache    wts-doc's fetched documents
 #   kv           small caches (wts-doc's connector list)
 #   notes        what the Claude agents leave for each other (`wts db set`)
+#   tasks        the durable unit of work above a session (a Things 3 task)
+#   task_links   which session serves which task, while the session lives
+#   archive      finished work: what `wts log` reports and nothing ever deletes
 #
 # Why a database: the registry used to be one JSON file rewritten whole with
 # `jq … > tmp && mv` by bin/wts, wts-gc and wts-doc. Two writers at once lost one
@@ -19,7 +22,7 @@
 
 WTS_STATE_DIR="${WTS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wts}"
 WTS_DB="${WTS_DB:-$WTS_STATE_DIR/wts.db}"
-WTS_DB_SCHEMA=1
+WTS_DB_SCHEMA=2
 
 db_available() {
   (( ${+commands[sqlite3]} ))
@@ -78,7 +81,20 @@ sql_list() {
 db_init() {
   db_available || return 1
   [[ -n "${_WTS_DB_READY:-}" ]] && return 0
-  if [[ -s "$WTS_DB" && "$(db_q 'PRAGMA user_version' 2>/dev/null)" == "$WTS_DB_SCHEMA" ]]; then
+  # `>=` and not `==`: a git checkout and a Homebrew install share this database
+  # (see CLAUDE.md), and an older binary testing for equality wrote its own,
+  # lower version back — the two then migrated against each other forever, one
+  # write transaction per process each way. Every change here is additive, so a
+  # database from a newer wts is readable by an older one.
+  # Still guarded by -s: db_q opens read-write and would create the file.
+  # An `if` and not `[[ … ]] && v=…`: bin/wts runs under `set -e` and sources
+  # this file, so a guard that is false on a database that does not exist yet
+  # would exit before the schema was ever created — every first run, silently.
+  local v=""
+  if [[ -s "$WTS_DB" ]]; then
+    v=$(db_q 'PRAGMA user_version' 2>/dev/null) || v=""
+  fi
+  if [[ "$v" =~ '^[0-9]+$' ]] && (( v >= WTS_DB_SCHEMA )); then
     _WTS_DB_READY=1
     return 0
   fi
@@ -171,6 +187,97 @@ CREATE TABLE IF NOT EXISTS notes (
   PRIMARY KEY (session, key)
 );
 CREATE INDEX IF NOT EXISTS notes_by_time ON notes(updated_at);
+-- A durable unit of work above the session: a task lives for months and gets
+-- 1..N sessions, a session lives for days. NOT a mirror of the Things database,
+-- which wts-log reads live: only the tasks wts was pointed at are here. A
+-- snapshot is kept anyway, because the archive must still be able to name the
+-- work when Things is uninstalled, the task edited, or the machine another one.
+-- source: 'things' (id is TMTask.uuid, the Things Cloud id, stable across
+-- devices) or 'local', because wts has to work on a machine without Things.
+CREATE TABLE IF NOT EXISTS tasks (
+  id           TEXT PRIMARY KEY,
+  source       TEXT NOT NULL DEFAULT 'things',
+  title        TEXT NOT NULL DEFAULT '',
+  notes        TEXT NOT NULL DEFAULT '',
+  links        TEXT NOT NULL DEFAULT '[]',
+  status       TEXT NOT NULL DEFAULT 'open',
+  area         TEXT NOT NULL DEFAULT '',
+  created_at   TEXT NOT NULL DEFAULT '',
+  completed_at TEXT NOT NULL DEFAULT '',
+  synced_at    TEXT NOT NULL
+);
+-- The live link, dropped with its session like briefs and notes: a session name
+-- is reused (wts rm auth-form, then wts auth-form again), so a link that
+-- outlived its session would hand the new incarnation the old one's task. The
+-- durable link is archive.task, whose row is identified by (session,
+-- created_at) and cannot be confused that way.
+-- Nothing below may carry a backtick, a double quote or a dollar sign: this
+-- whole block is one double-quoted zsh string (it interpolates the import
+-- statements). A backtick runs as a command substitution, and a double quote
+-- closes the string so the next newline ends the assignment and the rest of the
+-- schema is read as commands. Both were found the hard way. Single quotes are
+-- fine, which is why the SQL defaults below use them.
+CREATE TABLE IF NOT EXISTS task_links (
+  session   TEXT PRIMARY KEY,
+  task      TEXT NOT NULL,
+  linked_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS task_links_by_task ON task_links(task);
+-- Finished work, written at teardown and never deleted: this is the index that
+-- wts rm and wts gc used to destroy at the very moment it was complete. It
+-- holds a pointer to the Claude transcript and a generated retrospective rather
+-- than the conversation — and the retro is what survives, because Claude Code
+-- deletes transcripts after 30 days by default while a performance review looks
+-- six months back.
+--
+-- A table of its own and not a status column on sessions: a dead row there
+-- would reach registry_json() and so wts-status, wts ls, the switcher's
+-- two-second tick, wts-doc's agent_pane_of and wts-gc's busy check, five
+-- readers whose shared invariant is that the worktree exists — and
+-- registry_prune() would delete it on the next listing anyway.
+--
+-- (session, created_at) is UNIQUE and not the primary key: INSERT OR IGNORE
+-- then makes a second capture of the same session a no-op, and the rowid gives
+-- wts-log a stable cursor.
+CREATE TABLE IF NOT EXISTS archive (
+  id               INTEGER PRIMARY KEY,
+  session          TEXT NOT NULL,
+  task             TEXT NOT NULL DEFAULT '',
+  repo_root        TEXT NOT NULL DEFAULT '',
+  branch           TEXT NOT NULL DEFAULT '',
+  base             TEXT NOT NULL DEFAULT '',
+  subdir           TEXT NOT NULL DEFAULT '',
+  prompt           TEXT NOT NULL DEFAULT '',
+  context          TEXT NOT NULL DEFAULT '',
+  docs             TEXT NOT NULL DEFAULT '[]',
+  brief            TEXT NOT NULL DEFAULT '',
+  notes            TEXT NOT NULL DEFAULT '{}',
+  outcome          TEXT NOT NULL DEFAULT 'unknown',
+  pr_url           TEXT NOT NULL DEFAULT '',
+  title            TEXT NOT NULL DEFAULT '',
+  commits          TEXT NOT NULL DEFAULT '',
+  files            TEXT NOT NULL DEFAULT '',
+  added            INTEGER NOT NULL DEFAULT 0,
+  removed          INTEGER NOT NULL DEFAULT 0,
+  commit_count     INTEGER NOT NULL DEFAULT 0,
+  file_count       INTEGER NOT NULL DEFAULT 0,
+  transcript       TEXT NOT NULL DEFAULT '',
+  claude_session   TEXT NOT NULL DEFAULT '',
+  transcript_bytes INTEGER NOT NULL DEFAULT 0,
+  transcript_mtime INTEGER NOT NULL DEFAULT 0,
+  retro_delivered  TEXT NOT NULL DEFAULT '',
+  retro_resisted   TEXT NOT NULL DEFAULT '',
+  retro_resolved   TEXT NOT NULL DEFAULT '',
+  retro_abandoned  TEXT NOT NULL DEFAULT '',
+  retro_model      TEXT NOT NULL DEFAULT '',
+  retro_error      TEXT NOT NULL DEFAULT '',
+  retro_at         INTEGER NOT NULL DEFAULT 0,
+  created_at       TEXT NOT NULL DEFAULT '',
+  finished_at      TEXT NOT NULL,
+  UNIQUE (session, created_at)
+);
+CREATE INDEX IF NOT EXISTS archive_by_finish ON archive(finished_at);
+CREATE INDEX IF NOT EXISTS archive_by_task   ON archive(task);
 $imports
 PRAGMA user_version = $WTS_DB_SCHEMA;
 COMMIT;"
@@ -184,23 +291,33 @@ COMMIT;"
     mv -f "$old" "$old.migrated" 2>/dev/null
     print -u2 -r -- "→ state imported into $WTS_DB ($(db_q 'SELECT count(*) FROM sessions') sessions; old file kept as sessions.json.migrated)"
   fi
-  rm -rf "$WTS_STATE_DIR/brief" "$WTS_STATE_DIR/panehash" 2>/dev/null
-  rm -f "$docdir"/*.{md,json}(N) "$docdir"/.*(N) "$WTS_STATE_DIR"/sessions.json.tmp.*(N) 2>/dev/null
-  rmdir "$docdir" 2>/dev/null
+  # Each `|| true`: bin/wts runs under `set -e` and sources this file, and on a
+  # fresh install none of these paths exists — `rmdir` on a missing directory
+  # returns 1 and used to abort the very first wts command of a new state
+  # directory, after the schema was created but before anything was printed.
+  rm -rf "$WTS_STATE_DIR/brief" "$WTS_STATE_DIR/panehash" 2>/dev/null || true
+  rm -f "$docdir"/*.{md,json}(N) "$docdir"/.*(N) "$WTS_STATE_DIR"/sessions.json.tmp.*(N) 2>/dev/null || true
+  rmdir "$docdir" 2>/dev/null || true
   _WTS_DB_READY=1
   return 0
 }
 
 # The registry as one JSON object, in the exact shape of the pre-1.0
 # sessions.json ({name: {profile, repo_root, …, docs: [...]}}): the jq readers
-# kept their filters, only their input changed.
+# kept their filters, only their input changed. `task` and `task_title` were
+# added on top, by correlated subquery over a table of at most a few dozen rows —
+# additive, so a reader using // defaults is unaffected.
 registry_json() {
   local out
   out=$(db_ro "SELECT json_group_object(name, json_object(
       'profile', profile, 'repo_root', repo_root, 'worktree', worktree,
       'branch', branch, 'subdir', subdir, 'context', context, 'prompt', prompt,
-      'docs', json(docs), 'created_at', created_at))
-    FROM (SELECT * FROM sessions ORDER BY name)" 2>/dev/null)
+      'docs', json(docs), 'created_at', created_at,
+      'task', coalesce((SELECT task FROM task_links l WHERE l.session = s.name), ''),
+      'task_title', coalesce((SELECT t.title FROM task_links l
+                              JOIN tasks t ON t.id = l.task
+                              WHERE l.session = s.name), '')))
+    FROM (SELECT * FROM sessions ORDER BY name) s" 2>/dev/null)
   [[ -n "$out" ]] || out='{}'
   print -r -- "$out"
 }

@@ -124,7 +124,10 @@ wts restore [name...]
 wts stop <name>
 wts pr [name]
 wts rm <name> [-f]
-wts gc [--apply] [--no-fetch]
+wts gc [--apply] [--no-fetch] [--no-retro]
+wts log [--since <when>] [--until <when>] [--task <id>] [--brief] [--no-notes]
+wts retro [name...] [--force]
+wts task ls | show <id> | link [<id>] [name] | unlink [name] | new "<title>"
 wts layouts
 wts keys
 wts db path | schema | sql "<SELECT ...>" | notes [--all] | get | set | del
@@ -526,6 +529,73 @@ entirely present in it, whatever the merge method, and is deleted with
 - An `index.lock` is only removed once it is empty, older than `WTS_LOCK_STALE_AFTER`
   (5 min) and held by no live process: deleting a lock somebody owns would corrupt
   their index.
+
+## The work journal: `wts log`
+
+```sh
+wts log                             # the last 180 days, as JSON
+wts log --since '-6 months'         # or an ISO date: --since 2026-04-01
+wts log --brief                     # titles, outcomes, retros — without the bulk
+wts retro                           # write the retrospectives gc could not
+```
+
+**`wts gc --apply` and `wts rm` now archive what they tear down.** They used to do
+the opposite: `registry_del` and gc's closing transaction deleted the session row,
+its brief and its notes — so the moment a piece of work became tellable was the
+moment wts forgot it. What is kept, per finished session: the phrase it started
+from, the branch and its base, the outcome (`merged`, `squashed`, `remote-deleted`,
+`removed`, `abandoned`), the pull request, the commit subjects, the paths touched,
+the diffstat, the notes the agents left each other, the last brief — and a
+four-line retrospective.
+
+**Why a retrospective and not just a pointer to the conversation.** Claude Code
+deletes transcripts after 30 days by default. On the machine this was built on:
+275 transcripts, 148 MB, **none older than 30 days**. A self-assessment looks six
+months back, so by the time you need it the only trace of *how* the work went is
+already gone. `wts gc --apply` therefore asks Haiku, once per finished session and
+while the transcript is still there, for four lines:
+
+```
+delivered: BalanceMovement and its 47 collaborators moved into packs/banking
+resisted:  the Packwerk boundary check failed on two circular references
+resolved:  inverted the dependency with an event rather than a privacy exception
+abandoned: dropping the deprecated alias in the same PR — deferred a release
+```
+
+`resisted` and `resolved` are the parts a task title can never carry, and they are
+read mostly from **your own corrections to the agent** — "no, that breaks
+idempotency", "revert that" — which is the only place friction is recorded.
+
+wts also keeps a gzipped copy of the transcript (`~/.local/state/wts/transcripts/`,
+about 2–5 MB per semester), so `wts log` can tell you whether drilling into the raw
+conversation is still possible: each session carries
+`transcript.available`, tested at export time rather than promised.
+
+**The links you keep in a task become context.** `wts <name> --task <id>` reads
+the URLs out of the task's notes — the Notion page, the meeting minutes, the Slack
+thread — and attaches them as [context documents](#context-documents-wts-doc), so
+the agent opens on them. They are recorded as **pointers**, not fetched: a task
+carries one to three links, the fetch model is sonnet with a 90 s cap, and paying
+that at creation would put minutes in front of a starting agent. A pointer is also
+likelier to work — a Slack permalink or a private Notion page is exactly what the
+sandboxed fetch cannot read and the agent in the pane can. `wts doc sync` fetches
+them later, at your pace.
+
+**Where the model is called, and where it is not.** Only in `wts gc --apply`, and
+only after every destructive step has finished and been reported — so a timeout, a
+missing `claude` or a Ctrl-C there costs nothing but text, which `wts retro` writes
+later from rows already in the database. `wts rm` never calls it: it is synchronous
+with a human waiting, and often used on work being abandoned. `wts gc --no-retro`
+and `WTS_NO_LLM=1` skip it; the facts are archived either way.
+
+**A dry run still writes nothing.** `wts gc` announces `To archive (kept for wts
+log): 3 session(s)` and stops there.
+
+**Privacy.** This is the most sensitive thing wts produces: prompts, commit
+subjects, file paths, agent notes and a full transcript copy. The database is
+`chmod 600`, but `wts log` prints all of it on stdout. `--no-notes` drops the free
+text, `--brief` drops the bulk, `WTS_ARCHIVE_TRANSCRIPT=0` stops the transcript
+copy, and `WTS_NO_ARCHIVE=1` stops the capture altogether.
 
 ## Persistence and restore
 
