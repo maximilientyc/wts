@@ -346,22 +346,34 @@ not only *where* to go back to.
 
 On a task row:
 
-- **`enter` starts a session on it.** The name is derived from the title
-  (`Ship the audit trail` → `ship-audit-trail`), and creation goes through the
-  same path as `prefix+g` — so the branch is still cut from a freshly fetched
-  base, it still refuses outside a repository, and the popup never calls the
-  model. Nothing to confirm: `enter` acts on the row, the way it does on a
-  session. When you want to compose the creation by hand — another layout, an
-  extra phrase — `prefix+g` is still the way, and the preview has already told
-  you what the task carries.
+- **`enter` asks what to do with it**, on a second screen in the same popup:
+  - **new session from a prompt** — pre-filled with the title; the agent opens on
+    it and wts names the session from it (`wts-fresh "<prompt>" --task <id>`);
+  - **new session from a branch name** — pre-filled with a name derived from the
+    title; a `feature/` typed by habit is dropped, wts adds its own prefix
+    (`wts-fresh <name> --task <id>`);
+  - **attach to a session** — for work that started before the task was written
+    down (`wts task link`), then switches to it. The agent already running sees
+    the task at its next `/clear`.
+
+  Creation goes through `wts-fresh`, the same path as `prefix+g`: the branch is
+  cut from a freshly fetched base and it refuses outside a repository. `esc` goes
+  back to the list.
 - **`tab` notes on it**, the way `tab` replies to an agent: the prompt becomes
   `note on <task>>` and `enter` appends the line to the task's notes. This is the
   fastest way to put something where the next session on this task will find it.
 - **`ctrl-e` attaches a document to the task** rather than to a session, so every
   later attempt at it inherits the document.
-- **`ctrl-t` pulls a task in from Things** (`wts task add`), which is how a task
-  gets on this list in the first place: the switcher only ever reads its own
-  database — one query, no Things, no git, no model, because it runs every 2 s.
+
+
+![ctrl-t typing a task into the switcher, the new row selected with its preview, enter on it offering a new session from a prompt or a branch name or attaching it to a session, a session created from the branch name feature/migration-guide, and a second task attached to an existing session](docs/new-task.gif)
+
+Anywhere in the list, **`ctrl-t` creates a task**: the prompt becomes
+`new task>`, you type the title, `enter` creates it (`wts task new`) and puts the
+cursor on it — ready for `tab`, `ctrl-e` or `enter`. On an empty title, `enter`
+pulls one in from Things instead (`wts task add`), where Things is installed. The
+switcher itself only ever reads its own database — one query, no Things, no git,
+no model, because it runs every 2 s.
 
 A task already being worked on is not listed twice: it is already on screen as
 its session's row, with the `*` in SUBJECT. Ten tasks at most, most recently

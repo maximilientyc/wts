@@ -271,10 +271,12 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
         if [[ "$agent_state" == '"working"' ]]; then
           cur=$(tmux capture-pane -p -t "$pane_id" 2>/dev/null | shasum | cut -d' ' -f1)
           now=$(date +%s)
-          prev_hash="" prev_ts=""
-          IFS=$'\x1f' read -r -d $'\x1e' prev_hash prev_ts \
-            < <(db_rows "SELECT hash, since FROM pane_hashes
-                         WHERE agent_session = $(sql_str "$sid")" 2>/dev/null)
+          # Split, not `read -d`: this runs inside the switcher's reload, where
+          # `read -d` stops the process (see db_rows in wts-db.zsh).
+          prev=$(db_rows "SELECT hash, since FROM pane_hashes
+                          WHERE agent_session = $(sql_str "$sid")" 2>/dev/null)
+          prev_f=("${(@ps:\x1f:)${prev%$'\x1e'}}")
+          prev_hash="${prev_f[1]:-}" prev_ts="${prev_f[2]:-}"
           if [[ -n "$cur" && -n "$prev_hash" && "$cur" == "$prev_hash" ]]; then
             (( now - ${prev_ts:-$now} >= STALE_AFTER )) && stale=true
           elif [[ -n "$cur" ]]; then

@@ -86,7 +86,7 @@
 
 set -euo pipefail
 
-WTS_VERSION="1.2.0"
+WTS_VERSION="1.3.0"
 
 # ─── Install layout ──────────────────────────────────────────────────────────
 # Homebrew, `make install` and a git checkout all share the same tree:

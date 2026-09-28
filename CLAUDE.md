@@ -29,6 +29,7 @@ test/bench-big.zsh         speed on a generated large repository (make bench)
 docs/big-repo-analysis.md  what that bench found, and the fixes it suggests
 docs/demo/                record.zsh + demo.tape (README GIF, make demo)
                           + journal.tape (the wts log demo, WTS_DEMO_TAPE=)
+                          + new-task.zsh/.tape (switcher tasks GIF, no agent, no model)
 ```
 
 Homebrew, `make install` and a git checkout share this tree, so `bin/wts` works
@@ -97,6 +98,12 @@ straight from the checkout. Scripts locate each other from their own path
   when nothing captures it (fzf's `execute` does hand its child all three).
   Test `-t 0`/`-t 2`; fzf draws on `/dev/tty`, not on the captured stdout, and
   works with its own stderr on `/dev/null`.
+- `read -d` stops a process that fzf runs (reload, preview, transform): it puts
+  the terminal in non-canonical mode through zsh's own tty — opened at startup
+  even in a script — whatever it reads from, and fzf's children are in a
+  background process group, so SIGTTOU stops them for good. Measured in a popup:
+  `read -d x < <(print axb)` stops, `read -r` does not. Split `db_rows` output
+  with `${(@ps:\x1e:)out}` on those paths instead (see `db_rows`).
 - Field separator `\x1f`, not TAB: TAB is IFS whitespace, so `read` merges
   consecutive delimiters and shifts empty fields.
 - Globs that may match nothing need `(N)`, or zsh prints "no matches found".
