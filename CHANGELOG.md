@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.3.2 — 2026-09-28
+
+1.3.1 took the macOS privacy dialog off the switcher; this takes it off the rest.
+The rule is now one read of Things per command, and none at all when there is
+nothing there to read — each open of another app's container is a prompt, and
+macOS does not always remember the answer.
+
+- **A local task no longer opens Things.** `snapshot` went to the container for
+  every id it was handed, including the `local:` ones that by definition have
+  nothing there. `wts task show`, `wts task link` and `wts <name> --task` all
+  asked, for an answer that is always empty — and most tasks are local ones,
+  since that is what `ctrl-t` with a title creates.
+- **Creating a task from the picker reads Things once, not twice.**
+  `wts-things pick --json` hands back the whole task instead of its id alone, so
+  the snapshot is taken from what the picker already read rather than from a
+  second `show` on the very task the process was holding.
+- **`wts task ls` reads Things once, not once per task.** It refreshed each
+  snapshot with its own `show`; with three Things tasks on the list that was
+  three dialogs for one `ls`.
+- **Fixed: `wts task ls` leaked its own variables into the listing** — from the
+  second task on, seven lines of `name=''`, `outcome=''` … between the tasks. A
+  bare `local a b` re-run in a scope that already has them makes zsh *display*
+  them; the declaration belongs outside the loop.
+
 ## 1.3.1 — 2026-09-28
 
 - **Fixed: opening the switcher raised a macOS privacy dialog** — "iTerm would

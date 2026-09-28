@@ -7,7 +7,9 @@
 #                         [--since <iso>] [--until <iso>] [--limit N]
 #        wts-things show <uuid>              one task as a JSON object
 #        wts-things links <uuid>             the URLs in its notes, one per line
-#        wts-things pick [--completed]       fzf over the plausible tasks -> a uuid
+#        wts-things pick [--completed] [--json]
+#                                            fzf over the plausible tasks -> a uuid,
+#                                            or the whole task with --json
 #
 # READ-ONLY, by design and not by omission: wts is the corpus and Things is the
 # input, so a wts that wrote back would own the same fact twice. This helper
@@ -269,14 +271,27 @@ cmd_links() {
 # 132 open tasks, of which 9 are scheduled and 11 were created in the last 90
 # days, so "everything, alphabetically" is unusable. Today and the inbox first,
 # then whatever was touched recently, and fzf to search the rest.
+#
+# --json answers the chosen task itself, and not only its id, out of THIS read.
+# Every caller wants the whole task — it is what they snapshot — and used to come
+# back for it with `show`, which opens Things' container a second time. On
+# macOS 15+ that is a second "access data from other apps" prompt, for a task
+# this very process is already holding in a variable.
 cmd_pick() {
-  local want_status=open
-  [[ "${1:-}" == "--completed" ]] && want_status=completed
+  local want_status=open want_json=0 a
+  for a in "$@"; do
+    case "$a" in
+      --completed) want_status=completed ;;
+      --json)      want_json=1 ;;
+      *) print -u2 -r -- "wts-things pick: unknown option $a"; return 2 ;;
+    esac
+  done
   command -v fzf >/dev/null 2>&1 || { print -u2 -r -- "fzf not found"; return 1 }
   command -v jq >/dev/null 2>&1 || { print -u2 -r -- "jq not found"; return 1 }
 
-  local rows
-  rows=$(cmd_tasks --status "$want_status" --limit 400 | jq -r '
+  local all rows
+  all=$(cmd_tasks --status "$want_status" --limit 400)
+  rows=$(print -r -- "$all" | jq -r '
     sort_by((if .scheduled != "" then "0" else "1" end) + (.modified_at // ""))
     | reverse
     | .[]
@@ -289,10 +304,18 @@ cmd_pick() {
 
   # fzf draws on /dev/tty, so this works with stdout captured by a command
   # substitution — which is how every caller reads the answer.
-  print -r -- "$rows" \
+  local id
+  id=$(print -r -- "$rows" \
     | fzf --with-nth=2,3,4 --delimiter=$'\t' --height=60% --reverse \
           --prompt="things> " --header="a task for this session" \
-    | cut -f1
+    | cut -f1)
+  # Cancelled: a status, and nothing on stdout. Not an error worth a message.
+  [[ -n "$id" ]] || return 1
+  if (( want_json )); then
+    print -r -- "$all" | jq -c --arg id "$id" 'map(select(.id == $id)) | .[0] // empty'
+  else
+    print -r -- "$id"
+  fi
 }
 
 # ─── Dispatch ────────────────────────────────────────────────────────────────
