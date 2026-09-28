@@ -1055,6 +1055,40 @@ check "unlink detaches without removing the session" eval '
 
 tt() { env WTS_NO_THINGS=1 "$WTS" task "$@" }
 
+# How many times a command opens Things' container. On macOS 15+ each open is an
+# "access data from other apps" prompt, so the count IS the user-visible
+# behaviour. The stub records the verb and answers "nothing", which is what a
+# machine without Things answers anyway.
+cat > "$SANDBOX/things-stub" <<'STUB'
+#!/usr/bin/env zsh
+print -r -- "$1" >> "$WTS_THINGS_LOG"
+exit 1
+STUB
+chmod +x "$SANDBOX/things-stub"
+export WTS_THINGS_LOG="$SANDBOX/things-opens"
+opens() {  # <command…> -> the verbs it asked Things for, one per line
+  : > "$WTS_THINGS_LOG"
+  env WTS_THINGS_BIN="$SANDBOX/things-stub" "$@" >/dev/null 2>&1
+  cat "$WTS_THINGS_LOG"
+}
+check "a local task never opens Things: there is nothing there for it" eval '
+  [[ -z "$(opens "$WTS" task show "$TASK")" ]] \
+  && [[ -z "$(opens "$WTS" task resolve "$TASK")" ]]'
+q "insert or replace into tasks (id, source, title, synced_at)
+      values ('ABC123abc456DEF789xyz', 'things', 'A task from Things', '2026-01-01T00:00:00Z')"
+check "wts task ls refreshes every snapshot in one read, not one per task" eval '
+  log=$(opens "$WTS" task ls --all)
+  [[ "$(print -r -- "$log" | grep -c .)" == 1 && "$log" == "tasks" ]]'
+# Into a file and not through `grep -q`: grep leaves as soon as it matches, wts
+# dies of SIGPIPE writing the rest, and pipefail makes that the check's verdict.
+check "and it still lists what the database holds" eval '
+  env WTS_THINGS_BIN="$SANDBOX/things-stub" "$WTS" task ls --all > "$SANDBOX/ls-out" 2>&1
+  grep -q "A task from Things" "$SANDBOX/ls-out"'
+check "and lists two tasks without leaking its own variables between them" eval '
+  [[ "$(grep -c "^[a-z_]*=" "$SANDBOX/ls-out")" == 0 ]]'
+q "delete from tasks where id = 'ABC123abc456DEF789xyz'"
+unset WTS_THINGS_LOG
+
 check "task note appends, dated" eval '
   tt note "$TASK" "the audit table needs an index" >/dev/null
   tt note "$TASK" "finance wants a CSV export" >/dev/null

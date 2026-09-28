@@ -42,7 +42,10 @@ set -uo pipefail
 WTS_BIN="${0:A:h}"
 source "$WTS_BIN/wts-db.zsh"
 
-THINGS="$WTS_BIN/wts-things"
+# Overridable so the smoke test can count the opens: "one read of Things per
+# command" is the property this file is built around, and a claim no test can
+# check is how it drifted back to one per task in the first place.
+THINGS="${WTS_THINGS_BIN:-$WTS_BIN/wts-things}"
 DOC="$WTS_BIN/wts-doc"
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -103,10 +106,25 @@ task_exists() {  # <id>
 # Things is absent, on another machine, or the task since edited.
 snapshot() {  # <uuid>
   local id="$1" json
+  # A local task has nothing in Things, so asking for it opened another app's
+  # container for an answer that is always empty — and on macOS 15+ every open
+  # is an "access data from other apps" prompt. `wts task show`, `wts task link`
+  # and `wts <name> --task` all land here, and most tasks are local ones.
+  [[ "$id" == local:* ]] && return 1
   [[ -x "$THINGS" ]] || return 1
   command -v jq >/dev/null 2>&1 || return 1
   json=$("$THINGS" show "$id" 2>/dev/null) || return 1
   [[ -n "$json" ]] || return 1
+  snapshot_json "$json"
+}
+
+# The same write, from a task ALREADY read. The picker and the `ls` refresh both
+# hold the whole object; going back to Things for it would be one more prompt.
+snapshot_json() {  # <task json>
+  local json="$1" id
+  command -v jq >/dev/null 2>&1 || return 1
+  id=$(print -r -- "$json" | jq -r '.id // empty' 2>/dev/null)
+  [[ -n "$id" ]] || return 1
 
   local title notes links st area created completed
   # A \u001e terminator, read with -d: a task's notes are the user's own free
@@ -143,12 +161,22 @@ task_title() {  # <id>
 # Turn what the user typed into a task id. A Things "Copy Link" gives
 # things:///show?id=<uuid>, so that shape is accepted whole; bare words are
 # searched in the open tasks; nothing at all opens the picker.
+#
+# With no argument it also SNAPSHOTS what the picker read, and that is why every
+# caller below snapshots only when it was given an id: the picker hands back the
+# whole task, so the trip to Things costs one open instead of two.
 resolve_task() {  # [<id|url|words>]
   local want="${1:-}"
   if [[ -z "$want" ]]; then
     [[ -x "$THINGS" ]] || { print -u2 -r -- "wts task: no Things on this machine, pass an id"; return 1 }
-    "$THINGS" pick
-    return
+    local json id
+    json=$("$THINGS" pick --json) || return 1
+    [[ -n "$json" ]] || return 1
+    id=$(print -r -- "$json" | jq -r '.id // empty' 2>/dev/null)
+    [[ -n "$id" ]] || return 1
+    snapshot_json "$json"
+    print -r -- "$id"
+    return 0
   fi
   # things:///show?id=<uuid> — and any other query parameter order.
   if [[ "$want" == things:* ]]; then
@@ -209,24 +237,43 @@ cmd_ls() {
   [[ "${1:-}" == "--all" ]] && all=true
   db_init 2>/dev/null
 
-  # Refresh the snapshots wts holds, so titles do not drift from Things.
-  local id
-  if [[ -x "$THINGS" ]]; then
-    while IFS=$'\x1f' read -r -d $'\x1e' id; do
-      [[ -n "$id" ]] && snapshot "$id"
-    done < <(db_rows "SELECT id FROM tasks WHERE source = 'things'" 2>/dev/null)
+  # Refresh the snapshots wts holds, so titles do not drift from Things — in ONE
+  # read, not one per task. This used to call `show` per snapshot, and every one
+  # of those opens another app's container: on macOS 15+, `wts task ls` asked
+  # "iTerm would like to access data from other apps" once per task it held.
+  # A task outside the window keeps the snapshot it has, which is exactly what
+  # happens anyway when Things is not installed.
+  # Not `all`: that name is this function's --all flag, and taking it here made
+  # `wts task ls --all` hide every task without a session.
+  local known fresh id
+  known=$(db_ro "SELECT count(*) FROM tasks WHERE source = 'things'" 2>/dev/null)
+  if [[ -x "$THINGS" ]] && (( ${known:-0} > 0 )) && command -v jq >/dev/null 2>&1; then
+    fresh=$("$THINGS" tasks --status all --limit 2000 2>/dev/null)
+    if [[ -n "$fresh" ]]; then
+      local one
+      while IFS=$'\x1f' read -r -d $'\x1e' id; do
+        [[ -n "$id" ]] || continue
+        one=$(print -r -- "$fresh" | jq -c --arg id "$id" \
+                'map(select(.id == $id)) | .[0] // empty' 2>/dev/null)
+        [[ -n "$one" ]] && snapshot_json "$one"
+      done < <(db_rows "SELECT id FROM tasks WHERE source = 'things'" 2>/dev/null)
+    fi
   fi
 
   local bold="" dim="" reset=""
   if [[ -t 1 ]]; then bold=$'\e[1m' dim=$'\e[2m' reset=$'\e[0m'; fi
 
+  # Declared ONCE, outside the loop: a bare `local a b` re-run in a scope that
+  # already has them PRINTS them (zsh displays what it is asked to declare and
+  # not assign), so the second task listed pushed `name=''` and six more lines
+  # of its own state into the middle of the output.
   local task title st done_at n
+  local name outcome pr added removed retro state
   integer shown=0
   while IFS=$'\x1f' read -r -d $'\x1e' task title st done_at n; do
     [[ -n "$task" ]] || continue
     (( ++shown ))
     print -r -- "${bold}◆ ${title:-$task}${reset}  ${dim}${st}${done_at:+ $done_at}  $n session(s)${reset}"
-    local name outcome pr added removed retro state
     while IFS=$'\x1f' read -r -d $'\x1e' name state outcome pr added removed retro; do
       [[ -n "$name" ]] || continue
       local prl=""
@@ -273,7 +320,9 @@ cmd_show() {
   id=$(resolve_task "${1:-}") || return 1
   [[ -n "$id" ]] || return 1
   db_init 2>/dev/null
-  snapshot "$id" 2>/dev/null
+  # Only when an id was given: with none, resolve_task went through the picker
+  # and has already snapshotted what it read.
+  if [[ -n "${1:-}" ]]; then snapshot "$id" 2>/dev/null; fi
 
   local title notes links st
   IFS=$'\x1f' read -r -d $'\x1e' title notes links st < <(db_rows "
@@ -349,7 +398,9 @@ cmd_link() {
   id=$(resolve_task "$want") || return 1
   [[ -n "$id" ]] || { print -u2 -r -- "wts task link: no task chosen"; return 1 }
 
-  snapshot "$id" 2>/dev/null
+  # Only when an id was given: with none, resolve_task went through the picker
+  # and has already snapshotted what it read.
+  if [[ -n "$want" ]]; then snapshot "$id" 2>/dev/null; fi
   db_q "INSERT INTO task_links (session, task, linked_at)
         VALUES ($(sql_str "$session"), $(sql_str "$id"), $(sql_str "$(now_iso)"))
         ON CONFLICT(session) DO UPDATE SET
@@ -417,7 +468,9 @@ cmd_add() {
   db_init 2>/dev/null
   id=$(resolve_task "${1:-}") || return 1
   [[ -n "$id" ]] || { print -u2 -r -- "wts task add: no task chosen"; return 1 }
-  snapshot "$id" 2>/dev/null
+  # Only when an id was given: with none, resolve_task went through the picker
+  # and has already snapshotted what it read.
+  if [[ -n "${1:-}" ]]; then snapshot "$id" 2>/dev/null; fi
   if ! task_exists "$id"; then
     print -u2 -r -- "wts task add: $id could not be read from Things"
     return 1
@@ -592,7 +645,7 @@ case "${1:-ls}" in
     db_init 2>/dev/null
     id=$(resolve_task "${1:-}") || exit 1
     [[ -n "$id" ]] || exit 1
-    snapshot "$id" 2>/dev/null
+    if [[ -n "${1:-}" ]]; then snapshot "$id" 2>/dev/null; fi
     print -r -- "$id"
     ;;
   # Also internal: the one line `wts <name> --task` prints once it has linked.
