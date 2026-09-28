@@ -767,6 +767,7 @@ if db_available && [[ -s "$WTS_DB" ]]; then
            DELETE FROM briefs WHERE session NOT IN (SELECT name FROM sessions);
            DELETE FROM notes WHERE session NOT IN (SELECT name FROM sessions);
            DELETE FROM task_links WHERE session NOT IN (SELECT name FROM sessions);
+           DELETE FROM agent_events WHERE session NOT IN (SELECT name FROM sessions);
            DELETE FROM pane_hashes WHERE since < unixepoch() - 7 * 86400;
            COMMIT;" >/dev/null 2>&1; then
     (( ${#purge} )) && print "✓ registry: ${#purge} entry(ies) removed"

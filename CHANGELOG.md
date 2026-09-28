@@ -1,5 +1,50 @@
 # Changelog
 
+## 1.5.0 — 2026-09-28
+
+The attention loop closes. Until now the only way to learn that an agent was
+waiting for you was to open the switcher (a poll every 2 s) or to press
+`prefix+a`; wts had no clock for `blocked` and no idea what the question was.
+The agent knows all of that and Claude Code says it through its hooks — so wts
+listens. Schema 4, one new table, imported on the first command.
+
+- **wts records the agent's own events.** `wts setup claude --install` now
+  installs four more hooks, all on `wts-hook`: `UserPromptSubmit` (a turn
+  starts), `Stop` (it ends), `Notification` (a permission, a question) and
+  `SessionEnd`. Each writes a row to `agent_events`; outside a wts session the
+  hook is silent. It never prints on stdout, since Claude Code would add a
+  `UserPromptSubmit` hook's output to the conversation, and always exits 0,
+  since a failing `Stop` hook would block the turn.
+- **A bell and a banner when an agent needs you**, from the `Notification`
+  and `Stop` hooks: the pane's own bell, so tmux flags the window, and a
+  desktop banner naming the wts session ("wts: auth-form needs you — Bash: rm
+  -rf dist"; "wts: auth-form is done — turn finished in 4m12s"). Skipped when
+  the pane is already under your eyes: session attached, window active and,
+  on macOS, a terminal in front. `WTS_NOTIFY=0` turns both off, `bell` or
+  `banner` keeps one. With `terminal-notifier` (on PATH, or `WTS_NOTIFIER`)
+  a click on the banner switches the tmux client to the session; otherwise
+  macOS's own notification, or `notify-send`. If you had wired a notifier of
+  your own on these events, this replaces it.
+- **Since when, and waiting for what.** `wts status --json` gains
+  `agent_since` (epoch of the event that put the agent in its state) and
+  `agent_source` (`agents` or `events`); `agent_waiting_for` is filled from
+  the notification when `claude agents` gives none. The list sorts the
+  longest-waiting first within each state, `prefix+a` lands on the oldest
+  question and says why in the status line ("wts: auth-form — blocked 4m:
+  Bash: rm -rf dist"), and the switcher's preview opens on the same line.
+- **A status-line segment.** `wts setup tmux` appends `wts-status --line` to
+  `status-right`: "wts: 2 blocked · 1 idle", nothing when nobody needs you,
+  refreshed every `status-interval`. No git in that pass.
+- **State without `claude agents`.** When claude cannot be asked, or does not
+  list the agent, the last event decides: working, idle, blocked — unless it is
+  an end, or older than twelve hours. With it, its word is the state and the
+  events only date it.
+- **Restore resumes the agent's own conversation.** The hooks record the
+  Claude session id, so `wts restore` pre-fills `claude --resume <id>` when
+  that transcript still exists (`WTS_RESUME_ID` for layouts), rather than
+  `--continue`, which takes the most recent conversation in the directory —
+  not always the agent's.
+
 ## 1.4.1 — 2026-09-28
 
 A safety release: every destructive path that could act on a session nobody

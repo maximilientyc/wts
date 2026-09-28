@@ -58,12 +58,16 @@ while (( $# )); do
     --json)   FORMAT=json ;;
     --table)  FORMAT=table ;;
     --fzf)    FORMAT=fzf ;;
+    # --line: one line for a tmux status bar ("wts: 2 blocked · 1 idle"), so
+    # never git — it runs every status-interval.
+    --line)   FORMAT=line; WITH_GIT=false ;;
     --no-git) WITH_GIT=false ;;
-    -*) print -u2 "wts-status: unknown option '$1' (--json|--table|--fzf|--no-git)"; exit 2 ;;
+    -*) print -u2 "wts-status: unknown option '$1' (--json|--table|--fzf|--line|--no-git)"; exit 2 ;;
     *)  ONLY+=("$1") ;;
   esac
   shift
 done
+NOW=${EPOCHSECONDS:-$(date +%s)}
 
 if ! command -v jq >/dev/null 2>&1; then
   print -u2 "wts-status: jq is required"
@@ -109,6 +113,39 @@ fi
 [[ -n "$sessions_map" ]] || sessions_map='{}'
 
 tmux_alive=$(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+
+# ─── Agent events (wts-hook) ─────────────────────────────────────────────────
+# What the agent reported itself: the latest row per (session, event), one
+# query for every session. They give `claude agents` what it lacks — since when
+# (the event that put the agent in its state) and what it waits for — and stand
+# in for it when it cannot be asked. Split, not `read -d`: this runs inside the
+# switcher's reload (see db_rows in wts-db.zsh).
+typeset -A ev_at ev_kind ev_msg ev_sid ev_last ev_last_at
+if db_available && [[ -s "$WTS_DB" ]]; then
+  ev_rows=$(db_rows "SELECT e.session, e.event, e.kind, e.message, e.claude_session, e.at
+                     FROM agent_events e
+                     WHERE e.id = (SELECT id FROM agent_events
+                                   WHERE session = e.session AND event = e.event
+                                   ORDER BY at DESC, id DESC LIMIT 1)" 2>/dev/null)
+  for ev_row in "${(@ps:\x1e:)ev_rows}"; do
+    ev_f=("${(@ps:\x1f:)ev_row}")
+    [[ -n "${ev_f[1]:-}" && -n "${ev_f[2]:-}" ]] || continue
+    ev_at[${ev_f[1]}:${ev_f[2]}]="${ev_f[6]:-0}"
+    if [[ "${ev_f[2]}" == notification ]]; then
+      ev_kind[${ev_f[1]}]="${ev_f[3]:-}"
+      ev_msg[${ev_f[1]}]="${ev_f[4]:-}"
+    fi
+    if (( ${ev_f[6]:-0} >= ${ev_last_at[${ev_f[1]}]:-0} )); then
+      ev_last_at[${ev_f[1]}]="${ev_f[6]:-0}"
+      ev_last[${ev_f[1]}]="${ev_f[2]}"
+      [[ -n "${ev_f[5]:-}" ]] && ev_sid[${ev_f[1]}]="${ev_f[5]}"
+    fi
+  done
+fi
+# A Notification whose kind means the agent cannot go on without a human.
+needs_human() { # <notification_type>
+  [[ "$1" == (permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input) ]]
+}
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -250,6 +287,37 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
   agent_waiting=${agent_waiting:-null}; agent_name=${agent_name:-null}
   agent_session=${agent_session:-null}
 
+  # --- events: the state when claude could not be asked ---------------------
+  # Not a second opinion: when `claude agents` answers, its word is the state
+  # and the events only date it. Without it (no claude on PATH, an agent it
+  # does not list) the last event decides — prompt: working, stop: idle, a
+  # notification that needs a human: blocked — unless it is an `end`, or older
+  # than twelve hours, which is an agent that died without saying so.
+  agent_source=null; agent_since=null
+  p_at=${ev_at[${name}:prompt]:-0}; s_at=${ev_at[${name}:stop]:-0}
+  n_at=${ev_at[${name}:notification]:-0}; n_kind="${ev_kind[$name]:-}"
+  if [[ -n "$raw" || "$agent_session" != "null" ]]; then
+    agent_source='"agents"'
+  elif [[ -n "${ev_last[$name]:-}" ]] && (( NOW - ${ev_last_at[$name]:-0} < 43200 )); then
+    ev_state=""
+    case "${ev_last[$name]}" in
+      prompt) ev_state=working ;;
+      stop)   ev_state=idle ;;
+      notification)
+        if needs_human "$n_kind"; then ev_state=blocked
+        elif [[ "$n_kind" == idle_prompt ]]; then ev_state=idle
+        elif (( p_at > s_at )); then ev_state=working
+        else ev_state=idle
+        fi ;;
+    esac
+    if [[ -n "$ev_state" ]]; then
+      raw="$ev_state"
+      sid="${ev_sid[$name]:-}"
+      [[ -n "$sid" ]] && agent_session=$(jq -nc --arg s "$sid" '$s')
+      agent_source='"events"'
+    fi
+  fi
+
   if [[ -n "$raw" || "$agent_session" != "null" ]]; then
 
     # `state` (background) and `status` (interactive) mapped to one vocabulary.
@@ -293,7 +361,29 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
     fi
   fi
 
+  # --- since when, and waiting for what ------------------------------------
+  # `since` is the event that put the agent in its state: the prompt for
+  # working, the notification for blocked (or the prompt, when the notification
+  # predates it — an old permission already answered), the stop for idle. The
+  # waiting-for text comes from the notification when claude gave none.
+  case "$agent_state" in
+    '"working"') (( p_at )) && agent_since=$p_at ;;
+    '"blocked"')
+      if (( n_at >= p_at )) && needs_human "$n_kind"; then agent_since=$n_at
+      elif (( p_at )); then agent_since=$p_at
+      fi ;;
+    '"idle"')
+      if [[ "$n_kind" == idle_prompt ]] && (( n_at > s_at )); then agent_since=$n_at
+      elif (( s_at )); then agent_since=$s_at
+      fi ;;
+  esac
+  if [[ "$agent_state" == '"blocked"' && "$agent_waiting" == null && -n "${ev_msg[$name]:-}" ]] \
+     && (( n_at >= p_at )); then
+    agent_waiting=$(jq -nc --arg m "${ev_msg[$name]}" '$m')
+  fi
+
   objects+=("$(jq -nc \
+    --argjson agent_since "$agent_since" --argjson agent_source "$agent_source" \
     --arg name "$name" --arg profile "$profile" --arg repo_root "$repo_root" \
     --arg worktree "$worktree" --arg branch "$branch" --arg subdir "$subdir" \
     --arg context "$context" --arg created_at "$created_at" --arg base "$base" \
@@ -312,7 +402,8 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
       added:$added, removed:$removed, merged:$merged,
       agent_state:$agent_state, agent_waiting_for:$agent_waiting_for,
       agent_name:$agent_name, agent_session:$agent_session,
-      agent_pane:$agent_pane, stale:$stale}')")
+      agent_pane:$agent_pane, stale:$stale,
+      agent_since:$agent_since, agent_source:$agent_source}')")
 
 done < <(jq -r '$ARGS.positional as $only
   | to_entries | sort_by(.key)[]
@@ -328,7 +419,7 @@ if (( ${#objects} == 0 )); then
   exit 0
 fi
 
-# Sort: whatever needs a human first.
+# Sort: whatever needs a human first, and among equals the one waiting longest.
 SORT_KEY='def rank:
   if .stale then 0
   elif .agent_state == "blocked" then 1
@@ -336,7 +427,7 @@ SORT_KEY='def rank:
   elif .agent_state == "idle" then 3
   elif .agent_state == "working" then 4
   else 5 end;
-sort_by(rank, .name)'
+sort_by(rank, (.agent_since // 9e15), .name)'
 
 all=$(printf '%s\n' "${objects[@]}" | jq -s "$SORT_KEY")
 
@@ -378,6 +469,7 @@ case "$FORMAT" in
   # row is about the session, and `claude agents` can still list a record whose
   # cwd is that worktree, which would show a ghost "working". --json keeps the
   # raw facts.
+  # Fields 7 and 8, since (epoch) and waiting-for, feed the preview's header.
   fzf)   print -r -- "$all" | jq -r --argjson git "$WITH_GIT" "$SUBJECT"'.[]
            | [ .name,
                (if (.tmux_alive | not) then "stopped"
@@ -386,8 +478,24 @@ case "$FORMAT" in
                (if $git then "+\(.added)/-\(.removed)" + (if .ahead > 0 then " ^\(.ahead)" else "" end) else "-" end),
                (if ($git | not) then "-" elif .dirty > 0 then "dirty" else "clean" end),
                (.agent_pane // ""),
+               (.agent_since // "" | tostring),
+               (.agent_waiting_for | if type == "string" then . elif . == null then "" else tojson end
+                | gsub("[\\t\\n\\r\u001f\u001e]"; " ")),
                subject ]
            | join("")' ;;
+  # One line for a status bar, empty when nobody needs you: dead tmux sessions
+  # and working agents are not news.
+  line)  print -r -- "$all" | jq -r '
+           [ .[] | select(.tmux_alive) ] as $live
+           | [ (($live | map(select(.stale)) | length) as $n
+                | if $n > 0 then "\($n) stuck" else empty end),
+               (($live | map(select((.stale | not) and .agent_state == "blocked")) | length) as $n
+                | if $n > 0 then "\($n) blocked" else empty end),
+               (($live | map(select(.agent_state == "failed")) | length) as $n
+                | if $n > 0 then "\($n) failed" else empty end),
+               (($live | map(select((.stale | not) and .agent_state == "idle")) | length) as $n
+                | if $n > 0 then "\($n) idle" else empty end) ]
+           | if length == 0 then "" else "wts: " + join(" · ") end' ;;
   table) print -r -- "$all" | jq -r --argjson git "$WITH_GIT" "$SUBJECT"'
            (["SESSION","AGENT","BRANCH","DELTA","DIRTY","TMUX","SUBJECT"] | @tsv),
            (.[] | [ .name,

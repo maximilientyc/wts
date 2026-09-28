@@ -11,9 +11,13 @@ each other, and for finding your way back afterwards:
 - **Lets the agents know about each other.** Each Claude Code agent started in a
   wts session is told which other sessions are running and what they are on, and
   can query the shared state and leave notes for the others (`wts db`).
-- **Shows what each agent is doing.** `wts ls` and the fzf switcher (`prefix+s`)
-  tell you which Claude Code agent is blocked, idle or working, with a stale guard
-  that catches agents claiming to work on a frozen pane.
+- **Shows what each agent is doing, and since when.** `wts ls` and the fzf
+  switcher (`prefix+s`) tell you which Claude Code agent is blocked, idle or
+  working, for how long, and on what question — from the agent's own hooks —
+  with a stale guard that catches agents claiming to work on a frozen pane.
+- **Tells you when one needs you.** A bell on the pane and a banner naming the
+  session when an agent waits for a permission or an answer, a status-line
+  segment counting them, and `prefix+a` to jump to the one waiting longest.
 - **Cleans up after squash merges.** `wts gc` compares patch-ids against
   `origin/<base>`, so branches merged by squash or rebase are recognized, not left
   to pile up.
@@ -82,17 +86,22 @@ wts setup tmux >> ~/.tmux.conf && tmux source-file ~/.tmux.conf
 | Key                          | Action                                                  |
 |------------------------------|---------------------------------------------------------|
 | `prefix+s`                   | session switcher — **replaces** tmux's default `choose-tree -s` |
-| `prefix+a`                   | jump to the next agent that needs you                   |
+| `prefix+a`                   | jump to the agent that has waited for you the longest   |
 | `prefix+:` then `wts …`      | create a session from a freshly fetched base            |
 | `prefix+g`                   | the same prompt, pre-filled with `wts `                 |
 
-The snippet uses absolute paths: tmux runs `command-alias` programs directly,
-without a shell, so neither `~` nor `PATH` lookups are reliable there. Homebrew
-paths point to the stable `opt/wts` location and survive `brew upgrade`.
+The snippet also appends a segment to `status-right` — `wts: 2 blocked · 1
+idle`, nothing when nobody needs you — so keep it after the lines that set
+`status-right` (a theme's), or they overwrite it. It uses absolute paths: tmux
+runs `command-alias` programs directly, without a shell, so neither `~` nor
+`PATH` lookups are reliable there. Homebrew paths point to the stable `opt/wts`
+location and survive `brew upgrade`.
 
-**Claude Code integration** (optional, recommended): a `SessionStart` hook that
+**Claude Code integration** (optional, recommended): five hooks. `SessionStart`
 tells every agent started in a wts session about the other sessions and about
-`wts db` — see [Agents share state](#agents-share-state-wts-db).
+`wts db` — see [Agents share state](#agents-share-state-wts-db); the four
+others record what the agent reports about itself, which is what dates the
+states and rings when one needs you — see [When an agent needs you](#when-an-agent-needs-you).
 
 ```sh
 wts setup claude             # read it first
@@ -228,8 +237,46 @@ The **stale guard** hashes the agent's pane on every refresh: an agent reported 
 `stuck?`. Without it, a `Ctrl-C` leaves a session "working" forever.
 
 Sessions are sorted by what needs a human first: `stuck?`, `blocked`, `failed`,
-`idle`, `working`, then the rest. `wts status --json` exposes the same data
-(`agent_state`, `stale`, git counters, tmux state) for scripts.
+`idle`, `working`, then the rest — and among equals, the one waiting longest.
+`wts status --json` exposes the same data (`agent_state`, `stale`, git
+counters, tmux state) for scripts, plus `agent_since` (the epoch of the event
+that put the agent in its state), `agent_waiting_for` (the permission or the
+question) and `agent_source` (`agents` or `events`, see below).
+
+**The agent's own events.** `claude agents` says what state an agent is in, not
+since when nor what it is waiting on. The agent knows, and Claude Code says it
+through its hooks: `wts setup claude --install` puts `wts-hook` on
+`UserPromptSubmit`, `Stop`, `Notification` and `SessionEnd`, and each one
+writes a row to the `agent_events` table (kept a week). The poll remains the
+word on the state; the events date it — the prompt for `working`, the
+notification for `blocked`, the stop for `idle` — and supply the question.
+When claude cannot be asked, or does not list the agent, the last event decides
+the state, unless it is an end or older than twelve hours. Outside a wts
+session the hook is silent, and it never prints on stdout: Claude Code would
+add a `UserPromptSubmit` hook's output to the conversation.
+
+## When an agent needs you
+
+Opening the switcher is a poll. The hooks above make it a push: on a
+`Notification` (a permission to grant, a question to answer) and on a `Stop`
+(the turn is over), `wts-hook` rings the pane's bell — tmux flags the window,
+and a theme that draws flags shows it — and posts a desktop banner that names
+the wts session: *wts: auth-form needs you — Bash: rm -rf dist*, or *wts:
+auth-form is done — turn finished in 4m12s*. Both are skipped when the pane is
+already under your eyes: the session attached, the window active and, on
+macOS, a terminal in front.
+
+The banner goes through `terminal-notifier` when it is on your `PATH` (or named
+by `WTS_NOTIFIER`) — a click on it switches the tmux client to the session —
+else through macOS's own notification, else `notify-send`. `WTS_NOTIFY=0`
+turns bell and banner off, `WTS_NOTIFY=bell` or `banner` keeps one. If you had
+wired a notifier of your own on these hook events, this replaces it: remove
+yours, or you will hear both.
+
+The tmux status line carries the count, from the snippet `wts setup tmux`
+prints: `wts: 2 blocked · 1 idle`, and nothing at all when nobody needs you.
+`prefix+a` goes to the agent that has waited longest and says why in the status
+line: *wts: auth-form — blocked 4m: Bash: rm -rf dist*.
 
 ## Where each session stands: `wts brief`
 
@@ -292,7 +339,9 @@ The list is a table **sized to the popup**: the session and branch columns take
 the width of their longest value, capped so that every column stays visible, and
 a cell too long for its column is cut with `…` rather than pushing its row out
 of line. `*` after a name marks the session you came from. The preview takes the
-right half.
+right half; its first line is the agent's state, for how long, and the question
+it waits on when there is one (`blocked 4m: Bash: rm -rf dist`), above the
+pane itself.
 
 `tab` **answers the agent without leaving the popup**: the prompt becomes
 `reply to <session>>`, what you type no longer filters the list, and `enter` sends
@@ -390,8 +439,9 @@ A task already being worked on is not listed twice: it is already on screen as
 its session's row, with the `*` in SUBJECT. Ten tasks at most, most recently
 touched first (`WTS_SWITCH_TASKS=<n>`, `0` to hide them).
 
-`prefix+a` jumps straight to the next agent that needs you (`stuck?`, `blocked`,
-`failed`, `idle`), without a popup; pressing it again cycles through them.
+`prefix+a` jumps straight to the agent that needs you (`stuck?`, `blocked`,
+`failed`, `idle`) and has waited longest, without a popup, and says why in the
+status line; pressing it again cycles through them.
 
 Tip, not included in the snippet: `choose-tree` assigns jump keys to its lines, so
 `j` / `k` select a line instead of moving once enough sessions are open. This keeps
@@ -741,15 +791,25 @@ session is killed, everything else stays, and `wts restore <name>` replays it.
 During `wts restore`, layouts see `WTS_RESTORE=1` and skip heavy commands —
 otherwise eight sessions mean eight `claude` and eight dependency installs at once.
 The Claude pane is not empty for all that: the command is **pre-filled** on the
-pane's zsh command line (`print -z`), press Enter to run it. When a conversation
-exists for the pane's directory, `WTS_RESUME=1` and `claude --continue` is proposed;
-otherwise plain `claude`, since `--continue` would fail. The leading space keeps the
-command out of your history (`histignorespace`).
+pane's zsh command line (`print -z`), press Enter to run it. When the hooks
+recorded the agent's conversation and its transcript still exists,
+`WTS_RESUME_ID` carries its id and `claude --resume <id>` is proposed — the
+agent's own conversation, where `--continue` takes the most recent one in the
+directory, which may be a side chat. When only a conversation for the pane's
+directory exists, `WTS_RESUME=1` and `claude --continue`; otherwise plain
+`claude`, since both would fail. The leading space keeps the command out of
+your history (`histignorespace`).
 
 ```erb
 <% claude_cmd =
     if restore
-      ENV['WTS_RESUME'].to_s == '1' ? %q{" print -z 'claude --continue'"} : %q{" print -z claude"}
+      if ENV['WTS_RESUME_ID'].to_s =~ /\A[0-9a-f-]+\z/
+        %Q{" print -z 'claude --resume #{ENV['WTS_RESUME_ID']}'"}
+      elsif ENV['WTS_RESUME'].to_s == '1'
+        %q{" print -z 'claude --continue'"}
+      else
+        %q{" print -z claude"}
+      end
     elsif task.empty?
       'claude'
     else
@@ -775,12 +835,13 @@ building on, and only you knew. wts already knows every session, so it shares
 that knowledge with the agents themselves.
 
 **Every agent is told, automatically.** `wts setup claude --install` adds a
-Claude Code `SessionStart` hook (user-wide, in `~/.claude/settings.json`), and
+Claude Code `SessionStart` hook (user-wide, in `~/.claude/settings.json`), the
+four event hooks of [When an agent needs you](#when-an-agent-needs-you), and
 the permissions the block below asks the agent to use — `Bash(wts db:*)`,
 `wts task note`, `wts task show`, `wts status` — so no agent starts its work
-blocked on a prompt to allow `wts db notes --all`. In a wts session the hook
-puts a short block at the top of the agent's context — again after `/clear`,
-`/compact` and a resume:
+blocked on a prompt to allow `wts db notes --all`. In a wts session the
+`SessionStart` hook puts a short block at the top of the agent's context —
+again after `/clear`, `/compact` and a resume:
 
 ```
 # wts: you are in session `auth-form` (branch feature/auth-form, worktree …)
@@ -892,6 +953,7 @@ name.
 | `WTS_PROMPT`  | the phrase of `wts "<phrase>"` (empty otherwise)                 |
 | `WTS_RESTORE` | `1` during `wts restore`                                         |
 | `WTS_RESUME`  | `1` during `wts restore` when a Claude conversation exists       |
+| `WTS_RESUME_ID` | during `wts restore`, the id of the agent's own conversation when the hooks recorded it and its transcript exists |
 
 Use `WTS_WORKDIR` for `root:` and `WTS_ROOT` for commands that must run from the
 worktree root. Panes do not inherit the environment of `wts` (the tmux server is
@@ -922,6 +984,9 @@ locale (`LANG=C`), Ruby refuses to read them ("invalid byte sequence in US-ASCII
 | `WTS_DOC_TOOLS_TTL`     | `86400`                       | seconds the `claude mcp list` enumeration is cached    |
 | `WTS_DOC_MAX_BYTES`     | `200000`                      | cap on a document, and on all of them together         |
 | `WTS_STALE_AFTER`       | `10`                          | seconds before a frozen `working` agent shows `stuck?` |
+| `WTS_NOTIFY`            | `1`                           | `0`: no bell nor banner when an agent needs you; `bell` or `banner` keeps one |
+| `WTS_NOTIFIER`          | `terminal-notifier` on PATH   | a terminal-notifier binary for the banner (click switches to the session) |
+| `WTS_NOTIFY_TERMINALS`  | iTerm2, Terminal, Ghostty, …  | bundle ids counted as "a terminal in front" (macOS), space-separated |
 | `WTS_SWITCH_REFRESH`    | `2`                           | switcher refresh interval, `0` for a static list       |
 | `WTS_SWITCH_SCROLLBACK` | `2000`                        | lines of tmux history reachable in the preview         |
 | `WTS_LOCK_STALE_AFTER`  | `300`                         | seconds before `wts gc` calls an `index.lock` stale    |
