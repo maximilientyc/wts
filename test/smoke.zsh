@@ -1207,6 +1207,15 @@ check "the task preview is what the task carries" eval '
   [[ "$out" == *"## Task:"* && "$out" == *"attach it to a session"* ]]'
 check "WTS_SWITCH_TASKS=0 keeps them out" eval '
   ! env WTS_SWITCH_TASKS=0 "$SWITCH" --list | cut -f2 | grep -q "^task:"'
+# A served task stays listed: its row is the only way to start a second session
+# on it from the popup. It used to leave the list at its first session.
+env WTS_NO_ATTACH=1 WTS_NO_THINGS=1 "$WTS" tserved smoke --task "$TASK" >/dev/null
+check "a task a session serves stays listed, with its session count" eval '
+  row=$("$SWITCH" --list | awk -F "\t" -v t="task:$TASK" "\$2 == t && \$3 == \"\"")
+  [[ "$row" == *"1 session(s)"* ]]'
+check "both producers list the served task" eval '
+  diff <("$SWITCH" --list-fast | cut -f2 | sort) <("$SWITCH" --list | cut -f2 | sort)'
+"$WTS" rm tserved -f >/dev/null
 # tab on a task pins the task, and enter appends to its notes instead of typing
 # into a pane there is none of.
 export WTS_SWITCH_REPLY="$SANDBOX/reply-task"
@@ -1282,7 +1291,7 @@ check "attaching links the task to the session" eval '
   env WTS_NO_ATTACH=1 WTS_NO_THINGS=1 "$WTS" tattach smoke >/dev/null
   [[ "$(ta session tattach)" == "switch tattach" ]] \
   && [[ "$(q "select task from task_links where session = '\''tattach'\''")" == "$NEWTASK" ]]'
-refute "and the task leaves the task rows, it is on its session now" eval '
+check "and the task keeps its row, to start another session on it" eval '
   "$SWITCH" --list | cut -f2 | grep -qxF "task:$NEWTASK"'
 "$WTS" rm tattach -f >/dev/null
 

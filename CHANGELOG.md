@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.1 — 2026-09-29
+
+- **A task stays in the switcher while a session serves it**, after the tasks
+  still to start, with `N session(s)` in SUBJECT. It used to leave the list at
+  its first session, and with it `enter` on the task: the popup had no way to
+  start a second session on the same task.
+
 ## 1.5.0 — 2026-09-28
 
 The attention loop closes. Until now the only way to learn that an agent was

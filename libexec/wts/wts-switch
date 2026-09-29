@@ -3,8 +3,8 @@
 #
 # Sessions known to the registry are listed first, sorted by urgency (stuck or
 # blocked agent > idle > working), with a live preview of the agent's pane. Then
-# the open TASKS that have no session yet — the work still to start, with what it
-# already carries — and last the tmux sessions unknown to the registry.
+# the open TASKS — the work still to start first, then the work already served by
+# a session — and last the tmux sessions unknown to the registry.
 #
 #   enter    switch to the session; on a task, choose: attach it to a session,
 #            or start one from a prompt or a branch name (through wts-fresh)
@@ -144,15 +144,17 @@ emit() {
 }
 
 # ─── Tasks ───────────────────────────────────────────────────────────────────
-# The work that has no session yet, at the bottom of the same list. Not a second
+# The open work, at the bottom of the same list. Not a second
 # view and not a nested tree: the switcher is the one place that has to stay
 # scannable, and a task is a row like any other — `enter` on it starts a session
 # instead of switching to one.
 #
-# Only tasks with NO live session: a task already being worked on is already on
-# screen as that session's row, with its `*` in SUBJECT. And only tasks wts
-# already holds — one query on its own database, no `wts-things`, no git, no
-# model, because this runs inside the 2-second refresh. `ctrl-t` is how a Things
+# A task a session already serves stays listed, after the ones still to start,
+# with the count of its sessions in SUBJECT. It was hidden once, as a duplicate
+# of that session's `*` row, and that hid the only way to start a second session
+# on it: `enter` on the task row. Only tasks wts already holds — one query on
+# its own database, no `wts-things`, no git, no model, because this runs inside
+# the 2-second refresh. `ctrl-t` is how a Things
 # task gets in.
 #
 # ASCII only in the display columns: `emit` pads them to an exact character count
@@ -169,7 +171,7 @@ task_rows() {
   # whole statement fail — silently, since the query is quiet by design.
   local limit="${WTS_SWITCH_TASKS:-10}"
   [[ "$limit" == <-> ]] || limit=10
-  local id title area ctx att delta subject out row
+  local id title area ctx att live delta subject out row
   local -a f
   # Split rather than `read -d`, which stops this very process under fzf's
   # reload: see db_rows in wts-db.zsh.
@@ -178,15 +180,15 @@ task_rows() {
            (SELECT count(*) FROM task_docs d WHERE d.task = t.id)
              + (SELECT count(*) FROM task_notes n WHERE n.task = t.id)
              + (SELECT count(*) FROM json_each(t.links) WHERE json_valid(t.links)),
-           (SELECT count(*) FROM archive a WHERE a.task = t.id)
+           (SELECT count(*) FROM archive a WHERE a.task = t.id),
+           (SELECT count(*) FROM task_links l WHERE l.task = t.id) AS live
       FROM tasks t
      WHERE t.status = 'open'
-       AND NOT EXISTS (SELECT 1 FROM task_links l WHERE l.task = t.id)
-     ORDER BY t.synced_at DESC, t.title
+     ORDER BY live > 0, t.synced_at DESC, t.title
      LIMIT $limit" 2>/dev/null)
   for row in "${(@ps:\x1e:)out}"; do
     f=("${(@ps:\x1f:)row}")
-    id="${f[1]:-}" title="${f[2]:-}" area="${f[3]:-}" ctx="${f[4]:-0}" att="${f[5]:-0}"
+    id="${f[1]:-}" title="${f[2]:-}" area="${f[3]:-}" ctx="${f[4]:-0}" att="${f[5]:-0}" live="${f[6]:-0}"
     [[ -n "$id" ]] || continue
     # Cut before add_row, not in `fit`: name_w is measured from the rows, so an
     # 80-character task title would push the name column to its cap and re-lay
@@ -197,7 +199,9 @@ task_rows() {
     delta="-"
     (( ctx )) && delta="$ctx ctx"
     subject="$area"
-    if [[ -z "$subject" ]] && (( att )); then
+    if (( live )); then
+      subject="$live session(s)${area:+, $area}"
+    elif [[ -z "$subject" ]] && (( att )); then
       subject="$att attempt(s)"
     fi
     add_row "${title:-$id}" "task" "-" "$delta" "$subject" "task:$id" task
