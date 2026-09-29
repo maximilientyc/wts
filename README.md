@@ -392,10 +392,12 @@ the right rather than pushed into the list.
 
 ![a task given a note and a context document, wts task show listing what it now carries, the switcher showing that task as a row with a count of its context, its preview holding the note and the document, tab typing another note straight onto it without leaving the popup, and enter starting a session on the task whose agent opens on the context file](docs/tasks.gif)
 
-Under the sessions, the popup lists the **open tasks that have no session** — the
-other half of the question it answers. A task row reads `task` in the AGENT
-column, and `N ctx` in DELTA: how many documents, links and notes it already
-carries, so you can see at a glance whether a piece of work is ready to start.
+Under the sessions, the popup lists the **open tasks** — the other half of the
+question it answers — those with no session first. A task row reads `task` in the
+AGENT column, and `N ctx` in DELTA: how many documents, links and notes it already
+carries, so you can see at a glance whether a piece of work is ready to start. A
+task some sessions already serve stays listed, with `N session(s)` in SUBJECT:
+`enter` on it starts one more, for a second attempt next to the first.
 The preview is the task itself — title, status, the notes you kept on it, its
 links, its documents — which makes the popup the place you decide *what* to do,
 not only *where* to go back to.
