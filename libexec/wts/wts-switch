@@ -651,11 +651,60 @@ loaded() { # [--no-git]
   print -rn -- "${(j:+:)chain}"
 }
 
+# The sessions started from a task: the live ones with their agent's state, then
+# the finished ones from the archive, newest first. The list row only said
+# "2 session(s)", and finding out which meant leaving the popup for
+# `wts task show`. Not part of task_context_md: that one is also the agent's
+# context, where a live state would be stale the moment it was written.
+TASK_PREVIEW_ARCHIVED=5
+
+task_sessions_md() { # $1 = task id
+  db_available || return 0
+  local out row name kind outcome pr retro head
+  local -a f
+  local -i n=0 shown=0
+  # Split rather than `read -d`, which stops this very process under fzf's
+  # preview: see db_rows in wts-db.zsh.
+  out=$(db_rows "
+    SELECT name, kind, outcome, pr, retro FROM (
+      SELECT s.name AS name, 'live' AS kind, '' AS outcome, '' AS pr, '' AS retro,
+             0 AS o1, 0 AS o2
+        FROM task_links l JOIN sessions s ON s.name = l.session
+       WHERE l.task = $(sql_str "$1")
+      UNION ALL
+      SELECT session, 'archived', outcome, pr_url, retro_delivered, 1, -id
+        FROM archive WHERE task = $(sql_str "$1"))
+     ORDER BY o1, o2, name" 2>/dev/null)
+  for row in "${(@ps:\x1e:)out}"; do
+    f=("${(@ps:\x1f:)row}")
+    name="${f[1]:-}" kind="${f[2]:-}" outcome="${f[3]:-}" pr="${f[4]:-}" retro="${f[5]:-}"
+    [[ -n "$name" ]] || continue
+    (( n++ == 0 )) && { print -r -- "Sessions started from it:"; print -r -- "" }
+    if [[ "$kind" == live ]]; then
+      head=$(preview_header "$name") || head="live"
+      print -r -- "- $name  $head"
+      continue
+    fi
+    if (( shown >= TASK_PREVIEW_ARCHIVED )); then continue; fi
+    (( shown++ ))
+    print -r -- "- $name (${outcome:-unknown})${pr:+  $pr}"
+    [[ -n "$retro" ]] && print -r -- "  delivered: ${retro%%$'\n'*}"
+  done
+  if (( n == 0 )); then
+    print -r -- "Sessions started from it: none yet, enter starts one."
+  else
+    local -i archived_n
+    archived_n=$(db_ro "SELECT count(*) FROM archive WHERE task = $(sql_str "$1")" 2>/dev/null)
+    (( archived_n > shown )) && print -r -- "- ($(( archived_n - shown )) more: wts task show $1)"
+  fi
+  return 0
+}
+
 # A task has no pane to capture, so the preview is what the task carries: the
 # same block wts writes into a new session's context file, from the same
-# renderer, plus what `enter` will do with it. Reading the task here is the
-# payoff of the whole feature — the popup becomes where you check whether a
-# piece of work is ready to start.
+# renderer, plus the sessions started from it and what `enter` will do with it.
+# Reading the task here is the payoff of the whole feature — the popup becomes
+# where you check whether a piece of work is ready to start.
 task_preview() { # $1 = task id
   local md
   md=$(task_context_md "$1" 2>/dev/null) || md=""
@@ -663,7 +712,16 @@ task_preview() { # $1 = task id
     print -r -- "(task $1 is unknown here)"
     return
   fi
-  print -r -- "$md"
+  # Right under the header (title, status, area), above the notes: a long note
+  # would otherwise push the sessions below the fold of a task that opens on
+  # its first line.
+  local head="${md%%$'\n\n'*}" rest=""
+  [[ "$md" == *$'\n\n'* ]] && rest="${md#*$'\n\n'}"
+  print -r -- "$head"
+  print -r -- ""
+  task_sessions_md "$1"
+  print -r -- ""
+  [[ -n "$rest" ]] && print -r -- "$rest"
   print -r -- "enter: attach it to a session, or start one from a prompt or a branch name."
   print -r -- "tab notes on it, ctrl-e attaches a document."
 }

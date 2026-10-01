@@ -1215,7 +1215,13 @@ check "a task a session serves stays listed, with its session count" eval '
   [[ "$row" == *"1 session(s)"* ]]'
 check "both producers list the served task" eval '
   diff <("$SWITCH" --list-fast | cut -f2 | sort) <("$SWITCH" --list | cut -f2 | sort)'
+check "the task preview names the session serving it" eval '
+  out=$("$SWITCH" --preview "task:$TASK" "")
+  [[ "$out" == *"Sessions started from it:"* && "$out" == *"- tserved "* ]]'
 "$WTS" rm tserved -f >/dev/null
+check "and still names it once it is archived, with its outcome" eval '
+  out=$("$SWITCH" --preview "task:$TASK" "")
+  [[ "$out" == *"- tserved ("*")"* ]]'
 # tab on a task pins the task, and enter appends to its notes instead of typing
 # into a pane there is none of.
 export WTS_SWITCH_REPLY="$SANDBOX/reply-task"

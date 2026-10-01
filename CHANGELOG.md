@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **A task's preview in the switcher lists its sessions**: the live ones with
+  their agent's state, then the finished ones with their outcome, PR and what
+  they delivered (the last five; `wts task show` has the rest). The row only
+  said `N session(s)`.
+
 ## 1.5.1 — 2026-09-29
 
 - **A task stays in the switcher while a session serves it**, after the tasks
