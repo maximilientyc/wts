@@ -398,8 +398,9 @@ AGENT column, and `N ctx` in DELTA: how many documents, links and notes it alrea
 carries, so you can see at a glance whether a piece of work is ready to start. A
 task some sessions already serve stays listed, with `N session(s)` in SUBJECT:
 `enter` on it starts one more, for a second attempt next to the first.
-The preview is the task itself — title, status, the notes you kept on it, its
-links, its documents — which makes the popup the place you decide *what* to do,
+The preview is the task itself — title, status, the sessions started from it
+(live ones with their agent's state, finished ones with their outcome), the
+notes you kept on it, its links, its documents — which makes the popup the place you decide *what* to do,
 not only *where* to go back to.
 
 On a task row:
