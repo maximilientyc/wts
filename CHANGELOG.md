@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.5.2 — 2026-10-02
 
 - **A task's preview in the switcher lists its sessions**: the live ones with
   their agent's state, then the finished ones with their outcome, PR and what
