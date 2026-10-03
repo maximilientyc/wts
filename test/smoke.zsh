@@ -1582,7 +1582,8 @@ check "and the last two notes its agent left, not the older ones" eval '
   [[ "$out" == *"note api"*"renamed the route"* && "$out" == *"note schema"* && "$out" != *"not shown"* ]]'
 # Its stderr kept, and the pane printed under the memos: a failing expansion in
 # the rule once ended the preview there, silently for the checks above.
-tmux send-keys -t "=tretry:" "print pane-marker" Enter
+# echo, not print: the pane runs the login shell, bash on the Linux runner.
+tmux send-keys -t "=tretry:" "echo pane-marker" Enter
 check "and the pane itself below them" eval '
   pane_shows tretry pane-marker
   out=$(FZF_PREVIEW_LINES=40 FZF_PREVIEW_COLUMNS=100 "$SWITCH" --preview tretry tretry 2>&1)
