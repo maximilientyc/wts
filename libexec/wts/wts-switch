@@ -875,7 +875,8 @@ preview() { # $1 = cursor target, $2 = cursor name
   if [[ "$target" == task:* ]]; then
     capture=$(task_preview "${target#task:}")
   else
-    capture=$(tmux capture-pane -p -e -S "-$SCROLLBACK" -t "$target" 2>/dev/null)
+    # tmux_target: a bare `0` is read as a window of the current session first.
+    capture=$(tmux capture-pane -p -e -S "-$SCROLLBACK" -t "${target:+$(tmux_target "$target")}" 2>/dev/null)
     header=$(preview_header "${2:-}") || header=""
     prline=$(preview_pr "${2:-}") || prline=""
     memo=$(preview_memo "${2:-}") || memo=""
@@ -977,7 +978,7 @@ fit_preview() { # $1 = cursor target, $2 = cursor name ; prints the action, or n
   # A task has no pane: leave the window where the last session put it rather
   # than asking tmux about a target it cannot resolve.
   [[ "$target" == task:* ]] && return 0
-  width=$(tmux display-message -p -t "$target" '#{pane_width}' 2>/dev/null)
+  width=$(tmux display-message -p -t "${target:+$(tmux_target "$target")}" '#{pane_width}' 2>/dev/null)
   # A gone pane, or a fzf without FZF_COLUMNS: leave the window as it is.
   [[ "$width" == <-> && "$cols" == <-> ]] || return 0
   if (( width < cols / 2 )); then
@@ -1246,9 +1247,21 @@ fresh_window() { # wts-fresh arguments
 # `feature/` is what one types by habit, and wts adds it back itself; the rule is
 # the one wts applies to the slug it derives (bin/wts), since the name is used
 # as a directory, a tmux session and a branch at once.
+#
+# The prefix is the one of the layout the session will start on, `default`: the
+# built-in one has none, and stripping a `feature/` it never adds back turned
+# `feature/foo` into branch `foo`.
+task_branch_prefix() {
+  local f
+  f=$("$WTS_CMD" layouts 2>/dev/null | awk -F '\t' '$1 == "default" { print $2 }')
+  if (( ${+WTS_BRANCH_PREFIX} )) || [[ -n "$f" ]]; then
+    branch_prefix_of "${f:-/dev/null}"
+  fi
+}
 branch_to_name() { # $1 = what was typed
   setopt local_options extended_glob
-  local n="$1" p="${WTS_BRANCH_PREFIX:-feature/}"
+  local n="$1" p
+  p=$(task_branch_prefix)
   n="${n##[[:space:]]##}"
   n="${n%%[[:space:]]##}"
   [[ -n "$p" && "$n" == "$p"* ]] && n="${n#$p}"
@@ -1340,7 +1353,7 @@ choice_rows() { # $1 = task id
 
 # The screens. Status 1 is `esc` on the choice itself: back to the list.
 choose_for_task() { # $1 = task id
-  local id="$1" title slug pick kind value hint def rc
+  local id="$1" title slug pick kind value hint def rc prefix
   [[ -n "$id" ]] || return 1
   title=$(db_ro "SELECT title FROM tasks WHERE id = $(sql_str "$id")" 2>/dev/null)
   title="${title//[[:cntrl:]]/ }"
@@ -1370,7 +1383,12 @@ choose_for_task() { # $1 = task id
           hint="The agent's opening prompt, and wts names the session from it."
         else
           def="$slug"
-          hint="The session name; wts adds the branch prefix (feature/ by default)."
+          prefix=$(task_branch_prefix)
+          if [[ -n "$prefix" ]]; then
+            hint="The session name; the branch is ${prefix}<name>."
+          else
+            hint="The session name, and the branch's."
+          fi
         fi
         # Until an answer is usable, or esc / an empty line to go back.
         while value=$(ask_line "$kind> " "$def" "$hint"$'\n'"enter: start · esc: back"); do

@@ -109,6 +109,37 @@ sql_list() {
   print -r -- "(${out:-NULL})"
 }
 
+# A digest of stdin, for equality only (the stale guard's pane hashes, the brief
+# cache key). `shasum` is Perl's and some Linux images ship without it: piped
+# into a missing command the hash was empty, and the stale guard silently off.
+# sha1sum is coreutils', cksum is POSIX. One machine always takes the same.
+hash_stdin() {
+  if (( ${+commands[shasum]} )); then shasum | cut -d' ' -f1
+  elif (( ${+commands[sha1sum]} )); then sha1sum | cut -d' ' -f1
+  else cksum | tr ' ' -
+  fi
+}
+
+# branch_prefix_of <layout file> — declared by a `# wts: branch_prefix=feature/`
+# line in the layout. It is a YAML comment, so tmuxinator never sees it, and the
+# convention travels with the layout instead of living in wts, which a
+# package manager overwrites on every upgrade. $WTS_BRANCH_PREFIX wins, even
+# when set to an empty string.
+branch_prefix_of() {
+  if (( ${+WTS_BRANCH_PREFIX} )); then
+    print -r -- "$WTS_BRANCH_PREFIX"
+    return 0
+  fi
+  local line
+  while IFS= read -r line; do
+    if [[ "$line" =~ '^#[[:space:]]*wts:[[:space:]]*branch_prefix=([^[:space:]]*)' ]]; then
+      print -r -- "${match[1]}"
+      return 0
+    fi
+  done < "$1"
+  return 0
+}
+
 # Create the schema and import the pre-1.0 files, once. Fast path: a database
 # already at WTS_DB_SCHEMA costs one sqlite3 call.
 db_init() {

@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+- **CI runs on Linux too.** The smoke test runs on `ubuntu-latest` next to
+  `macos-latest` (fzf from its release, as Ubuntu's 0.44 predates the
+  switcher's binds). The Things checks needed no gate: they run on fixtures
+  and stubs, and pass on Linux as they are.
+- **`wts task edit` asks for a terminal first.** Without one it said "no vi"
+  on a machine without vi, to an agent that could not have used any editor.
+- **The switcher's preview and its width follow a session named `0` or `1`.**
+  A bare `-t 1` is window 1 of the current session before it is the session
+  `1`: the preview showed that window. Both calls go through `tmux_target`.
+- **The stale guard ignores a pane it cannot capture.** A dead pane hashed as
+  the empty text, the same every tick, read `stuck?` for good and gc held its
+  worktree. Without `shasum` (some Linux images) the guard was silently off:
+  `hash_stdin` falls back to `sha1sum`, then `cksum`.
+- **`wts status --json` keeps to its `agent_state` list.** A state `claude
+  agents` reports and wts does not know is now `null` instead of passed
+  through; the collector records it once and `wts doctor` names it.
+- **A session name with `.` or `:` is refused** (exit 2), with the name to
+  use instead: tmux rewrote them to `_`, `has-session` never matched, and
+  every re-run started a duplicate.
+- **The task screen's branch hint reads the prefix of the `default` layout**
+  (`branch_prefix_of`, now in `wts-db.zsh`). It stripped and promised
+  `feature/`, which the built-in layout never adds: `feature/foo` typed there
+  made branch `foo`.
+
 ## 1.7.0 — 2026-10-03
 
 After upgrading: `wts setup claude --install` (the skill lists the new

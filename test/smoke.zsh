@@ -242,6 +242,13 @@ for ex in feature sentry; do
     [[ "$(typed_arg "$ROOT/examples/layouts/$ex.yml")" == "it'"'"'s a \$HOME test; ok" ]]'
 done
 
+# tmux makes `v1.2` a session `v1_2`: `has-session -t "=v1.2"` then never
+# matched, and each re-run started a duplicate. Refused with a usable name.
+check "a session name with . or : is refused, with the name to use" eval '
+  out=$(env WTS_NO_ATTACH=1 "$WTS" v1.2 smoke 2>&1); rc=$?
+  (( rc == 2 )) && [[ "$out" == *"tmux rewrites"*"wts v1-2"* ]] \
+  && ! git show-ref --quiet refs/heads/feature/v1.2 && [[ ! -e "$WT/v1.2" ]]'
+refute "and so is one with a colon" env WTS_NO_ATTACH=1 "$WTS" "a:b" smoke
 refute "missing layout fails" env WTS_NO_ATTACH=1 "$WTS" other nope
 refute "missing layout creates nothing" test -e "$WT/other"
 
@@ -345,6 +352,31 @@ jq -n --arg cwd "$WT/export-users-csv" \
   '[{kind: "interactive", status: "waiting", cwd: $cwd, sessionId: "smoke"}]' > "$WTS_SMOKE_AGENTS"
 check "waiting agent shown as blocked, first" \
   eval '"$WTS" status --json | jq -e ".[0].name == \"export-users-csv\" and .[0].agent_state == \"blocked\""'
+WAITING_AGENT=$(cat "$WTS_SMOKE_AGENTS")
+
+# A state outside the closed list `status --json` promises is null, not passed
+# through to the agents that read the contract, and named once by doctor.
+jq -n --arg cwd "$WT/export-users-csv" \
+  '[{kind: "interactive", status: "pondering", cwd: $cwd, sessionId: "smoke"}]' > "$WTS_SMOKE_AGENTS"
+check "an unknown agent state is null in status --json" eval '
+  "$WTS" status --json | jq -e "map(select(.name == \"export-users-csv\"))[0].agent_state == null"'
+check "and doctor names it" eval '
+  out=$("$WTS" doctor 2>&1); [[ "$out" == *"state wts does not know (pondering)"* ]]'
+q "DELETE FROM kv WHERE key LIKE 'agent_state.unknown:%'"
+
+# The stale guard on a pane tmux cannot capture (the agent's pane is gone): the
+# empty capture hashed the same every tick and read `stuck?` for good.
+mkdir -p "$CLAUDE_CONFIG_DIR/sessions"
+print -r -- '{"sessionId": "smoke", "tmux": "gone:@99.%9999"}' > "$CLAUDE_CONFIG_DIR/sessions/99999.json"
+jq -n --arg cwd "$WT/export-users-csv" \
+  '[{kind: "interactive", status: "busy", cwd: $cwd, sessionId: "smoke"}]' > "$WTS_SMOKE_AGENTS"
+check "a pane that cannot be captured never reads stuck?" eval '
+  WTS_STALE_AFTER=0 "$WTS" status --json >/dev/null
+  WTS_STALE_AFTER=0 "$WTS" status --json \
+    | jq -e "map(select(.name == \"export-users-csv\"))[0] | .agent_state == \"working\" and .stale == false"'
+check "and stores no hash for it" eval '[[ "$(q "SELECT count(*) FROM pane_hashes WHERE agent_session = '\''smoke'\''")" == 0 ]]'
+rm -f "$CLAUDE_CONFIG_DIR/sessions/99999.json"
+print -r -- "$WAITING_AGENT" > "$WTS_SMOKE_AGENTS"
 
 # The skeleton fzf opens on must be interchangeable with the collected list:
 # 3 TAB fields, and the same sessions, or the swap would drop or shift rows.
@@ -404,6 +436,18 @@ check "--fit caps the preview at half the popup" \
   eval '[[ "$(FZF_COLUMNS=$pane_width "$SWITCH" --fit auth-form)" == "change-preview-window(right,$((pane_width / 2)),border-left)" ]]'
 check "--fit stays quiet for an unknown target" \
   eval '[[ -z "$(FZF_COLUMNS=200 "$SWITCH" --fit no-such-session)" ]]'
+# A session named like a window index: a bare `-t 1` is window 1 of the current
+# session (here the most recent one) before it is the session `1`. Both the
+# preview and --fit showed the decoy's window.
+tmux new-session -d -s 1 -x 100 -y 24 "echo right-session; exec sleep 600"
+tmux new-session -d -s numdecoy -x 70 -y 24 "exec sleep 600"
+tmux new-window -d -t "=numdecoy:1" "echo wrong-window; exec sleep 600"
+pane_shows 1 right-session || true
+check "--fit sizes a session named 1, not window 1" \
+  eval '[[ "$(FZF_COLUMNS=400 "$SWITCH" --fit 1 1)" == "change-preview-window(right,100,border-left)" ]]'
+check "the preview shows a session named 1, not window 1" \
+  eval 'out=$("$SWITCH" --preview 1 1); [[ "$out" == *right-session* && "$out" != *wrong-window* ]]'
+tmux kill-session -t "=1"; tmux kill-session -t "=numdecoy"
 
 # ─── Reply mode ──────────────────────────────────────────────────────────────
 # The verbs are what fzf's `transform` runs on tab / enter / esc: each prints
@@ -1538,7 +1582,8 @@ check "and the last two notes its agent left, not the older ones" eval '
   [[ "$out" == *"note api"*"renamed the route"* && "$out" == *"note schema"* && "$out" != *"not shown"* ]]'
 # Its stderr kept, and the pane printed under the memos: a failing expansion in
 # the rule once ended the preview there, silently for the checks above.
-tmux send-keys -t "=tretry:" "print pane-marker" Enter
+# echo, not print: the pane runs the login shell, bash on the Linux runner.
+tmux send-keys -t "=tretry:" "echo pane-marker" Enter
 check "and the pane itself below them" eval '
   pane_shows tretry pane-marker
   out=$(FZF_PREVIEW_LINES=40 FZF_PREVIEW_COLUMNS=100 "$SWITCH" --preview tretry tretry 2>&1)
@@ -1615,8 +1660,17 @@ ta() { env WTS_SWITCH_DRY=1 WTS_NO_THINGS=1 "$SWITCH" --task-action "$NEWTASK" "
 check "a prompt starts wts-fresh on the phrase, linked to the task" eval '
   [[ "$(ta prompt "write the migration guide")" == "wts-fresh '\''write the migration guide'\'' --task $NEWTASK" ]]'
 refute "a one-word prompt is refused, it would be read as a name" ta prompt status
-check "a branch name loses the prefix typed by habit" eval '
-  [[ "$(ta branch feature/migration-guide)" == "wts-fresh migration-guide --task $NEWTASK" ]]'
+# The prefix is the `default` layout's, the one the session starts on: the
+# built-in one has none, so `feature/` is not stripped (and a `/` cannot be in a
+# session name) rather than promised and dropped.
+refute "without a prefix in the layout, feature/ is not stripped" ta branch feature/migration-guide
+check "a branch name loses the layout's prefix typed by habit" eval '
+  print -r -- "# wts: branch_prefix=feature/" > "$XDG_CONFIG_HOME/wts/layouts/default.yml"
+  cat "$ROOT/share/wts/layouts/default.yml" >> "$XDG_CONFIG_HOME/wts/layouts/default.yml"
+  out=$(ta branch feature/migration-guide); rm -f "$XDG_CONFIG_HOME/wts/layouts/default.yml"
+  [[ "$out" == "wts-fresh migration-guide --task $NEWTASK" ]]'
+check "and WTS_BRANCH_PREFIX's" eval '
+  [[ "$(WTS_BRANCH_PREFIX=me/ ta branch me/migration-guide)" == "wts-fresh migration-guide --task $NEWTASK" ]]'
 refute "a branch that cannot be a session name is refused" ta branch "Migration Guide"
 check "attaching links the task to the session" eval '
   env WTS_NO_ATTACH=1 WTS_NO_THINGS=1 "$WTS" tattach smoke >/dev/null
@@ -1932,10 +1986,15 @@ print -r -- '{"type":"pr-link","prNumber":47,"prUrl":"https://github.com/o/tap/p
 PATH="$GHPATH" "$SWITCH" --list >/dev/null 2>&1
 check "ls, status and the switcher's list never call gh" eval '[[ ! -s "$WTS_SMOKE_GHLOG" ]]'
 
-# gh lives in a Homebrew prefix, never in /usr/bin: a PATH of the system
-# directories alone is a machine without it.
+# A machine without gh: the system directories, minus gh. Not /usr/bin itself,
+# where the Linux runner (and a distribution package) installs it.
+NOGH="$SANDBOX/nogh"
+mkdir -p "$NOGH"
+for f in /usr/bin/*(N*) /bin/*(N*); do
+  [[ "${f:t}" == gh || -e "$NOGH/${f:t}" ]] || ln -s "$f" "$NOGH/${f:t}"
+done
 check "pr --refresh exits 3 without gh" eval '
-  PATH=/usr/bin:/bin "$WTS" pr --refresh >/dev/null 2>&1; (( $? == 3 ))'
+  PATH="$NOGH" "$WTS" pr --refresh >/dev/null 2>&1; (( $? == 3 ))'
 out=$(PATH="$GHPATH" "$WTS" pr --refresh pr-ok pr-ci pr-chg pr-none pr-link 2>&1) || true
 check "pr --refresh prints one line per session" eval '
   [[ "$out" == *"pr-ok"*"#41 ✓"* && "$out" == *"pr-ci"*"#42 ✗ci"* && "$out" == *"pr-chg"*"#43 chg"*

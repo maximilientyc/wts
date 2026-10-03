@@ -46,6 +46,7 @@ docs/demo/                record.zsh + demo.tape (README GIF, make demo)
                           + journal.tape (the wts log demo, WTS_DEMO_TAPE=)
                           + new-task.zsh/.tape (switcher tasks GIF, no agent, no model)
                           + read-data.zsh/.tape (brief, notes, attempts, gc --all)
+                          + small-fixes.zsh/.tape (names, agent states, preview, branch hint)
 ```
 
 Homebrew, `make install` and a git checkout share this tree, so `bin/wts` works

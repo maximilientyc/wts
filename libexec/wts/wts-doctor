@@ -306,6 +306,11 @@ else
   else
     ok "database: $WTS_DB (schema ${v:-?}, ${n:-0} session(s))"
   fi
+  # Recorded by the collector, once per value, when it maps one to null.
+  unknown=$(db_ro "SELECT group_concat(substr(key, 21), ', ') FROM kv
+                   WHERE key LIKE 'agent_state.unknown:%'" 2>/dev/null)
+  [[ -n "$unknown" ]] \
+    && warn "claude agents reported a state wts does not know ($unknown): shown as no state"
 fi
 
 if $JSON; then
