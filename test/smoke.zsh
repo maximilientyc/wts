@@ -127,6 +127,14 @@ check "layouts lists the built-in default" eval '"$WTS" layouts | grep -qF "defa
 # pane's shell, then tmuxinator's own for send-keys) and on the YAML quoting of
 # the restore pre-fill: a backslash in a double-quoted scalar stops the file
 # from parsing at all.
+# Directly, not through wts: bin/wts is a zsh script, so a ~/.zshenv that
+# exports EDITOR overrides the one given here and hides the case. Bare in the
+# YAML, `true` was a boolean and tmuxinator failed on it.
+check "an EDITOR that reads as a YAML boolean renders as a command" eval '
+  out=$(env EDITOR=true WTS_NAME=render WTS_ROOT="$SANDBOX" WTS_WORKDIR="$SANDBOX" WTS_RESTORE= \
+          WTS_DOC= WTS_PROMPT= tmuxinator debug --suppress-tmux-version-warning \
+          --project-config "$ROOT/share/wts/layouts/default.yml" 2>&1)
+  [[ "$out" == *"send-keys -t render:0.0 true C-m"* ]]'
 for restore in "" 1; do
   for doc in "" ".wts/context.md"; do
     check "default layout renders (restore=${restore:-0}, doc=${doc:-none})" env \

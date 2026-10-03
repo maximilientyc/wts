@@ -84,8 +84,12 @@
     end
 
   # The editor tmuxinator sees ($EDITOR of the shell that ran wts), else vi.
-  editor = ENV.fetch('EDITOR', '').strip
+  # Quoted as a YAML string: bare, EDITOR=true became the boolean true and
+  # tmuxinator failed on it (undefined method shellescape for true), and so
+  # would `yes`, `on`, `null` or a number.
+  editor = ENV.fetch('EDITOR', '').to_s.dup.force_encoding('UTF-8').scrub.strip
   editor = 'vi' if editor.empty?
+  editor = yaml_sq.(editor)
 %>
 name: <%= ENV['WTS_NAME'] %>
 root: <%= ENV['WTS_WORKDIR'] || ENV['WTS_ROOT'] %>

@@ -11,6 +11,10 @@
   run `claude "$(cat <file>)"`. A layout of your own copied from an older
   `default.yml` still types the phrase: replace its `claude #{task.shellescape}`
   branch the same way (see `default.yml`).
+- **An `$EDITOR` that YAML reads as a value no longer breaks the built-in
+  layout.** `EDITOR=true` (or `yes`, `on`, a number) was written bare into the
+  YAML, read as a boolean, and tmuxinator failed with "undefined method
+  shellescape for true". The editor is now always a quoted string.
 
 ## 1.6.0 — 2026-10-03
 
