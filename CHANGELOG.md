@@ -2,8 +2,42 @@
 
 ## Unreleased
 
-Schema 7, two new tables, created on the first command.
+Schema 7: three new tables (`usage`, `pr_state`, `merge_checks`), created on
+the first command.
 
+- **Tokens and cost per session and per task.** `wts brief` and the teardown
+  (`wts rm`, `wts gc --apply`) sum `message.usage` from every transcript of a
+  session — after each `/clear`, and each subagent's — once per message, per
+  model, into the `usage` table; an unchanged transcript is not read again, and
+  `wts retro` backfills archived sessions from their kept transcript. Nothing
+  else reads a transcript for it: `wts ls`, the switcher and the hooks only read
+  the table, and the switcher shows none of it.
+- **`wts ls --wide`** (and `wts status --table --wide`) adds TOKENS, COST and
+  MODEL. COST is the API list price of those tokens, computed when read
+  (`usage_cost_sql` in `wts-db.zsh`), not what a subscription bills; `~$` when
+  a model has no price there.
+- **`wts status --json` gets a `usage` key** per session: `input`, `output`,
+  `cache_write`, `cache_read`, `tokens`, `messages`, `cost_usd`,
+  `cost_complete`, `model`, `models` (per model and speed) and `updated_at`;
+  `null` before the first count, and with `--no-git` (what `prefix+a` and
+  `wts wait` poll). Additive: no existing key changes.
+- **`wts log`** carries the same `usage` on each session, and on each work item
+  the total of its sessions (`tokens`, `cost_usd`, `sessions`…): what a task
+  cost over all its attempts. `wts task show` prints that line, and its
+  `--json` has it under `usage`.
+- **A long phrase starts its agent.** The layouts typed `claude '<phrase>'`
+  into the pane before its shell was ready, while the terminal keeps 1024
+  bytes of a line: a phrase of about 1 KB once escaped lost its closing quote,
+  Claude never started and `wts ls` showed agent `-`. wts now writes the phrase
+  to `.wts/prompt` in the worktree (ignored by git, like `.wts/context.md`) and
+  exposes its path as `WTS_PROMPT_FILE`; the built-in layout and both examples
+  run `claude "$(cat <file>)"`. A layout of your own copied from an older
+  `default.yml` still types the phrase: replace its `claude #{task.shellescape}`
+  branch the same way (see `default.yml`).
+- **An `$EDITOR` that YAML reads as a value no longer breaks the built-in
+  layout.** `EDITOR=true` (or `yes`, `on`, a number) was written bare into the
+  YAML, read as a boolean, and tmuxinator failed with "undefined method
+  shellescape for true". The editor is now always a quoted string.
 - **PR, CI and review state per session.** `wts pr --refresh [--json]
   [name...]` asks `gh` for each session's pull request (number, state, review
   decision, checks) and caches it in a `pr_state` table. The switcher shows a PR

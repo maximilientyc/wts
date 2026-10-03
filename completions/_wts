@@ -479,6 +479,8 @@ _wts() {
           "--json:JSON, the default" \
           "--table:the wts ls table" \
           "--fzf:lines for the switcher"
+      elif (( CURRENT == 4 )) && [[ ${words[3]} == --table ]]; then
+        _wts_offer options option "" "--wide:tokens, cost and model too"
       else
         _wts_say "no more arguments"
       fi ;;
@@ -522,7 +524,14 @@ _wts() {
         esac
       fi ;;
 
-    ls|layouts|keys|version)
+    ls)
+      if (( CURRENT == 3 )); then
+        _wts_offer options option "" "--wide:tokens, cost and model too"
+      else
+        _wts_say "no more arguments"
+      fi ;;
+
+    layouts|keys|version)
       _wts_say "no arguments" ;;
 
     doctor)

@@ -286,7 +286,8 @@ task_json() {  # <id>
                      'finished_at', finished_at, 'delivered', retro_delivered,
                      'resisted', retro_resisted, 'resolved', retro_resolved,
                      'abandoned', retro_abandoned) AS a
-                FROM archive WHERE task = $q ORDER BY finished_at DESC, id DESC)))
+                FROM archive WHERE task = $q ORDER BY finished_at DESC, id DESC)),
+           'usage', json($(task_usage_sql "$q")))
          FROM tasks t WHERE t.id = $q" 2>/dev/null
 }
 
@@ -470,6 +471,23 @@ cmd_show() {
     print -r -- "$attempts" | sed -e '/^$/d' -e 's/^/  /'
   elif (( live == 0 )); then
     print -r -- "  sessions: none yet"
+  fi
+  # Over every attempt: the number a single session's row in wts ls cannot
+  # give. As of each one's last wts brief or teardown.
+  local usage
+  local -a u
+  usage=$(db_rows "SELECT CASE WHEN json_extract(j, '\$.tokens') >= 1000000
+                               THEN printf('%.1fM', json_extract(j, '\$.tokens') / 1e6)
+                               WHEN json_extract(j, '\$.tokens') >= 1000
+                               THEN printf('%dk', json_extract(j, '\$.tokens') / 1000)
+                               ELSE json_extract(j, '\$.tokens') END,
+                          printf('%.2f', json_extract(j, '\$.cost_usd')),
+                          json_extract(j, '\$.cost_complete'), json_extract(j, '\$.sessions')
+                   FROM (SELECT $(task_usage_sql "$(sql_str "$id")") AS j)
+                   WHERE j IS NOT NULL" 2>/dev/null)
+  u=("${(@ps:\x1f:)${usage%$'\x1e'}}")
+  if [[ -n "${u[1]:-}" ]]; then
+    print -r -- "  usage:  ${u[1]} tokens, ${${u[3]:#1}:+~}\$${u[2]:-0} at API list prices, over ${u[4]:-?} session(s)"
   fi
   # Explicit: a function's status is its last command's, and `wts task show`
   # once exited 1 on every successful listing that ended on a `[[ ]] && …`.

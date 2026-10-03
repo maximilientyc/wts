@@ -127,6 +127,14 @@ check "layouts lists the built-in default" eval '"$WTS" layouts | grep -qF "defa
 # pane's shell, then tmuxinator's own for send-keys) and on the YAML quoting of
 # the restore pre-fill: a backslash in a double-quoted scalar stops the file
 # from parsing at all.
+# Directly, not through wts: bin/wts is a zsh script, so a ~/.zshenv that
+# exports EDITOR overrides the one given here and hides the case. Bare in the
+# YAML, `true` was a boolean and tmuxinator failed on it.
+check "an EDITOR that reads as a YAML boolean renders as a command" eval '
+  out=$(env EDITOR=true WTS_NAME=render WTS_ROOT="$SANDBOX" WTS_WORKDIR="$SANDBOX" WTS_RESTORE= \
+          WTS_DOC= WTS_PROMPT= tmuxinator debug --suppress-tmux-version-warning \
+          --project-config "$ROOT/share/wts/layouts/default.yml" 2>&1)
+  [[ "$out" == *"send-keys -t render:0.0 true C-m"* ]]'
 for restore in "" 1; do
   for doc in "" ".wts/context.md"; do
     check "default layout renders (restore=${restore:-0}, doc=${doc:-none})" env \
@@ -177,6 +185,62 @@ WTS_NO_ATTACH=1 "$WTS" "export users as csv" smoke >/dev/null
 check "name derived locally from a phrase" has_session export-users-csv
 check "phrase stored in the registry" \
   eval '[[ "$(reg_field export-users-csv prompt)" == "export users as csv" ]]'
+check "phrase written to .wts/prompt" \
+  eval '[[ "$(<"$WT/export-users-csv/.wts/prompt")" == "export users as csv" ]]'
+check "and ignored by git" eval '[[ -z "$(git -C "$WT/export-users-csv" status --porcelain)" ]]'
+
+# A long phrase reaches claude whole. The layout used to type `claude '<phrase>'`
+# into the pane before its shell was ready: the tty, still in canonical mode,
+# kept 1024 bytes of the line, the closing quote was lost and claude never
+# started. The built-in layout runs here with the stand-in named by absolute
+# path (the pane's login shell rebuilds PATH), which logs what it was given.
+cat > "$SANDBOX/claude-logger" <<EOF
+#!/bin/sh
+printf '%s' "\$*" > "$SANDBOX/claude-arg"
+exec sleep 3600
+EOF
+chmod +x "$SANDBOX/claude-logger"
+sed -e "s#{claude #{$SANDBOX/claude-logger #; s#\"claude #\"$SANDBOX/claude-logger #" \
+    -e "s#? 'claude' :#? '$SANDBOX/claude-logger' :#" \
+    -e 's#^name: #tmux_options: -f /dev/null\nname: #' \
+    "$ROOT/share/wts/layouts/default.yml" > "$XDG_CONFIG_HOME/wts/layouts/longp.yml"
+long=$(perl -e 'print join(" ", map { "step $_: keep the \$HOME, the `ticks` and \"quotes\" (it'"'"'s fine);" } 1..30)')
+claude_got() { # <text> — the stand-in was started with exactly that argument
+  local i
+  for i in {1..100}; do
+    [[ -s "$SANDBOX/claude-arg" ]] && break
+    sleep 0.1
+  done
+  [[ "$(cat "$SANDBOX/claude-arg" 2>/dev/null)" == "$1" ]]
+}
+check "the long phrase is over the tty's 1024-byte line" eval '(( ${#long} > 1024 ))'
+EDITOR=true WTS_NO_ATTACH=1 "$WTS" longp "$long" longp >/dev/null
+check "a long phrase reaches claude whole" claude_got "$long"
+"$WTS" rm longp -f >/dev/null
+rm -f "$SANDBOX/claude-arg"
+# The line each layout types, replayed in a shell: a path with a space and a
+# quote, and the context document's lead sentence before the phrase.
+mkdir -p "$SANDBOX/pf dir"
+print -r -- "it's a \$HOME test; ok" > "$SANDBOX/pf dir/it's"
+typed_arg() { # <layout> [env=value...] — what the claude pane receives as its argument
+  local layout="$1" out line
+  shift
+  out=$(env WTS_NAME=render WTS_ROOT="$SANDBOX" WTS_WORKDIR="$SANDBOX" WTS_RESTORE= WTS_DOC= \
+          WTS_PROMPT="it's a test; ok" WTS_PROMPT_FILE="$SANDBOX/pf dir/it's" "$@" \
+          tmuxinator debug --suppress-tmux-version-warning --project-config "$layout") || return 1
+  line=${${(M)${(f)out}:#*send-keys -t render:0.1 *}[1]}
+  line=${${line#*render:0.1 }% C-m}
+  [[ "$line" == *'$\(cat'* ]] || return 1     # read from the file, not typed
+  line=$(eval "print -r -- $line")              # the layer tmuxinator adds
+  zsh -fc "claude() { print -r -- \"\$*\" }; $line"
+}
+check "the default layout reads the phrase file, after the document's lead" eval '
+  [[ "$(typed_arg "$ROOT/share/wts/layouts/default.yml" WTS_DOC=.wts/context.md)" \
+     == "Read @.wts/context.md first, it is the context for this task. it'"'"'s a \$HOME test; ok" ]]'
+for ex in feature sentry; do
+  check "examples/$ex reads the phrase file" eval '
+    [[ "$(typed_arg "$ROOT/examples/layouts/$ex.yml")" == "it'"'"'s a \$HOME test; ok" ]]'
+done
 
 refute "missing layout fails" env WTS_NO_ATTACH=1 "$WTS" other nope
 refute "missing layout creates nothing" test -e "$WT/other"
@@ -2115,7 +2179,88 @@ check "doctor finds the skill" eval '[[ "$(CLAUDE_CONFIG_DIR="$CS" "$WTS" doctor
 print -r -- "my own skill" > "$CS/skills/wts/SKILL.md"
 CLAUDE_CONFIG_DIR="$CS" "$WTS" setup claude --install >/dev/null 2>&1
 check "a SKILL.md of your own is left alone" eval '[[ "$(<"$CS/skills/wts/SKILL.md")" == "my own skill" ]]'
+# ─── Usage: tokens and cost per session ─────────────────────────────────────
+# Claude Code repeats a message's usage on every record of it (one per content
+# block): message A appears twice, its output growing, and must count once at
+# its largest. <synthetic> is Claude Code's placeholder and costs nothing. The
+# subagent's file is a transcript of its own, under <session id>/subagents/.
+# Opus 5.5: 15 in, 300 out, 1000 written to the 1h cache (2x), 30000 read
+# (0.20) -> 0.02006; the Haiku subagent: 100 in, 1000 out -> 0.0051.
+{
+  print -r -- '{"type":"assistant","message":{"id":"msg_A","model":"claude-opus-5-5","usage":{"input_tokens":10,"output_tokens":50,"cache_creation_input_tokens":1000,"cache_creation":{"ephemeral_1h_input_tokens":1000},"cache_read_input_tokens":10000},"content":[{"type":"thinking"}]}}'
+  print -r -- '{"type":"assistant","message":{"id":"msg_A","model":"claude-opus-5-5","usage":{"input_tokens":10,"output_tokens":100,"cache_creation_input_tokens":1000,"cache_creation":{"ephemeral_1h_input_tokens":1000},"cache_read_input_tokens":10000},"content":[{"type":"text","text":"hi"}]}}'
+  print -r -- '{"type":"assistant","message":{"id":"msg_B","model":"claude-opus-5-5","usage":{"input_tokens":5,"output_tokens":200,"cache_creation_input_tokens":0,"cache_read_input_tokens":20000},"content":[{"type":"text","text":"ok"}]}}'
+  print -r -- '{"type":"assistant","message":{"id":"msg_S","model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0},"content":[{"type":"text","text":"No response requested."}]}}'
+} > "$proj_a/0123abcd-ef01-2345-6789-abcdef0000bb.jsonl"
+mkdir -p "$proj_a/0123abcd-ef01-2345-6789-abcdef0000bb/subagents"
+print -r -- '{"type":"assistant","isSidechain":true,"message":{"id":"msg_H","model":"claude-haiku-4-5-20251001","usage":{"input_tokens":100,"output_tokens":1000},"content":[{"type":"text","text":"found it"}]}}' \
+  > "$proj_a/0123abcd-ef01-2345-6789-abcdef0000bb/subagents/agent-x.jsonl"
+
+refute "ls and status never read a transcript" eval '
+  "$WTS" ls >/dev/null; "$WTS" status --json >/dev/null
+  [[ "$(q "SELECT count(*) FROM usage WHERE session = '\''agent-a'\''")" != 0 ]]'
+check "wts status --json says usage: null before any count" eval '
+  "$WTS" status --json agent-a | jq -e ".[0] | has(\"usage\") and .usage == null"'
+"$WTS" brief agent-a </dev/null >/dev/null 2>&1
+check "wts brief counts each message once, at its largest" eval '
+  [[ "$(q "SELECT sum(output) FROM usage WHERE session = '\''agent-a'\'' AND model = '\''claude-opus-5-5'\''")" == 300 ]]'
+check "the synthetic placeholder is left out" eval '
+  [[ "$(q "SELECT count(*) FROM usage WHERE model = '\''<synthetic>'\''")" == 0 ]]'
+check "a subagent transcript counts, under its own model" eval '
+  [[ "$(q "SELECT output FROM usage WHERE session = '\''agent-a'\'' AND model LIKE '\''claude-haiku-4-5%'\''")" == 1000 ]]'
+check "status --json carries tokens, cost and the main model" eval '
+  "$WTS" status --json agent-a | jq -e ".[0].usage | .output == 1300 and .cache_read == 30000
+    and .cost_usd == 0.0252 and .cost_complete and .model == \"claude-opus-5-5\"
+    and (.models | length) == 2"'
+check "ls --wide adds tokens, cost and model" eval '
+  out=$("$WTS" ls --wide)
+  [[ "$out" == *TOKENS*COST*MODEL*SUBJECT* && "$(print -r -- "$out" | grep "^agent-a ")" == *"32k"*"\$0.03"*"opus-5-5"* ]]'
+check "plain ls does not" eval '[[ "$("$WTS" ls)" != *TOKENS* ]]'
+check "status --table --wide is the same table" eval '[[ "$("$WTS" status --table --wide)" == *TOKENS* ]]'
+check "the switcher list keeps its 10 fields (usage adds none)" eval '"$WTS" status --fzf | awk -F "\037" "NF != 10 { exit 1 }"'
+check "--no-git, what prefix+a and wait poll, leaves it out" eval '
+  "$WTS" status --json --no-git agent-a | jq -e ".[0].usage == null"'
+q "UPDATE usage SET input = 999 WHERE session = 'agent-a' AND model = 'claude-opus-5-5'"
+"$WTS" brief agent-a </dev/null >/dev/null 2>&1
+check "an unchanged transcript is not read again" eval '
+  [[ "$(q "SELECT input FROM usage WHERE session = '\''agent-a'\'' AND model = '\''claude-opus-5-5'\''")" == 999 ]]'
+print -r -- '{"type":"assistant","message":{"id":"msg_C","model":"claude-opus-5-5","usage":{"input_tokens":1,"output_tokens":1},"content":[]}}' \
+  >> "$proj_a/0123abcd-ef01-2345-6789-abcdef0000bb.jsonl"
+"$WTS" brief agent-a </dev/null >/dev/null 2>&1
+check "a grown one is, whole" eval '
+  [[ "$(q "SELECT input || '\'' '\'' || output FROM usage WHERE session = '\''agent-a'\'' AND model = '\''claude-opus-5-5'\''")" == "16 301" ]]'
+q "INSERT INTO usage (session, created_at, transcript, model, output)
+   SELECT name, created_at, 'x', 'claude-future-9', 5 FROM sessions WHERE name = 'agent-a'"
+check "an unpriced model makes the cost approximate, not wrong" eval '
+  "$WTS" status --json agent-a | jq -e ".[0].usage | (.cost_complete | not) and .cost_usd > 0" >/dev/null \
+  && [[ "$("$WTS" ls --wide | grep "^agent-a ")" == *"~\$0.03"* ]]'
+q "DELETE FROM usage WHERE transcript = 'x'"
+check "wts log carries the usage of a live session" eval '
+  "$WTS" log --no-things | jq -e "[.work[].sessions[] | select(.name == \"agent-a\")][0].usage.output == 1301"'
+q "INSERT OR IGNORE INTO tasks (id, source, title, status, synced_at) VALUES ('t-usage', 'local', 'usage task', 'open', 'x');
+   INSERT OR REPLACE INTO task_links VALUES ('agent-a', 't-usage', 'x')"
+check "and of the work item, added up over its sessions" eval '
+  "$WTS" log --no-things | jq -e "[.work[] | select(.id == \"t-usage\")][0].usage | .output == 1301 and .sessions == 1"'
+check "wts task show says what the task cost" eval '
+  [[ "$("$WTS" task show t-usage </dev/null)" == *"usage:  32k tokens, \$0.03 at API list prices, over 1 session(s)"* ]]'
+check "and task show --json has it" eval '
+  "$WTS" task show t-usage --json </dev/null | jq -e ".usage.sessions == 1 and .usage.tokens > 0"'
+check "the table is in the schema" eval '[[ "$("$WTS" db schema)" == *"CREATE TABLE usage"* ]]'
 "$WTS" rm agent-a -f >/dev/null
+check "the usage outlives the session, with its archive row" eval '
+  "$WTS" log --no-things --since 2020-01-01 \
+    | jq -e "[.work[].sessions[] | select(.name == \"agent-a\" and .state == \"archived\")][0].usage.output == 1301"'
+env WTS_NO_ATTACH=1 "$WTS" noarch2 smoke >/dev/null
+q "INSERT INTO usage (session, created_at, transcript, model, output)
+   SELECT name, created_at, 'y', 'claude-opus-5-5', 7 FROM sessions WHERE name = 'noarch2'"
+env WTS_NO_ARCHIVE=1 "$WTS" rm noarch2 -f >/dev/null
+check "and goes when there is no archive row to keep it" eval '
+  [[ "$(q "SELECT count(*) FROM usage WHERE session = '\''noarch2'\''")" == 0 ]]'
+# An existing database, written by a wts before the table: db_init only adds it
+# because the schema version moved.
+q "DROP TABLE usage; PRAGMA user_version = 5"
+check "a database at schema 5 gets the table on the next command" eval '
+  "$WTS" ls >/dev/null; [[ "$(q "SELECT count(*) FROM sqlite_master WHERE name = '\''usage'\''")" == 1 ]]'
 check "log, retro, doctor, keys, doc, stop and pr are info commands for wts-fresh" eval '
   line=$(grep -E "^  ls\|status\|" "$ROOT/libexec/wts/wts-fresh")
   for c in log retro doctor keys doc stop pr; do [[ "$line" == *"|$c|"* ]] || exit 1; done'

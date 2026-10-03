@@ -135,6 +135,7 @@ wts auth-form                          # ../myapp-worktrees/auth-form, branch au
 wts "rate-limit the public API per key"   # Claude proposes the name, starts on the task
 wts ls                                 # agent state, branch, git delta, tmux state
                                        # (and REPO, once sessions span two repositories)
+wts ls --wide                          # + tokens, API-price cost and model per session
 wts stop auth-form                     # tmux session only; wts restore brings it back
 wts rm auth-form -f                    # session + worktree + branch + registry entry
 ```
@@ -146,8 +147,8 @@ wts <name> ["<phrase>"] [layout] [context...] [--doc <d>] [--task [<id>]] [--det
 wts "<phrase>" [layout] [context...] [--doc <d>] [--task [<id>]] [--detach] [--json]
 wts new [-p layout] [--doc <d>] [--task [<id>]] [--detach] [--json] <name|"phrase">...
 wts doc add <url|path> | ls [--json] | show [--json] | sync | forget | use <slug> [name] | tools
-wts ls
-wts status [--json|--table|--fzf]
+wts ls [--wide]
+wts status [--json|--table [--wide]|--fzf]
 wts brief [name...] | brief --cached [--json] [name...]
 wts send <name> <text...>
 wts wait <name>... [--until <state>,...] [--timeout <s>] [--json]
@@ -171,7 +172,7 @@ wts help [<command>] | wts <command> --help | wts version
 ```
 
 Every command answers `--help` with its own usage, and does nothing else: `wts
-new --help` used to start a session named `--help`. `wts ls` takes no argument
+new --help` used to start a session named `--help`. `wts ls` takes `--wide` alone
 (`wts status --json` is the one with formats), and a command that did not do
 what was asked exits non-zero: `wts restore` when a session could not come back,
 `wts task unlink` on a name that is no session.
@@ -368,6 +369,32 @@ most recent one of the worktree — never one older than the session, which woul
 belong to a previous session of the same name. Without `claude`, with
 `WTS_NO_LLM=1`, or when the answer is malformed, the raw facts are shown, under the
 reason the summary is missing. The model is never called by `wts ls` or the switcher.
+
+### Tokens and cost
+
+```
+$ wts ls --wide
+SESSION      AGENT    BRANCH       DELTA        DIRTY  TMUX     TOKENS  COST    MODEL     SUBJECT
+auth-form    idle     auth-form    +322/-0 ^4   no     running  13.6M   $5.64   opus-5-5  Server-side email validation
+rate-limit   working  rate-limit   +80/-2 ^1    yes    running  2M      $1.95   opus-5-5  Rate-limit the public API
+```
+
+`wts brief` also sums what each session's agents consumed: `message.usage` of
+every transcript of the worktree no older than the session — the one after each
+`/clear` and each subagent's included, every message counted once although
+Claude Code repeats its usage on each of its records. Tokens per model go into
+the `usage` table; nothing calls the model for it, so `WTS_NO_LLM=1 wts brief`
+counts too, and an unchanged transcript is not read again. `wts rm` and `wts gc`
+take a last count at teardown, and the rows stay with the archive.
+
+`wts ls --wide`, `wts status --json` (`usage`), `wts log` and `wts task show`
+read that table: never a transcript, so the numbers are as of the last
+`wts brief` or teardown, and `-` before the first. **COST is the API list
+price** of those tokens (cache writes at 1.25x or 2x input, reads at the
+model's cache price, fast mode at 2x), computed when it is read from the table
+in `usage_cost_sql` (`libexec/wts/wts-db.zsh`): it is what the work would cost
+on the API, not what a subscription bills. A model that table does not know
+counts its tokens but not their price, and the cost then reads `~$`.
 
 > **Privacy.** `wts brief` sends to the model, through your own `claude -p`: the
 > branch's commit log and diff stats, the session's starting prompt, your last
@@ -783,6 +810,11 @@ about 2–5 MB per semester), so `wts log` can tell you whether drilling into th
 conversation is still possible: each session carries
 `transcript.available`, tested at export time rather than promised.
 
+Each session also carries `usage` (input, output, cache writes and reads, per
+model, and `cost_usd` at API list prices; see [Tokens and cost](#tokens-and-cost)),
+and each work item the total of its sessions: what a task cost over all its
+attempts. `null` where nothing was ever counted.
+
 ### A task is where the context lives
 
 A session lasts days and dies at the merge; the task lasts months. So the task is
@@ -1141,6 +1173,7 @@ name.
 | `WTS_WORKDIR` | `WTS_ROOT` + `WTS_SUBDIR` when set, else `WTS_ROOT`              |
 | `WTS_CONTEXT` | remaining arguments, joined                                      |
 | `WTS_PROMPT`  | the phrase of `wts "<phrase>"` (empty otherwise)                 |
+| `WTS_PROMPT_FILE` | absolute path of a file holding that phrase (`.wts/prompt` in the worktree), empty without one |
 | `WTS_RESTORE` | `1` during `wts restore`                                         |
 | `WTS_RESUME`  | `1` during `wts restore` when a Claude conversation exists       |
 | `WTS_RESUME_ID` | during `wts restore`, the id of the agent's own conversation when the hooks recorded it and its transcript exists |
@@ -1149,7 +1182,10 @@ Use `WTS_WORKDIR` for `root:` and `WTS_ROOT` for commands that must run from the
 worktree root. Panes do not inherit the environment of `wts` (the tmux server is
 already running): read variables in ERB, not in pane commands. To start Claude with
 the phrase, copy the `claude_cmd` block of `default.yml`, which escapes it for the
-pane's shell. Keep layout files **ASCII**, comments included: without a UTF-8
+pane's shell. Have the pane read the phrase from `WTS_PROMPT_FILE`
+(`claude "$(cat <file>)"`) rather than type it: tmuxinator types the pane's command
+before its shell is ready, and the terminal then keeps 1024 bytes of a line, so a
+long phrase typed whole loses its end and Claude never starts. Keep layout files **ASCII**, comments included: without a UTF-8
 locale (`LANG=C`), Ruby refuses to read them ("invalid byte sequence in US-ASCII").
 
 ## Configuration

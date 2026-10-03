@@ -16,19 +16,15 @@ once, docs and completion, and gc scoped to what wts made, `--all-branches`
 for the rest), shipped with it. Then *agent friendly*: no Things read, picker or
 attach without a terminal, `--json` on every listing, `wts send`, `wait` and
 `tail`, notes at each turn, real file overlap from a `PostToolUse` hook, a task
-link the agent can judge, and the wts skill. After 1.6.0, *PR, CI and review state per
-session*: `wts pr --refresh` and a `pr_state` cache, the switcher's PR column,
-merged last, and `merged` by patch-id rather than ancestry.
+link the agent can judge, and the wts skill. Then *tokens and cost per session
+and per task*: summed from the transcripts by `wts brief` and at teardown into
+a `usage` table, shown by `wts ls --wide`, `wts status --json`, `wts log` and
+`wts task show`. Then *PR, CI and review state per session*: `wts pr
+--refresh` and a `pr_state` cache, the switcher's PR column, merged last, and
+`merged` by patch-id rather than ancestry.
 
 ## 1. Then, by what you feel first
 
-- **Tokens and cost per session and per task. [M]** Nothing reads
-  `message.usage` or the model from transcripts, although `wts-retro`'s header
-  promises "what it cost". `wts-brief` and `wts-retro collect` already read the
-  transcript once: sum input, output and cache tokens and the model there,
-  store them in a side table (a new column never appears on an existing
-  database, `db_init` is `CREATE TABLE IF NOT EXISTS`), show them in `wts log`
-  and `wts ls --wide`.
 - **Filter and group the switcher at ten sessions and more. [M]** A `ctrl-g`
   toggle between "needs me" (blocked, failed, idle) and "all", a repository
   prefix or colour per row, per-state counts in the header. Inside the existing

@@ -855,6 +855,7 @@ if db_available && [[ -s "$WTS_DB" ]]; then
            DELETE FROM merge_checks WHERE session NOT IN (SELECT name FROM sessions);
            DELETE FROM pane_hashes WHERE since < unixepoch() - 7 * 86400;
            COMMIT;" 2>&1 >/dev/null); then
+    db_q "$(usage_prune_sql)" >/dev/null 2>&1
     (( ${#purge} )) && print "✓ registry: ${#purge} entry(ies) removed"
   else
     # sqlite3's reason: "database is locked" and "no such function: unixepoch"
