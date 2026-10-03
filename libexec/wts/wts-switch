@@ -74,15 +74,43 @@ typeset -g current=""
 # tmux server — compute the same widths and the swap redraws nothing shifted.
 # For that reason BOTH producers must list the same tasks, not just the same
 # sessions.
-# The header is the first line of the output (--header-lines=1) rather than a
-# --header fixed at startup, so it is laid out again with the rows when a session
-# appears or is deleted under the popup.
+# The header is the first TWO lines of the output (--header-lines=2) rather than
+# a --header fixed at startup, so it is laid out again with the rows when a
+# session appears or is deleted under the popup: the per-state counts, then the
+# column titles. See "View" for the first.
+#
+# <kind> is empty for a registered session, `task` for a task and `tmux` for a
+# tmux session the registry does not know. Only `task` empties field 3: a
+# foreign tmux session is still somewhere to switch to.
 typeset -ga rows
 rows=()
 SEP=$'\x1f'
 
-add_row() { # <name> <agent> <branch> <delta> <subject> <preview-target> [<kind>] [<pr>]
-  rows+=("$1$SEP$2$SEP$3$SEP$4$SEP${5:-}$SEP$6$SEP${7:-}$SEP${8:-}")
+add_row() { # <name> <agent> <branch> <delta> <subject> <preview-target> [<kind>] [<pr>] [<repo root>]
+  rows+=("$1$SEP$2$SEP$3$SEP$4$SEP${5:-}$SEP$6$SEP${7:-}$SEP${8:-}$SEP${9:-}")
+}
+
+# The repository a session works on, by name: what `wts ls` calls REPO. Read
+# from the worktree's `.git` file rather than asked of git, because this runs on
+# every row of every 2-second tick: a linked worktree's `.git` says
+# `gitdir: <main>/.git/worktrees/<name>`, and <main> is the repository. A
+# session created from inside a worktree has that worktree as its repo_root, so
+# the root alone would name the wrong thing. Memoized per process.
+typeset -gA repo_names
+repo_label() { # <repo root> -> REPLY
+  local r="$1" line=""
+  REPLY=""
+  [[ -n "$r" ]] || return 0
+  if [[ -n "${repo_names[$r]:-}" ]]; then REPLY="${repo_names[$r]}"; return 0; fi
+  local main="$r"
+  if [[ -f "$r/.git" ]]; then
+    read -r line < "$r/.git" 2>/dev/null
+    line="${line#gitdir: }"
+    [[ "$line" == /*/worktrees/* ]] && main="${line%/worktrees/*}"
+    [[ "$main" == */.git ]] && main="${main:h}"
+  fi
+  REPLY="${${main:t}%.git}"
+  repo_names[$r]="$REPLY"
 }
 
 # Cut to <width> characters, the last one an ellipsis, into REPLY. zsh counts
@@ -95,6 +123,8 @@ fit() { # <text> <width>
 # The agent states, and "+123/-45 ^2".
 AGENT_W=7
 DELTA_W=10
+# A repository name past this is cut: the column is there to tell two apart.
+REPO_CAP=12
 
 emit() {
   (( ${#rows} )) || return 0
@@ -105,19 +135,37 @@ emit() {
   # The PR column only exists while some row has something to say in it: on a
   # machine without gh, or before the first refresh, it would be a blank column
   # taking ten characters from the subject.
+  # The REPO column only exists while the sessions span several repositories,
+  # as in `wts ls`: with one, it would repeat the same word on every row.
+  #
+  # Measured on ALL the rows, the ones the view hides included: ctrl-g then
+  # redraws the same columns with rows missing, instead of a new layout.
   local -a f
-  local raw mark name_w=7 branch_w=6 pr_w=0
+  local -A seen_repo
+  local raw mark name_w=7 branch_w=6 pr_w=0 repo_w=0
   for raw in "${rows[@]}"; do
     f=("${(@ps:\x1f:)raw}")
-    mark=""; [[ -z "${f[7]:-}" && "$f[1]" == "$current" ]] && mark="*"
+    mark=""; [[ "${f[7]:-}" != task && "$f[1]" == "$current" ]] && mark="*"
     (( ${#f[1]} + ${#mark} > name_w )) && name_w=$(( ${#f[1]} + ${#mark} ))
     (( ${#f[3]} > branch_w )) && branch_w=${#f[3]}
     (( ${#${f[8]:-}} > pr_w )) && pr_w=${#${f[8]:-}}
+    if [[ -n "${f[9]:-}" ]]; then
+      repo_label "$f[9]"
+      seen_repo[$REPLY]=1
+      (( ${#REPLY} > repo_w )) && repo_w=${#REPLY}
+    fi
   done
   (( pr_w > 0 && pr_w < 2 )) && pr_w=2
+  if (( ${#seen_repo} > 1 )); then
+    (( repo_w < 4 )) && repo_w=4
+    (( repo_w > REPO_CAP )) && repo_w=$REPO_CAP
+  else
+    repo_w=0
+  fi
   # Four single-space gaps between five columns, five between six.
   local rest=$(( width - AGENT_W - DELTA_W - 4 ))
   (( pr_w )) && rest=$(( rest - pr_w - 1 ))
+  (( repo_w )) && rest=$(( rest - repo_w - 1 ))
   (( rest < 24 )) && rest=24
   local cap=$(( rest * 45 / 100 ))
   (( cap < 12 )) && cap=12
@@ -126,34 +174,135 @@ emit() {
   (( cap < 8 )) && cap=8
   (( branch_w > cap )) && branch_w=$cap
   local subject_w=$(( rest - name_w - branch_w ))
+  local line_w=$(( name_w + AGENT_W + branch_w + DELTA_W + subject_w + 4 ))
+  (( pr_w )) && line_w=$(( line_w + pr_w + 1 ))
+  (( repo_w )) && line_w=$(( line_w + repo_w + 1 ))
 
-  # The header first, with an empty field 6 so that it has 3 TAB fields too. The
-  # `*` is appended after the cut, so a name too long for its column keeps it.
-  local name agent branch delta subject sess pr
-  for raw in "SESSION${SEP}AGENT${SEP}BRANCH${SEP}DELTA${SEP}SUBJECT${SEP}${SEP}${SEP}PR" "${rows[@]}"; do
+  # The counts line first, padded like a row and with empty fields 2 and 3: it
+  # is a header line, and fzf cuts every line at the same column.
+  view_line
+  fit "$REPLY" $line_w
+  printf '%-*s\t\t\n' $line_w "$REPLY"
+
+  # Then the column titles, with an empty field 6 so that they have 3 TAB fields
+  # too. The `*` is appended after the cut, so a name too long for its column
+  # keeps it.
+  local name agent branch delta subject sess repo cells cell
+  for raw in "SESSION${SEP}AGENT${SEP}BRANCH${SEP}DELTA${SEP}SUBJECT${SEP}${SEP}${SEP}PR${SEP}" "${rows[@]}"; do
     f=("${(@ps:\x1f:)raw}")
+    # The view: a row it hides is not printed at all, rather than printed and
+    # filtered by fzf, which would leave it to the query. The titles always pass.
+    [[ -z "$f[6]" && -z "${f[7]:-}" ]] || view_shows "$f[2]" "${f[7]:-}" || continue
     # Field 3 is the session name, and only a session has one: a task row and
     # the header both leave it empty. This is what makes `enter` on a task go to
     # --start instead of switch-client, and every {3} bind a no-op there.
     sess=""
-    [[ -n "$f[6]" && -z "${f[7]:-}" ]] && sess="$f[1]"
+    [[ -n "$f[6]" && "${f[7]:-}" != task ]] && sess="$f[1]"
     mark=""; [[ -n "$sess" && "$f[1]" == "$current" ]] && mark="*"
     fit "$f[1]" $(( name_w - ${#mark} )); name="$REPLY$mark"
+    # printf -v and not $(printf): a command substitution is a fork, per cell,
+    # per row, every 2 seconds.
+    printf -v cells '%-*s ' $name_w "$name"
+    if (( repo_w )); then
+      if [[ -z "$f[6]" && -z "${f[7]:-}" ]]; then repo=REPO
+      elif [[ -n "${f[9]:-}" ]]; then repo_label "$f[9]"; repo=$REPLY
+      else repo="-"; fi
+      fit "$repo" $repo_w
+      printf -v cell '%-*s ' $repo_w "$REPLY"; cells+=$cell
+    fi
     fit "$f[2]" $AGENT_W;    agent=$REPLY
     fit "$f[3]" $branch_w;   branch=$REPLY
     fit "$f[4]" $DELTA_W;    delta=$REPLY
     fit "$f[5]" $subject_w;  subject=$REPLY
+    printf -v cell '%-*s %-*s %-*s ' $AGENT_W "$agent" $branch_w "$branch" $DELTA_W "$delta"
+    cells+=$cell
     if (( pr_w )); then
-      fit "${f[8]:-}" $pr_w; pr=$REPLY
-      printf '%-*s %-*s %-*s %-*s %-*s %-*s\t%s\t%s\n' \
-        $name_w "$name" $AGENT_W "$agent" $branch_w "$branch" \
-        $DELTA_W "$delta" $pr_w "$pr" $subject_w "$subject" "$f[6]" "$sess"
-    else
-      printf '%-*s %-*s %-*s %-*s %-*s\t%s\t%s\n' \
-        $name_w "$name" $AGENT_W "$agent" $branch_w "$branch" \
-        $DELTA_W "$delta" $subject_w "$subject" "$f[6]" "$sess"
+      fit "${f[8]:-}" $pr_w
+      printf -v cell '%-*s ' $pr_w "$REPLY"; cells+=$cell
+    fi
+    printf '%s%-*s\t%s\t%s\n' "$cells" $subject_w "$subject" "$f[6]" "$sess"
+  done
+}
+
+# ─── View (ctrl-g) ───────────────────────────────────────────────────────────
+# Past ten sessions the list is longer than the popup, and the rows that need
+# you are not all on screen: the urgency sort puts them first, but the working
+# ones still push the tasks and the rest out of sight, and nothing said how many
+# were waiting. So the first header line counts the sessions per agent state,
+# and ctrl-g toggles between every row and only the sessions that need you —
+# blocked, stuck, failed, idle, the same set `prefix+a` cycles through.
+#
+# Filtered by the producer, not by fzf: fzf's query belongs to the user, and a
+# filter written into it would be erased by the first letter typed. The view is
+# on-disk state like the scroll offset and the footer, so the poller's reload
+# every 2 s keeps it. Per popup: a new popup shows everything, which is also
+# what the skeleton can show, since it knows no agent state.
+#
+# The toggle must not wait for a collection pass (seconds on a large
+# repository), so every pass of build_list leaves its rows in WTS_SWITCH_ROWS
+# and the toggle re-emits those (--list-cached): the same rows, filtered the
+# other way, at once. The next tick brings fresh ones.
+
+NEEDS_STATES=(blocked "stuck?" failed idle)
+# The order the counts are spelled in: what needs you first.
+COUNT_STATES=(blocked "stuck?" failed idle working done stopped)
+
+# Set by build_list only: the skeleton has no agent state, and filtering it
+# would show an empty list until the collector returns.
+typeset -g filtering=0
+
+view_needs() { [[ -n "${WTS_SWITCH_VIEW:-}" && -f "$WTS_SWITCH_VIEW" ]] }
+
+view_shows() { # <agent> <kind>
+  (( filtering )) && view_needs || return 0
+  [[ -z "$2" && -n "${NEEDS_STATES[(r)${(b)1}]:-}" ]]
+}
+
+# The counts line, into REPLY: every registered session, the hidden ones
+# included, or the line could not say what the other view holds. ASCII only,
+# like every display column.
+view_line() {
+  local raw st n total=0 needs=0
+  local -a f parts needs_parts
+  local -A count
+  for raw in "${rows[@]}"; do
+    f=("${(@ps:\x1f:)raw}")
+    [[ -z "${f[7]:-}" ]] || continue
+    (( total++ ))
+    count[$f[2]]=$(( ${count[$f[2]]:-0} + 1 ))
+  done
+  for st in "${COUNT_STATES[@]}"; do
+    n="${count[$st]:-0}"
+    (( n )) || continue
+    parts+=("$n $st")
+    if [[ -n "${NEEDS_STATES[(r)${(b)st}]:-}" ]]; then
+      needs_parts+=("$n $st")
+      (( needs += n ))
     fi
   done
+  local s=s; (( total == 1 )) && s=""
+  if (( filtering )) && view_needs; then
+    REPLY="needs you: $needs of $total"
+    (( needs )) && REPLY+=" (${(j:, :)needs_parts})"
+    REPLY+="  ^g all"
+  elif (( ${#parts} )); then
+    REPLY="$total session$s: ${(j:, :)parts}  ^g needs you"
+  else
+    # The skeleton: no agent state is known yet, only how many there are.
+    REPLY="$total session$s"
+  fi
+}
+
+view_prompt() {
+  if view_needs; then print -rn -- "needs you> "; else print -rn -- "session> "; fi
+}
+
+# ctrl-g, through `transform` (fzf 0.45+): toggle, re-emit the cached rows,
+# and say which view this is in the prompt as well as in the counts line.
+view() { # $1 = verb
+  [[ "${1:-}" == toggle && -n "${WTS_SWITCH_VIEW:-}" ]] || return 0
+  if view_needs; then rm -f "$WTS_SWITCH_VIEW"; else : > "$WTS_SWITCH_VIEW"; fi
+  print -rn -- "reload-sync('$WTS_BIN/wts-switch' --list-cached)+change-prompt($(view_prompt))+first"
 }
 
 # ─── Tasks ───────────────────────────────────────────────────────────────────
@@ -227,7 +376,7 @@ unregistered() { # <names already listed, one per line>
   while IFS= read -r s; do
     [[ -n "$s" ]] || continue
     print -r -- "$1" | grep -qxF -- "$s" && continue
-    add_row "$s" "-" "-" "" "(not in registry)" "$s"
+    add_row "$s" "-" "-" "" "(not in registry)" "$s" tmux
   done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
 }
 
@@ -240,13 +389,13 @@ build_list() {
   extra=("$@")
   current=$(tmux display-message -p '#S' 2>/dev/null)
 
-  local since waiting pr meta=""
+  local since waiting pr repo meta=""
   if [[ -x "$WTS_BIN/wts-status" ]] && command -v jq >/dev/null 2>&1; then
     # \x1f (not whitespace): keeps empty fields, unlike TAB.
-    while IFS=$'\x1f' read -r name agent branch delta dirty pane since waiting pr subject; do
+    while IFS=$'\x1f' read -r name agent branch delta dirty pane since waiting pr repo subject; do
       [[ -n "$name" ]] || continue
       known+="$name"$'\n'
-      add_row "$name" "$agent" "$branch" "$delta" "${subject:-}" "${pane:-$name}" "" "${pr:-}"
+      add_row "$name" "$agent" "$branch" "$delta" "${subject:-}" "${pane:-$name}" "" "${pr:-}" "${repo:-}"
       meta+="$name"$'\x1f'"$agent"$'\x1f'"${since:-}"$'\x1f'"${waiting:-}"$'\x1e'
     done < <("$WTS_BIN/wts-status" --fzf "${extra[@]}" 2>/dev/null)
   fi
@@ -261,7 +410,30 @@ build_list() {
   # the list is where you look when nothing needs you.
   task_rows
   unregistered "$known"
+  # For ctrl-g, which re-emits these rather than waiting for a pass: see "View".
+  # \x1e between rows, which no field carries (wts-status strips it), and the
+  # current session first, since emit marks it.
+  if [[ -n "${WTS_SWITCH_ROWS:-}" ]]; then
+    print -rn -- "$current"$'\x1e'"${(pj:\x1e:)rows}" > "$WTS_SWITCH_ROWS.tmp.$$" 2>/dev/null \
+      && mv -f "$WTS_SWITCH_ROWS.tmp.$$" "$WTS_SWITCH_ROWS" 2>/dev/null
+  fi
+  filtering=1
   emit
+}
+
+# The rows of the last pass, emitted again under the current view. A popup that
+# has not finished a pass yet collects one, which is what --list would do.
+build_cached() {
+  if [[ -n "${WTS_SWITCH_ROWS:-}" && -s "$WTS_SWITCH_ROWS" ]]; then
+    local -a saved
+    saved=("${(@ps:\x1e:)$(<"$WTS_SWITCH_ROWS")}")
+    current="${saved[1]}"
+    rows=("${(@)saved[2,-1]}")
+    filtering=1
+    emit
+  else
+    build_list
+  fi
 }
 
 # The skeleton: registry and tmux only, no git and no claude call, so it costs
@@ -276,7 +448,7 @@ build_list() {
 # a skeleton row, because a session name is a valid capture-pane target — the
 # same fallback build_list uses when an agent has no pane.
 build_skeleton() {
-  local known="" name branch subject row
+  local known="" name branch subject repo row
   local -a f
   local -A pr_label
   current=$(tmux display-message -p '#S' 2>/dev/null)
@@ -295,13 +467,14 @@ build_skeleton() {
     # Same SUBJECT rule as wts-status, minus the agent's conversation title,
     # which is unknowable without calling claude: at the swap the text only ever
     # gains a title, it never changes width.
-    while IFS=$'\x1f' read -r name branch subject; do
+    while IFS=$'\x1f' read -r name branch repo subject; do
       [[ -n "$name" ]] || continue
       known+="$name"$'\n'
-      add_row "$name" "-" "${branch:--}" "-" "$subject" "$name" "" "${pr_label[$name]:-}"
+      add_row "$name" "-" "${branch:--}" "-" "$subject" "$name" "" "${pr_label[$name]:-}" "$repo"
     done < <(jq -r 'to_entries | sort_by(.key)[]
       | [ .key,
           (.value.branch // "-"),
+          (.value.repo_root // ""),
           ([.value.prompt, .value.context]
             | map(select(type == "string" and . != "")) | (.[0] // "")
             | gsub("[\\t\\n\\r]"; " ")
@@ -431,7 +604,9 @@ keys() { # $1 = verb, $2 = query
 # The keys reply mode turns off, in ONE place: they used to be two identical
 # string literals in toggle and leave, and a key added to one only was left
 # unbound for the rest of the popup.
-REPLY_UNBIND="ctrl-d,ctrl-x,ctrl-e,ctrl-t"
+# ctrl-g too: a reload under a pinned reply is harmless, but its change-prompt
+# would overwrite the "reply to" one.
+REPLY_UNBIND="ctrl-d,ctrl-x,ctrl-e,ctrl-t,ctrl-g"
 
 reply_active() { [[ -n "${WTS_SWITCH_REPLY:-}" && -f "$WTS_SWITCH_REPLY" ]] }
 
@@ -578,7 +753,7 @@ reply() { # $1 = verb, then verb arguments
       footer_active && switched="$switched,?"
       # After the reply file is gone, so the footer is the list's again.
       footer=$(footer_action)
-      chain=(enable-search clear-query "rebind($switched)" "change-prompt(session> )"
+      chain=(enable-search clear-query "rebind($switched)" "change-prompt($(view_prompt))"
              refresh-preview ${footer:+"$footer"})
       print -rn -- "${(j:+:)chain}"
       ;;
@@ -644,6 +819,10 @@ new_task_chain() { # $1 = title
   if [[ -x "$WTS_BIN/wts-task" ]]; then
     id=$("$WTS_BIN/wts-task" new "$title" 2>/dev/null) || id=""
   fi
+  # The new task has to be on screen for the cursor to land on it, and the
+  # "needs you" view shows no task: back to every row, before `reply leave`
+  # words the prompt.
+  view_needs && rm -f "$WTS_SWITCH_VIEW"
   local -a chain
   chain=("$(reply leave)")
   if [[ "$id" == local:* && -n "${WTS_SWITCH_FOCUS:-}" ]]; then
@@ -654,7 +833,8 @@ new_task_chain() { # $1 = title
   print -rn -- "${(j:+:)chain}"
 }
 
-# The row a task lands on, as fzf's `pos` counts it: 1-based, header excluded.
+# The row a task lands on, as fzf's `pos` counts it: 1-based, the two header
+# lines excluded.
 # Read from the skeleton — one query, no git — which lists the same rows in the
 # same places as the collected list (the swap at startup depends on it), so the
 # index holds for the list fzf has just loaded.
@@ -663,7 +843,7 @@ task_position() { # $1 = task id
   while IFS= read -r line; do
     (( n++ ))
     if [[ "${${line#*$'\t'}%%$'\t'*}" == "task:$1" ]]; then
-      print -r -- $(( n - 1 ))
+      print -r -- $(( n - 2 ))
       return 0
     fi
   done < <(build_skeleton)
@@ -1429,6 +1609,17 @@ if [[ "${1:-}" == "--list" ]]; then
   exit 0
 fi
 
+# ctrl-g: the last pass's rows under the view just toggled; see "View".
+if [[ "${1:-}" == "--list-cached" ]]; then
+  build_cached
+  exit 0
+fi
+
+if [[ "${1:-}" == "--view" ]]; then
+  view "${2:-}"
+  exit 0
+fi
+
 # Not used by fzf — the skeleton is passed on stdin — but the smoke test needs to
 # compare the two lists, and it is the quickest way to eyeball the alignment
 # (WTS_SWITCH_COLS=55 wts-switch --list-fast | cut -f1).
@@ -1669,7 +1860,10 @@ export WTS_SWITCH_LAST="${TMPDIR:-/tmp}/wts-switch.$$.last"
 # Written by --list, read by --preview: state, since-when and waiting-for per
 # session, for the header above the pane capture.
 export WTS_SWITCH_META="${TMPDIR:-/tmp}/wts-switch.$$.meta"
-rm -f "$WTS_SWITCH_REPLY" "$WTS_SWITCH_FOCUS"
+# ctrl-g: the view (present: only what needs you) and the rows it re-emits.
+export WTS_SWITCH_VIEW="${TMPDIR:-/tmp}/wts-switch.$$.view"
+export WTS_SWITCH_ROWS="${TMPDIR:-/tmp}/wts-switch.$$.rows"
+rm -f "$WTS_SWITCH_REPLY" "$WTS_SWITCH_FOCUS" "$WTS_SWITCH_VIEW" "$WTS_SWITCH_ROWS"
 
 # ctrl-d and ctrl-x: without a resolvable wts, the binds would fail silently in
 # the popup. fzf quotes {1} and {3} itself; {1} is the display line, from which
@@ -1722,6 +1916,16 @@ if [[ -n "$WTS_CMD" && -x "$WTS_BIN/wts-doc" ]]; then
   # the id, and the document goes on the task. The reload is new with that — a
   # task's `N ctx` count changes, where a session's row does not.
   doc_bind=(--bind="ctrl-e:execute('$self' --doc {3} {2})+reload('$self' --list)+refresh-preview")
+fi
+
+# ctrl-g: the view; see "View". fzf's own ctrl-g is a second `abort`, which esc
+# already is. Below 0.45 there is no `transform` to word the prompt with: the
+# toggle runs on its own and the counts line alone says which view this is.
+typeset -a view_bind
+if [[ -n "$fzf_version" ]] && is-at-least 0.45 "$fzf_version"; then
+  view_bind=(--bind="ctrl-g:transform('$self' --view toggle)")
+else
+  view_bind=(--bind="ctrl-g:execute-silent('$self' --view toggle)+reload('$self' --list-cached)")
 fi
 
 # ctrl-t: a new task, whose mode rests on `transform` like reply mode; see "New
@@ -1792,7 +1996,7 @@ cleanup() {
   [[ -n "$poll_pid" ]] && kill "$poll_pid" 2>/dev/null
   [[ -n "$sock" ]] && rm -f "$sock"
   rm -f "$WTS_SWITCH_SCROLL" "$WTS_SWITCH_REPLY" "$WTS_SWITCH_BUSY" "$WTS_SWITCH_LAST" "$WTS_SWITCH_META" \
-    "$WTS_SWITCH_FOCUS" \
+    "$WTS_SWITCH_FOCUS" "$WTS_SWITCH_VIEW" "$WTS_SWITCH_ROWS" \
     ${WTS_SWITCH_HELP:+"$WTS_SWITCH_HELP"}
 }
 trap cleanup EXIT INT TERM
@@ -1856,7 +2060,7 @@ selection=$(print -r -- "$list" | fzf \
   --delimiter=$'\t' \
   --with-nth=1 \
   --prompt='session> ' \
-  --header-lines=1 \
+  --header-lines=2 \
   --ellipsis='…' \
   --preview="'$self' --preview {2} {3}" \
   --preview-window="right,${preview_cols},border-left" \
@@ -1866,6 +2070,7 @@ selection=$(print -r -- "$list" | fzf \
   "${pr_bind[@]}" \
   "${doc_bind[@]}" \
   "${things_bind[@]}" \
+  "${view_bind[@]}" \
   --bind="ctrl-f:execute-silent('$self' --scroll {2} {3} down)+refresh-preview" \
   --bind="ctrl-b:execute-silent('$self' --scroll {2} {3} up)+refresh-preview" \
 ) || exit 0
