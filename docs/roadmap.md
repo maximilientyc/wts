@@ -21,7 +21,10 @@ and per task*: summed from the transcripts by `wts brief` and at teardown into
 a `usage` table, shown by `wts ls --wide`, `wts status --json`, `wts log` and
 `wts task show`. Then *PR, CI and review state per session*: `wts pr
 --refresh` and a `pr_state` cache, the switcher's PR column, merged last, and
-`merged` by patch-id rather than ancestry.
+`merged` by patch-id rather than ancestry. Then *Linux CI* (`ubuntu-latest`
+next to `macos-latest`) with five items of the list below: preview targets,
+the stale guard, unknown agent states, session names, the task screen's
+branch prefix.
 
 ## 1. Then, by what you feel first
 
@@ -33,28 +36,12 @@ a `usage` table, shown by `wts ls --wide`, `wts status --json`, `wts log` and
   `archive(prompt, title, files, retro_*)`; at `wts "<phrase>"` the two or three
   best same-repository matches go into `.wts/context.md` under "Related past
   work". A database read only.
-- **Linux CI. [S]** `ubuntu-latest` next to `macos-latest`; gate the Things
-  checks on `WTS_NO_THINGS=1`. It would have caught `shasum` and `unixepoch()`
-  (SQLite 3.38) already.
 
 ## Known, small, and not yet done
 
 From the correctness audit; none loses data, each is a wrong result on a path
 you can hit.
 
-- The task screen's branch hint strips and promises `feature/`; the built-in
-  layout has no prefix, so `feature/foo` typed there yields branch `foo`.
-  Read the prefix with `branch_prefix_of`.
-- Two preview calls use a bare session name as tmux target; a session named
-  `0` or `1` is tried as a window first. `tmux_target()` already builds `=name:`.
-- The stale guard hashes an empty capture when `capture-pane` fails, so a dead
-  pane reads `stuck?` for good and gc holds its worktree; without `shasum`
-  (some Linux) it is silently off. Check the capture's status; fall back to
-  `sha1sum` or `cksum`.
-- Unknown `claude agents` state values pass straight into the public JSON,
-  against the closed list CLAUDE.md promises. Map them to `null`, log once.
-- Session names are not validated: tmux rewrites `.` and `:`, `has-session -t
-  "=…"` never matches, and the idempotent re-run starts a duplicate.
 - One agent per worktree, picked with `first`: a `blocked` agent can hide
   behind a `done` one, which also weakens gc's busy check.
 - A branch cut from a local base that carries commits already squash-landed
