@@ -12,7 +12,7 @@
 #        wts stop <name>
 #        wts pr [name]
 #        wts rm <name> [-f]
-#        wts gc [--apply] [--no-fetch] [--no-retro]
+#        wts gc [--all] [--apply] [--no-fetch] [--no-retro]
 #        wts log [--since <when>] [--until <when>] [--brief] [--no-notes]
 #        wts retro [name...] [--force]
 #        wts task ls | show <id> | link [<id>] [session] | unlink | new "<title>"
@@ -49,7 +49,8 @@
 #   gc         : clean up from the remote: worktrees and branches whose PR is
 #                merged (squash included) or whose remote branch is gone,
 #                plus any stale index.lock blocking writes in a worktree.
-#                --apply also archives what it tears down, for `wts log`
+#                --apply also archives what it tears down, for `wts log`;
+#                --all does every repository that has a session
 #   log        : the work journal as JSON: every finished session with its
 #                outcome, its diff, its retrospective and a pointer to its
 #                transcript, for the six-month look back a review needs

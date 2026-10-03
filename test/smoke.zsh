@@ -641,6 +641,32 @@ check "gc spares a branch without commits" has_session export-users-csv
 check "gc spares its worktree" test -d "$WT/export-users-csv"
 check "gc spares sibling folders" test -f "$SANDBOX/code/demo-notes/todo.txt"
 
+# A second repository: `wts ls` names the repository of each row once there are
+# two, and `gc --all` collects both from anywhere.
+REPO2="$SANDBOX/code/other"
+mkdir -p "$REPO2"
+git -C "$REPO2" init -q
+print hi > "$REPO2/README"
+git -C "$REPO2" add README
+git -C "$REPO2" commit -qm init
+refute "ls has no REPO column with one repository" eval '"$WTS" ls | head -1 | grep -q REPO'
+( cd "$REPO2" && env WTS_NO_ATTACH=1 "$WTS" elsewhere smoke >/dev/null )
+check "ls adds a REPO column once sessions span two repositories" eval '
+  out=$("$WTS" ls)
+  [[ "${out%%$'\''\n'\''*}" == *REPO* && "$out" == *"elsewhere "*" other "* ]]'
+check "gc --all collects every repository with a session, from outside any" eval '
+  out=$(cd "$SANDBOX" && "$WTS" gc --all --no-fetch)
+  [[ "$out" == *"Garbage collection — demo "* && "$out" == *"Garbage collection — other "* ]]'
+check "and starts each from its main worktree, even from inside another" eval '
+  out=$(cd "$WT/export-users-csv" && "$WTS" gc --all --no-fetch)
+  [[ "$out" == *"Garbage collection — demo "* && "$out" != *"— export-users-csv "* ]]'
+mkdir -p "$SANDBOX/code/other-worktrees/husk"
+check "its dry run names --all in the command to run next" eval '
+  out=$(cd "$SANDBOX" && "$WTS" gc --all --no-fetch)
+  [[ "$out" == *"Run again with: wts gc --all --apply"* ]]'
+rmdir "$SANDBOX/code/other-worktrees/husk"
+"$WTS" rm elsewhere -f >/dev/null
+
 # ─── gc: stale index.lock ────────────────────────────────────────────────────
 # A git process killed mid-operation leaves <gitdir>/index.lock behind and every
 # later write in that worktree fails, silently until the next `git add`.
@@ -1217,11 +1243,51 @@ check "both producers list the served task" eval '
   diff <("$SWITCH" --list-fast | cut -f2 | sort) <("$SWITCH" --list | cut -f2 | sort)'
 check "the task preview names the session serving it" eval '
   out=$("$SWITCH" --preview "task:$TASK" "")
-  [[ "$out" == *"Sessions started from it:"* && "$out" == *"- tserved "* ]]'
+  [[ "$out" == *"Sessions on it now:"* && "$out" == *"- tserved "* ]]'
 "$WTS" rm tserved -f >/dev/null
 check "and still names it once it is archived, with its outcome" eval '
   out=$("$SWITCH" --preview "task:$TASK" "")
   [[ "$out" == *"- tserved ("*")"* ]]'
+# A retry starts where the last attempt stopped: the retrospective lines a
+# retry needs reach the preview, task show, the context file and the hook. Only
+# `delivered` used to, and only in the first two.
+q "UPDATE archive SET retro_delivered = 'half the form', retro_resisted = 'the date picker',
+     retro_resolved = '-', retro_abandoned = 'the i18n pass' WHERE session = 'tserved'"
+check "the task preview carries the last attempt's retrospective" eval '
+  out=$("$SWITCH" --preview "task:$TASK" "")
+  [[ "$out" == *"resisted: the date picker"* && "$out" != *"resolved: -"* ]]'
+check "task show prints every retrospective line, not delivered alone" eval '
+  out=$(tt show "$TASK" </dev/null)
+  [[ "$out" == *"resisted: the date picker"* && "$out" == *"abandoned: the i18n pass"* ]]'
+env WTS_NO_ATTACH=1 WTS_NO_THINGS=1 "$WTS" tretry smoke --task "$TASK" >/dev/null
+check "a new session on the task opens on the previous attempt" \
+  grep -qF "resisted: the date picker" "$WT/tretry/.wts/context.md"
+check "and the hook repeats it after every /clear" eval '
+  out=$(cd "$WT/tretry" && "$ROOT/libexec/wts/wts-context" </dev/null)
+  [[ "$out" == *"Previous attempts"* && "$out" == *"tserved (abandoned"* ]]'
+# The session preview: the cached brief and the agent's last two notes above the
+# pane, read from the database and never from the model.
+q "INSERT INTO briefs VALUES ('tretry', 'k', 'done: wired the form' || char(10) || 'next: pick a date lib', strftime('%s','now') - 7200);
+   INSERT INTO notes VALUES ('tretry', 'oldest', 'not shown', '2020-01-01T00:00:00Z'),
+                            ('tretry', 'schema', 'added a column', strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 minutes')),
+                            ('tretry', 'api', 'renamed the route', strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
+check "the session preview shows its brief, with its age" eval '
+  out=$(FZF_PREVIEW_LINES=40 FZF_PREVIEW_COLUMNS=100 "$SWITCH" --preview tretry tretry)
+  [[ "$out" == *"done: wired the form (2h0m)"* && "$out" == *"next: pick a date lib"* ]]'
+check "and the last two notes its agent left, not the older ones" eval '
+  out=$(FZF_PREVIEW_LINES=40 FZF_PREVIEW_COLUMNS=100 "$SWITCH" --preview tretry tretry)
+  [[ "$out" == *"note api"*"renamed the route"* && "$out" == *"note schema"* && "$out" != *"not shown"* ]]'
+# Its stderr kept, and the pane printed under the memos: a failing expansion in
+# the rule once ended the preview there, silently for the checks above.
+tmux send-keys -t "=tretry:" "print pane-marker" Enter
+check "and the pane itself below them" eval '
+  pane_shows tretry pane-marker
+  out=$(FZF_PREVIEW_LINES=40 FZF_PREVIEW_COLUMNS=100 "$SWITCH" --preview tretry tretry 2>&1)
+  [[ "$out" == *"next: pick a date lib"*"pane-marker"* && "$out" != *"bad substitution"* ]]'
+check "a short preview keeps the pane rather than the memos" eval '
+  out=$(FZF_PREVIEW_LINES=8 "$SWITCH" --preview tretry tretry)
+  [[ "$out" != *"wired the form"* ]]'
+"$WTS" rm tretry -f >/dev/null
 # tab on a task pins the task, and enter appends to its notes instead of typing
 # into a pane there is none of.
 export WTS_SWITCH_REPLY="$SANDBOX/reply-task"

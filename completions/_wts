@@ -356,6 +356,8 @@ _wts() {
         opts+=("--no-fetch:do not contact the remote (offline)")
       (( ${before[(Ie)--no-retro]} )) ||
         opts+=("--no-retro:archive without asking Claude for a retrospective")
+      (( ${before[(Ie)--all]} )) ||
+        opts+=("--all:every repository that has a session")
       _wts_offer flags option "no more options" "${opts[@]}" ;;
 
     log)

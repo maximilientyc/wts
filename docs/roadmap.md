@@ -7,31 +7,11 @@ day or two. Each item names the code it builds on, so the estimate is checkable.
 The rules of CLAUDE.md hold throughout: the model is never called from `ls`,
 the switcher or a hook; `wts status --json` and `wts log` are contracts.
 
-## 1. Read the data wts already writes
+Item 1, *read the data wts already writes* (previous attempts in the task's
+context, briefs and notes in the switcher preview, `gc --all` and a REPO
+column), shipped after 1.5.2.
 
-The archive, the briefs and the notes are written at every teardown and read by
-almost nothing. Two small changes turn them into something you see daily.
-
-- **Previous attempts, in the task's context. [S]** The schema promises "the
-  second attempt starts where the first left off" (`wts-db.zsh`, the archive
-  comment), but `task_context_md` and the SessionStart hook never read
-  `archive`, and `wts task show` prints only `retro_delivered` — dropping
-  `resisted`, `resolved` and `abandoned`, the three lines a retry needs. A
-  "Previous attempts" block (outcome, PR, the three lines, capped at three
-  attempts) in `task_context_md` reaches the switcher preview,
-  `.wts/context.md` and the hook at once.
-- **Briefs and notes in the switcher preview. [S]** The preview is the pane
-  capture under one header line. Above it: the cached `done:` / `next:` of
-  `wts brief` (no model call, the cache is keyed on HEAD and the transcript)
-  and the last two notes the session's agent left. The `briefs` and `notes`
-  tables are read by no switcher or status code today.
-- **`gc --all`, and a REPO column. [S–M]** gc works on the repository you
-  stand in (`wts-gc`, the `repo_root` block). Loop over
-  `SELECT DISTINCT repo_root FROM sessions`, resolved through git's common
-  directory as `wts-context` does, and run the per-repository gc unchanged.
-  `wts ls` gets a REPO column or `--repo`.
-
-## 2. The command surface
+## 1. The command surface
 
 - **`wts doctor`. [S–M]** tmuxinator is discovered missing after the worktree
   exists (`bin/wts` execs it unchecked). Nothing verifies tmux ≥ 3.2
@@ -93,7 +73,7 @@ almost nothing. Two small changes turn them into something you see daily.
   recommendation is to default to branches wts knows (registry + archive) with
   `--all-branches` as the opt-in.
 
-## 3. Then, by what you feel first
+## 2. Then, by what you feel first
 
 - **PR, CI and review state per session. [M]** No PR column; `merged` is in the
   JSON but hidden, and ancestry-only (a squash merge reads `false`, while gc has

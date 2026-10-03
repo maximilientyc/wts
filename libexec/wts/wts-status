@@ -496,9 +496,28 @@ case "$FORMAT" in
                (($live | map(select((.stale | not) and .agent_state == "idle")) | length) as $n
                 | if $n > 0 then "\($n) idle" else empty end) ]
            | if length == 0 then "" else "wts: " + join(" · ") end' ;;
-  table) print -r -- "$all" | jq -r --argjson git "$WITH_GIT" "$SUBJECT"'
-           (["SESSION","AGENT","BRANCH","DELTA","DIRTY","TMUX","SUBJECT"] | @tsv),
-           (.[] | [ .name,
+  # REPO only when the sessions span several repositories: with one, it would
+  # repeat the same word on every row. Named after git's common directory, not
+  # repo_root, which is a worktree for a session created from inside one.
+  table) typeset -a repo_pairs=()
+         r="" c=""
+         for r in "${(@f)$(print -r -- "$all" | jq -r '.[].repo_root // empty' | sort -u)}"; do
+           [[ -n "$r" ]] || continue
+           c=$(git -C "$r" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || c=""
+           if [[ "$c" == */.git ]]; then c="${c:h}"; fi
+           [[ -n "$c" ]] || c="$r"
+           repo_pairs+=("$r" "${${c:t}%.git}")
+         done
+         repos_json=$(jq -nc 'reduce range(0; $ARGS.positional | length; 2) as $i
+                                ({}; . + {($ARGS.positional[$i]): $ARGS.positional[$i + 1]})' \
+                        --args "${repo_pairs[@]}")
+         print -r -- "$all" | jq -r --argjson git "$WITH_GIT" --argjson repos "${repos_json:-"{}"}" "$SUBJECT"'
+           ([$repos[]] | unique | length > 1) as $multi
+           | (["SESSION"] + (if $multi then ["REPO"] else [] end)
+              + ["AGENT","BRANCH","DELTA","DIRTY","TMUX","SUBJECT"] | @tsv),
+           (.[] | [ .name ]
+                + (if $multi then [$repos[.repo_root // ""] // "-"] else [] end)
+                + [
                     (if .stale then "stuck?" else (.agent_state // "-") end),
                     .branch,
                     (if $git then "+\(.added)/-\(.removed)" + (if .ahead > 0 then " ^\(.ahead)" else "" end) else "-" end),
