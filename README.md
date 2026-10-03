@@ -418,6 +418,7 @@ says so and stays open; without `gh` the key is neither bound nor listed),
 `ctrl-e` attaches a [context document](#context-documents-wts-doc) to the session
 and tells its agent (`wts doc use`, picker included), `ctrl-t` pulls a
 [task](#the-work-you-have-not-started-yet) in from Things,
+`ctrl-g` shows only the sessions that need you (see below),
 `ctrl-f` / `ctrl-b` scroll the preview by half a page, `ctrl-r` reloads. The
 current session is never stopped from the popup, which it would close. tmux
 sessions unknown to wts are listed after, and `ctrl-x` works on them too.
@@ -443,6 +444,19 @@ what the session already said about itself: the cached `done:` / `next:` of
 — from the database, never a model call, and dropped on a popup too short to
 spare the lines. Then the pane itself.
 
+**At ten sessions and more**, the list is longer than the popup. Its first line
+counts the sessions per agent state (`all 12: 2 blocked 1 idle 7 working
+2 done`), and **`ctrl-g` keeps only the ones that need you** — blocked, `stuck?`,
+failed or idle, the agents `prefix+a` cycles through — with the prompt reading
+`needs you>` and the first line what the other view holds (`needs you 3/12:
+2 blocked 1 idle`); `ctrl-g` again brings every row back. The toggle redraws
+the rows of the last refresh at once, without waiting for git, and the columns
+keep their widths. It lasts as long as the popup: each `prefix+s` opens on
+every row. Once the sessions span several repositories, a REPO column names
+each row's, as in `wts ls`.
+
+![the switcher with fourteen sessions over two repositories, counted per state on its first line, ctrl-g narrowing it to the five that need you, the prompt reading needs you, and ctrl-g again bringing every row back](docs/switcher-filter.gif)
+
 `tab` **answers the agent without leaving the popup**: the prompt becomes
 `reply to <session>>`, what you type no longer filters the list, and `enter` sends
 the line to the agent's pane followed by Enter — a number for Claude's numbered
@@ -450,7 +464,7 @@ questions and permission prompts, a sentence for the rest, nothing at all for a
 bare Enter. The preview keeps refreshing, so the agent's reaction shows up in
 place; `esc` or `tab` brings the list back (`enter` switches again). The reply
 stays pinned to the session you pressed `tab` on, even if the list re-sorts under
-the cursor, and `ctrl-d` / `ctrl-x` are disabled meanwhile. While the agent column shows `-`,
+the cursor, and `ctrl-d` / `ctrl-x` / `ctrl-g` are disabled meanwhile. While the agent column shows `-`,
 wts does not know the agent's pane yet and the reply goes to the session's active
 pane. Needs fzf 0.45 or later; older versions keep the plain switcher.
 

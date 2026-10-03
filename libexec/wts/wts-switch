@@ -11,6 +11,8 @@
 #   tab      reply mode: type for the previewed agent, enter sends (fzf >= 0.45)
 #            on a task: note mode, enter appends the line to its notes
 #   esc      leave reply mode, or close the popup
+#   ctrl-g   only the sessions that need you (blocked, stuck, failed, idle), or
+#            every row again; see "View"
 #   ctrl-r   reload the list by hand
 #   ctrl-d   delete the session (wts rm) and reload
 #            on a local task: mark it done (wts task done), after a y/N prompt
@@ -180,7 +182,7 @@ emit() {
 
   # The counts line first, padded like a row and with empty fields 2 and 3: it
   # is a header line, and fzf cuts every line at the same column.
-  view_line
+  view_line $line_w
   fit "$REPLY" $line_w
   printf '%-*s\t\t\n' $line_w "$REPLY"
 
@@ -261,7 +263,7 @@ view_shows() { # <agent> <kind>
 # The counts line, into REPLY: every registered session, the hidden ones
 # included, or the line could not say what the other view holds. ASCII only,
 # like every display column.
-view_line() {
+view_line() { # <line width>
   local raw st n total=0 needs=0
   local -a f parts needs_parts
   local -A count
@@ -280,17 +282,30 @@ view_line() {
       (( needs += n ))
     fi
   done
-  local s=s; (( total == 1 )) && s=""
+  # Spaces, not commas, between the counts: at half a popup the list is about
+  # 64 columns, and the whole spread of states has to fit in it. The ^g hint
+  # comes last and only where there is room; the footer lists ^g anyway.
+  # Too long still, the states that do not need you go from the end (stopped,
+  # then done...) rather than letting `fit` cut a number in half.
+  local hint
   if (( filtering )) && view_needs; then
-    REPLY="needs you: $needs of $total"
-    (( needs )) && REPLY+=" (${(j:, :)needs_parts})"
-    REPLY+="  ^g all"
+    REPLY="needs you $needs/$total"
+    (( needs )) && REPLY+=": ${needs_parts[*]}"
+    hint="  ^g all"
   elif (( ${#parts} )); then
-    REPLY="$total session$s: ${(j:, :)parts}  ^g needs you"
+    while (( ${#parts} > ${#needs_parts} && ${#parts} > 1 )) \
+          && (( ${#${:-all $total: ${parts[*]}}} > ${1:-0} )); do
+      parts=("${(@)parts[1,-2]}")
+    done
+    REPLY="all $total: ${parts[*]}"
+    hint="  ^g needs you"
   else
     # The skeleton: no agent state is known yet, only how many there are.
-    REPLY="$total session$s"
+    REPLY="all $total"
+    hint=""
   fi
+  (( ${#REPLY} + ${#hint} <= ${1:-0} )) && REPLY+="$hint"
+  return 0
 }
 
 view_prompt() {
@@ -299,10 +314,16 @@ view_prompt() {
 
 # ctrl-g, through `transform` (fzf 0.45+): toggle, re-emit the cached rows,
 # and say which view this is in the prompt as well as in the counts line.
+#
+# `reload`, not the `reload-sync` everything else uses: on fzf 0.74 a
+# reload-sync that takes a moment sometimes swaps the rows in without redrawing
+# the header lines — measured, 6 toggles in 26 left the old counts on screen
+# until the next tick, 0 in 34 with `reload`. The cached rows come back in tens
+# of milliseconds, so the blank list `reload` shows meanwhile is not seen.
 view() { # $1 = verb
   [[ "${1:-}" == toggle && -n "${WTS_SWITCH_VIEW:-}" ]] || return 0
   if view_needs; then rm -f "$WTS_SWITCH_VIEW"; else : > "$WTS_SWITCH_VIEW"; fi
-  print -rn -- "reload-sync('$WTS_BIN/wts-switch' --list-cached)+change-prompt($(view_prompt))+first"
+  print -rn -- "reload('$WTS_BIN/wts-switch' --list-cached)+change-prompt($(view_prompt))+first"
 }
 
 # ─── Tasks ───────────────────────────────────────────────────────────────────

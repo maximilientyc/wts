@@ -419,20 +419,20 @@ tmux kill-session -t "=$LONG"
 # (--list-cached) rather than collecting again.
 export WTS_SWITCH_VIEW="$SANDBOX/view" WTS_SWITCH_ROWS="$SANDBOX/rows"
 check "the first header line counts the sessions per state" eval '
-  l=$("$SWITCH" --list); [[ "${l%%$'\''\n'\''*}" == "2 sessions: 1 blocked  ^g needs you "* ]]'
+  l=$("$SWITCH" --list); [[ "${l%%$'\''\n'\''*}" == "all 2: 1 blocked  ^g needs you "* ]]'
 check "the skeleton counts them, states unknown" eval '
-  l=$("$SWITCH" --list-fast); [[ "${l%%$'\''\n'\''*}" == "2 sessions "* ]]'
+  l=$("$SWITCH" --list-fast); [[ "${l%%$'\''\n'\''*}" == "all 2 "* ]]'
 check "fzf accepts the ctrl-g bind" \
   eval 'printf "x\n" | fzf --bind="ctrl-g:transform(true)" --filter=x'
 chain=$("$SWITCH" --view toggle)
 check "ctrl-g turns the view on, on disk" test -e "$WTS_SWITCH_VIEW"
 check "and re-emits the cached rows under a new prompt" eval '
-  [[ "$chain" == "reload-sync("*"--list-cached)+change-prompt(needs you> )+first" ]]'
+  [[ "$chain" == "reload("*"--list-cached)+change-prompt(needs you> )+first" ]]'
 check "fzf parses the ctrl-g chain" eval 'printf "x\n" | fzf --bind="start:$chain" --filter=x'
 check "the view keeps only the sessions that need you" eval '
   [[ "$("$SWITCH" --list-cached | tail -n +3 | cut -f3)" == export-users-csv ]]'
 check "and says so, with what it hides" eval '
-  l=$("$SWITCH" --list-cached); [[ "${l%%$'\''\n'\''*}" == "needs you: 1 of 2 (1 blocked)  ^g all "* ]]'
+  l=$("$SWITCH" --list-cached); [[ "${l%%$'\''\n'\''*}" == "needs you 1/2: 1 blocked  ^g all "* ]]'
 check "the collected list keeps the view" eval '
   [[ "$("$SWITCH" --list | tail -n +3 | cut -f3)" == export-users-csv ]]'
 check "the view keeps the columns of every row" eval '

@@ -24,14 +24,12 @@ a `usage` table, shown by `wts ls --wide`, `wts status --json`, `wts log` and
 `merged` by patch-id rather than ancestry. Then *Linux CI* (`ubuntu-latest`
 next to `macos-latest`) with five items of the list below: preview targets,
 the stale guard, unknown agent states, session names, the task screen's
-branch prefix.
+branch prefix. Then *the switcher at ten sessions and more*: per-state counts
+on its first line, `ctrl-g` between what needs you and every row, a REPO
+column once the sessions span two repositories.
 
 ## 1. Then, by what you feel first
 
-- **Filter and group the switcher at ten sessions and more. [M]** A `ctrl-g`
-  toggle between "needs me" (blocked, failed, idle) and "all", a repository
-  prefix or colour per row, per-state counts in the header. Inside the existing
-  `--list` reload and the three-TAB-field row contract.
 - **Related past work at creation, without a task. [M]** FTS5 over
   `archive(prompt, title, files, retro_*)`; at `wts "<phrase>"` the two or three
   best same-repository matches go into `.wts/context.md` under "Related past
