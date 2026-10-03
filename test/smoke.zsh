@@ -1979,8 +1979,8 @@ check "the base it was compared against is recorded" eval '
   [[ "$(q "select base from archive where session = '"'"'gcarch'"'"'")" == main ]]'
 check "the worktree really is gone" eval '[[ ! -e "$WT/gcarch" ]]'
 
-check "the schema is at version 7" eval '
-  [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 7 ]]'
+check "the schema is at version 8" eval '
+  [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 8 ]]'
 
 # ─── PR, CI and review state ─────────────────────────────────────────────────
 # gh is a stand-in: it answers from fixtures keyed by what it was asked (a
@@ -2066,8 +2066,9 @@ check "no PR is an answer, cached as none" eval '
 check "checks and review are normalized" eval '
   [[ "$(q "select checks || '"'"'/'"'"' || review from pr_state where session = '"'"'pr-chg'"'"'")" == "pending/changes_requested" ]]'
 
-# The contract: `pr` is an object or null, `merged` says the gh-merged PR too
-# only through the sort and the label, never by rewriting the git fact.
+# The contract: `pr` is an object or null. A PR gh saw merged sorts and labels
+# the session merged; `merged` itself only when its head is the branch's tip
+# (below: pr-link's fixture has no head).
 check "status --json carries pr" eval '"$WTS" status --json | jq -e "
   (.[] | select(.name == \"pr-ci\") | .pr | .number == 42 and .state == \"open\"
      and .checks == \"fail\" and .review == null and (.refreshed_at | type) == \"number\")
@@ -2151,6 +2152,83 @@ check "and archives it as squashed" eval '
   [[ "$(q "select outcome from archive where session = '"'"'pr-ok'"'"' order by id desc limit 1")" == squashed ]]'
 check "the PR rows go with the session" eval '
   [[ "$(q "select count(*) from pr_state where session = '"'"'pr-ok'"'"'")$(q "select count(*) from merge_checks where session = '"'"'pr-ok'"'"'")" == 00 ]]'
+# A squash of SEVERAL commits lands as one combined diff, which matches none of
+# the branch's patch-ids: #39 and #40 (4 and 3 commits) read merged:false, gc
+# left them out and `wts rm -f` archived them abandoned. The content test is a
+# merge into the base that would change nothing. The base moves on after the
+# squash, so the base's tip is not the squash itself.
+sq_land() { # <session>: squash its branch onto origin/main, one commit, then one more
+  local b; b=$(reg_field "$1" branch)
+  git -C "$sq_clone" fetch -q origin && git -C "$sq_clone" reset -q --hard origin/main
+  git -C "$sq_clone" fetch -q "$REPO" "refs/heads/$b"
+  git -C "$sq_clone" merge -q --squash FETCH_HEAD >/dev/null 2>&1
+  git -C "$sq_clone" commit -qm "$1 (#50)"
+  print later > "$sq_clone/LATER-$1"
+  git -C "$sq_clone" add "LATER-$1"
+  git -C "$sq_clone" commit -qm "unrelated, after the squash"
+  git -C "$sq_clone" push -q origin HEAD:main
+  git -C "$REPO" fetch -q origin
+}
+sq_commits() { # <session> <n>: n commits of its own, one file rewritten twice
+  local w i; w=$(reg_field "$1" worktree)
+  for i in {1..$2}; do
+    print "$1 step $i" > "$w/$1-$i"
+    print "$1 step $i" >> "$w/$1-notes"
+    git -C "$w" add -A && git -C "$w" commit -qm "$1: step $i"
+  done
+}
+sq_merged() { "$WTS" status --json | jq -e --arg n "$1" ".[] | select(.name == \$n) | .merged" >/dev/null }
+gc_tears() { "$WTS" gc --no-fetch --json </dev/null | jq -e --arg n "$1" "any(.teardown[]; .session == \$n)" >/dev/null }
+for s in sq-multi sq-force sq-pr; do
+  WTS_NO_ATTACH=1 WTS_BASE_BRANCH=origin/main "$WTS" "$s" smoke >/dev/null 2>&1
+done
+sq_commits sq-multi 3
+sq_commits sq-force 3
+sq_commits sq-pr 2
+check "a 3-commit branch is not merged before its squash" eval '! sq_merged sq-multi && ! gc_tears sq-multi'
+sq_land sq-multi
+sq_land sq-force
+check "its patch-ids match nothing in the base" eval '
+  [[ "$(git -C "$REPO" cherry origin/main "$(reg_field sq-multi branch)" | grep -c "^+")" == 3 ]]'
+check "a 3-commit branch squash-merged reads merged" eval 'sq_merged sq-multi'
+check "and gc tears it down" eval 'gc_tears sq-multi'
+check "gc says how it landed" eval '
+  "$WTS" gc --no-fetch --json </dev/null | jq -e "any(.teardown[]; .session == \"sq-multi\" and (.why | startswith(\"squashed\")))"'
+sqm_wt=$(reg_field sq-multi worktree)
+print "after the squash" >> "$sqm_wt/sq-multi-notes"
+git -C "$sqm_wt" commit -qam "one more, after the squash"
+check "one commit after the squash: not merged" eval '! sq_merged sq-multi'
+check "and gc leaves it" eval '! gc_tears sq-multi'
+git -C "$sqm_wt" reset -q --hard HEAD~1
+sqm_branch=$(reg_field sq-multi branch)
+out=$("$WTS" rm sq-multi </dev/null 2>&1)
+check "rm deletes the squashed branch without -f" eval '
+  [[ "$out" == *"branch $sqm_branch deleted (squashed)"* ]]'
+check "and archives it as squashed" eval '
+  [[ "$(q "select outcome from archive where session = '"'"'sq-multi'"'"' order by id desc limit 1")" == squashed ]]'
+"$WTS" rm sq-force -f </dev/null >/dev/null 2>&1
+check "rm -f archives a squashed branch as squashed, not abandoned" eval '
+  [[ "$(q "select outcome from archive where session = '"'"'sq-force'"'"' order by id desc limit 1")" == squashed ]]'
+
+# The second witness: gh saw the PR merged, at the branch's current tip. Its
+# content is nowhere in the local base (not fetched yet, or changed again
+# since), so only pr_state can say it.
+sqp_wt=$(reg_field sq-pr worktree)
+sqp_tip=$(git -C "$sqp_wt" rev-parse HEAD)
+fixture "$(reg_field sq-pr branch)" '{"number":51,"state":"MERGED","reviewDecision":"APPROVED",
+  "statusCheckRollup":[],"mergedAt":"2026-10-03T00:00:00Z","url":"https://github.com/o/r/pull/51",
+  "headRefName":"'"$(reg_field sq-pr branch)"'","headRefOid":"'"$sqp_tip"'"}'
+check "not merged before gh says so" eval '! sq_merged sq-pr && ! gc_tears sq-pr'
+PATH="$GHPATH" "$WTS" pr --refresh sq-pr >/dev/null 2>&1
+check "pr --refresh keeps the PR's head" eval '
+  [[ "$(q "select head from pr_state where session = '"'"'sq-pr'"'"'")" == "$sqp_tip" ]]'
+check "a PR gh saw merged at the tip reads merged" eval 'sq_merged sq-pr'
+check "and gc tears it down" eval 'gc_tears sq-pr'
+print "after the merge" >> "$sqp_wt/sq-pr-notes"
+git -C "$sqp_wt" commit -qam "one more, after the merge"
+check "a commit past the PR's head is not covered" eval '! sq_merged sq-pr && ! gc_tears sq-pr'
+"$WTS" rm sq-pr -f </dev/null >/dev/null 2>&1
+
 for s in pr-ci pr-chg pr-none pr-link; do "$WTS" rm "$s" -f </dev/null >/dev/null 2>&1; done
 
 # ─── Agent friendly ──────────────────────────────────────────────────────────
@@ -2378,6 +2456,15 @@ check "and goes when there is no archive row to keep it" eval '
 q "DROP TABLE usage; PRAGMA user_version = 5"
 check "a database at schema 5 gets the table on the next command" eval '
   "$WTS" ls >/dev/null; [[ "$(q "SELECT count(*) FROM sqlite_master WHERE name = '\''usage'\''")" == 1 ]]'
+# Schema 8 is a column on an existing table, which CREATE TABLE IF NOT EXISTS
+# never adds: a pr_state from schema 7 gets head, and its rows stay.
+q "INSERT OR REPLACE INTO pr_state (session, branch, state) VALUES ('old-pr', 'b', 'open');
+   ALTER TABLE pr_state DROP COLUMN head; PRAGMA user_version = 7"
+check "a pr_state from schema 7 gets head on the next command" eval '
+  "$WTS" ls >/dev/null
+  [[ "$(q "SELECT count(*) FROM pragma_table_info('"'"'pr_state'"'"') WHERE name = '"'"'head'"'"'")" == 1
+     && "$(q "SELECT state || head FROM pr_state WHERE session = '"'"'old-pr'"'"'")" == open
+     && "$(q "PRAGMA user_version")" == 8 ]]'
 check "log, retro, doctor, keys, doc, stop and pr are info commands for wts-fresh" eval '
   line=$(grep -E "^  ls\|status\|" "$ROOT/libexec/wts/wts-fresh")
   for c in log retro doctor keys doc stop pr; do [[ "$line" == *"|$c|"* ]] || exit 1; done'

@@ -18,9 +18,9 @@ each other, and for finding your way back afterwards:
 - **Tells you when one needs you.** A bell on the pane and a banner naming the
   session when an agent waits for a permission or an answer, a status-line
   segment counting them, and `prefix+a` to jump to the one waiting longest.
-- **Cleans up after squash merges.** `wts gc` compares patch-ids against
-  `origin/<base>`, so branches merged by squash or rebase are recognized, not left
-  to pile up.
+- **Cleans up after squash merges.** `wts gc` compares patch-ids and trees
+  against `origin/<base>`, so branches merged by squash or rebase are recognized,
+  not left to pile up.
 - **Tells you where you left off.** `wts brief` prints a two-line *done / next* per
   session, from git and the agent's transcript.
 - **Starts from a sentence.** `wts "rate-limit the public API per key"` names the
@@ -282,9 +282,9 @@ the same data (`agent_state`, `stale`, git counters, tmux state) for scripts,
 plus `agent_since` (the epoch of the event that put the agent in its state),
 `agent_waiting_for` (the permission or the question), `agent_source` (`agents`
 or `events`, see below) and `pr` (see [Pull requests](#pull-requests)).
-`merged` is true once every commit of the branch is in the base, squash and
-rebase included — the test `wts gc` uses — and false for a branch nothing was
-committed to yet.
+`merged` is true once the branch's content is in the base, squash and rebase
+included, or once `gh` saw its pull request merged at the branch's current tip —
+the test `wts gc` uses — and false for a branch nothing was committed to yet.
 
 ## Pull requests
 
@@ -765,7 +765,10 @@ an ancestor of the base and piles up forever. `wts gc` also compares **patch-ids
 (the test behind `git cherry`, with the base hashed once for all branches rather
 than once per branch): a branch whose every commit has an equivalent in the base is
 entirely present in it, whatever the merge method, and is deleted with
-`git branch -D`. A deleted remote branch is read from `%(upstream:track)` ==
+`git branch -D`. A squash of several commits lands as one diff that matches none
+of them, so a branch also counts when merging it into the base would change
+nothing (`git merge-tree`, git 2.38+), or when `wts pr --refresh` saw its pull
+request merged with the branch's current tip as its head. A deleted remote branch is read from `%(upstream:track)` ==
 `[gone]`, which only `--prune` reveals.
 
 **Safety rules:**
