@@ -93,7 +93,9 @@ quiet=false
 if [[ -n "${TMUX_PANE:-}" ]]; then
   db_q "INSERT INTO agent_panes (session, claude_session, pane, at)
         VALUES ($(sql_str "$me"), $(sql_str "$sid"), $(sql_str "$TMUX_PANE"), $now)
-        ON CONFLICT(session) DO UPDATE SET claude_session = excluded.claude_session,
+        ON CONFLICT(session) DO UPDATE SET
+          claude_session = CASE WHEN excluded.claude_session = '' THEN agent_panes.claude_session
+                                ELSE excluded.claude_session END,
           pane = excluded.pane, at = excluded.at" >/dev/null 2>&1
 fi
 
