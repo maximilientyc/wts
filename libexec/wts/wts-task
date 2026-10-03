@@ -169,6 +169,12 @@ task_title() {  # <id>
 resolve_task() {  # [<id|url|words>]
   local want="${1:-}"
   if [[ -z "$want" ]]; then
+    # No terminal, no picker: an agent gets the way out instead of a Things
+    # read followed by an fzf that cannot draw.
+    if ! [[ -t 0 && -t 2 ]]; then
+      print -u2 -r -- "wts task: no terminal to pick a task in — pass its id (wts task ls --json)"
+      return 2
+    fi
     [[ -x "$THINGS" ]] || { print -u2 -r -- "wts task: no Things on this machine, pass an id"; return 1 }
     local json id
     json=$("$THINGS" pick --json) || return 1
@@ -233,9 +239,66 @@ resolve_task() {  # [<id|url|words>]
 
 # ─── ls ──────────────────────────────────────────────────────────────────────
 
+# The JSON of `task ls --json` / `task show --json`: one SELECT each, over the
+# same tables as the text, so the two cannot disagree. `version` like `wts log`:
+# keys are added, never renamed. `state` is live or archived; `outcome` is the
+# archive's closed vocabulary (in-progress for a live session).
+task_sessions_sql() {  # <sql expression for the task id>
+  print -r -- "(SELECT coalesce(json_group_array(json(s)), json('[]')) FROM (
+      SELECT json_object('name', session, 'state', 'archived', 'outcome', outcome,
+                         'pr', pr_url, 'added', added, 'removed', removed,
+                         'finished_at', finished_at,
+                         'retro', json(CASE WHEN retro_delivered != '' THEN 'true' ELSE 'false' END)) AS s
+        FROM archive WHERE task = $1
+      UNION ALL
+      SELECT json_object('name', s.name, 'state', 'live', 'outcome', 'in-progress',
+                         'branch', s.branch, 'worktree', s.worktree)
+        FROM task_links l JOIN sessions s ON s.name = l.session WHERE l.task = $1))"
+}
+
+tasks_json() {  # <all?>
+  local all="$1" where=""
+  $all || where="WHERE (SELECT count(*) FROM (
+                   SELECT session FROM task_links WHERE task = t.id
+                   UNION SELECT session FROM archive WHERE task = t.id)) > 0"
+  db_ro "SELECT json_object('version', 1, 'tasks', coalesce(json_group_array(json(o)), json('[]')))
+         FROM (SELECT json_object('id', t.id, 'title', t.title, 'source', t.source,
+                 'status', CASE WHEN t.status = '' THEN 'unknown' ELSE t.status END,
+                 'area', t.area, 'completed_at', t.completed_at,
+                 'sessions', json($(task_sessions_sql t.id))) AS o
+               FROM tasks t $where ORDER BY t.completed_at DESC, t.title)" 2>/dev/null
+}
+
+task_json() {  # <id>
+  local q
+  q=$(sql_str "$1")
+  db_ro "SELECT json_object('version', 1, 'id', t.id, 'title', t.title, 'source', t.source,
+           'status', CASE WHEN t.status = '' THEN 'unknown' ELSE t.status END,
+           'area', t.area, 'notes', t.notes,
+           'links', json(CASE WHEN json_valid(t.links) THEN t.links ELSE '[]' END),
+           'wts_notes', (SELECT coalesce(json_group_array(json_object('at', added_at, 'body', body)), json('[]'))
+                         FROM (SELECT added_at, body FROM task_notes WHERE task = $q ORDER BY added_at)),
+           'documents', (SELECT coalesce(json_group_array(slug), json('[]'))
+                         FROM (SELECT slug FROM task_docs WHERE task = $q ORDER BY added_at)),
+           'sessions', json($(task_sessions_sql "$q")),
+           'attempts', (SELECT coalesce(json_group_array(json(a)), json('[]')) FROM (
+              SELECT json_object('session', session, 'outcome', outcome, 'pr', pr_url,
+                     'finished_at', finished_at, 'delivered', retro_delivered,
+                     'resisted', retro_resisted, 'resolved', retro_resolved,
+                     'abandoned', retro_abandoned) AS a
+                FROM archive WHERE task = $q ORDER BY finished_at DESC, id DESC)))
+         FROM tasks t WHERE t.id = $q" 2>/dev/null
+}
+
 cmd_ls() {
-  local all=false
-  [[ "${1:-}" == "--all" ]] && all=true
+  local all=false json=false a
+  for a in "$@"; do
+    case "$a" in
+      --all)  all=true ;;
+      --json) json=true ;;
+      *) print -u2 -r -- "usage: wts task ls [--all] [--json]"; return 2 ;;
+    esac
+  done
   db_init 2>/dev/null
 
   # Refresh the snapshots wts holds, so titles do not drift from Things — in ONE
@@ -259,6 +322,11 @@ cmd_ls() {
         [[ -n "$one" ]] && snapshot_json "$one"
       done < <(db_rows "SELECT id FROM tasks WHERE source = 'things'" 2>/dev/null)
     fi
+  fi
+
+  if $json; then
+    tasks_json "$all"
+    return 0
   fi
 
   local bold="" dim="" reset=""
@@ -317,7 +385,13 @@ sessions_of() {  # <task-id>
 # ─── show ────────────────────────────────────────────────────────────────────
 
 cmd_show() {
-  local id
+  local id json=false
+  local -a rest
+  rest=()
+  for a in "$@"; do
+    if [[ "$a" == --json ]]; then json=true; else rest+=("$a"); fi
+  done
+  set -- "${rest[@]}"
   # Inside a wts session, no id means this session's task — as for note, edit
   # and doc. The picker, and its read of Things, is for a human at a terminal
   # outside any session; an agent told `wts task show` by the SessionStart hook
@@ -332,6 +406,17 @@ cmd_show() {
   # Only when an id was given: with none, resolve_task went through the picker
   # and has already snapshotted what it read.
   if [[ -n "${1:-}" ]]; then snapshot "$id" 2>/dev/null; fi
+
+  if $json; then
+    local out
+    out=$(task_json "$id")
+    if [[ -z "$out" ]]; then
+      print -u2 -r -- "wts task: $id is unknown here"
+      return 1
+    fi
+    print -r -- "$out"
+    return 0
+  fi
 
   local title notes links st
   IFS=$'\x1f' read -r -d $'\x1e' title notes links st < <(db_rows "

@@ -1,11 +1,13 @@
 #!/usr/bin/env zsh
 # wts-hook — Claude Code hooks: what the agent reports about itself, recorded
 #
-# Installed by `wts setup claude --install` on four events, one verb each:
+# Installed by `wts setup claude --install` on five events, one verb each:
 #   UserPromptSubmit -> wts-hook prompt         a turn starts
 #   Stop             -> wts-hook stop           the turn is over
 #   Notification     -> wts-hook notification   waiting for a permission or an answer
 #   SessionEnd       -> wts-hook end            the agent is gone
+#   PostToolUse      -> wts-hook touch          a file was edited (Edit, Write,
+#                                               MultiEdit, NotebookEdit)
 #
 # Each one inserts a row into `agent_events`, keyed by the wts session found
 # from the pane ($TMUX_PANE) or the working directory. That is what makes the
@@ -16,9 +18,23 @@
 #
 # Outside a wts session it exits 0 without a word: the hook is user-wide.
 #
-# It never prints on stdout. Claude Code adds a UserPromptSubmit hook's stdout
-# to the conversation, and a non-zero exit from a Stop hook is read as "block
-# the turn and hand stderr to the model" — so every path here exits 0.
+# It prints on stdout in two places only, both on purpose, both through fd 3
+# (stdout itself goes to /dev/null right after the payload is read):
+#   prompt  the notes the same repository's other agents left since this one's
+#           last turn, one line each, five at most, nothing when there are
+#           none. Claude Code adds a UserPromptSubmit hook's stdout to the
+#           conversation, which is exactly the point: a note written an hour
+#           after SessionStart otherwise reached nobody who did not poll.
+#   touch   the first time this agent edits a file another session of the
+#           repository has edited too, PostToolUse's additionalContext JSON
+#           naming that session. Silence otherwise.
+# Nothing else may ever reach stdout, and every path exits 0: a non-zero exit
+# from a Stop hook is read as "block the turn and hand stderr to the model".
+# WTS_CONTEXT_QUIET=1 silences both, like the SessionStart hook.
+#
+# Every event also records $TMUX_PANE in agent_panes: the hook runs in the
+# agent's own environment, so this is the one exact answer to "which pane is
+# the agent", which `wts send` and the switcher's reply type into.
 #
 # Attention: a `notification` (permission, question) and a `stop` also ring the
 # pane's bell — tmux flags the window — and post a desktop banner, unless the
@@ -26,7 +42,7 @@
 # window active). WTS_NOTIFY=0 turns both off, `bell` or `banner` keeps one.
 # The banner names the wts session, which is what a generic notifier cannot do.
 #
-# Usage: wts-hook prompt|stop|notification|end   (payload as JSON on stdin)
+# Usage: wts-hook prompt|stop|notification|end|touch   (payload as JSON on stdin)
 
 set -uo pipefail
 zmodload zsh/datetime 2>/dev/null
@@ -35,7 +51,7 @@ source "${0:A:h}/wts-db.zsh"
 
 EVENT="${1:-}"
 case "$EVENT" in
-  prompt|stop|notification|end) ;;
+  prompt|stop|notification|end|touch) ;;
   *) exit 0 ;;
 esac
 
@@ -43,19 +59,22 @@ esac
 payload=""
 [[ -t 0 ]] || payload=$(cat 2>/dev/null)
 
-# From here on nothing may reach stdout (see the header).
-exec >/dev/null
+# From here on nothing may reach stdout (see the header); fd 3 is the channel
+# to the conversation, for the two messages that are its purpose.
+exec 3>&1 >/dev/null
 
 db_available || exit 0
 [[ -s "$WTS_DB" ]] || exit 0
 
-sid="" kind="" msg="" cwd=""
+sid="" kind="" msg="" cwd="" file=""
 if [[ -n "$payload" ]] && command -v jq >/dev/null 2>&1; then
-  IFS=$'\x1f' read -r sid kind msg cwd < <(print -r -- "$payload" | jq -r '
+  IFS=$'\x1f' read -r sid kind msg cwd file < <(print -r -- "$payload" | jq -r '
     [ (.session_id // ""),
       (.notification_type // .reason // .source // ""),
       ((.message // "") | gsub("[\\t\\n\\r\u001f\u001e]"; " ")),
-      (.cwd // "") ] | join("\u001f")' 2>/dev/null)
+      (.cwd // ""),
+      ((.tool_input.file_path // .tool_input.notebook_path // "") | gsub("[\\t\\n\\r\u001f\u001e]"; " "))
+    ] | join("\u001f")' 2>/dev/null)
 fi
 # Claude Code runs a hook from the project directory, which is the worktree
 # (or its WTS_SUBDIR); the payload's cwd is the same thing, and wins when the
@@ -67,10 +86,108 @@ me=$(db_current_session) || exit 0
 [[ -n "$me" ]] || exit 0
 
 now=${EPOCHSECONDS:-$(date +%s)}
+quiet=false
+[[ -n "${WTS_CONTEXT_QUIET:-}" ]] && quiet=true
+
+# The agent's pane, from its own environment (see the header).
+if [[ -n "${TMUX_PANE:-}" ]]; then
+  db_q "INSERT INTO agent_panes (session, claude_session, pane, at)
+        VALUES ($(sql_str "$me"), $(sql_str "$sid"), $(sql_str "$TMUX_PANE"), $now)
+        ON CONFLICT(session) DO UPDATE SET
+          claude_session = CASE WHEN excluded.claude_session = '' THEN agent_panes.claude_session
+                                ELSE excluded.claude_session END,
+          pane = excluded.pane, at = excluded.at" >/dev/null 2>&1
+fi
+
+cut120() {
+  local v="${1//[[:cntrl:]]/ }"
+  (( ${#v} > 120 )) && v="${v[1,119]}…"
+  print -r -- "$v"
+}
+
+# ─── touch: a file edited ────────────────────────────────────────────────────
+# Not an agent_events row: an agent edits dozens of files a turn, and the
+# events are about its state. One touches row per (session, path), the first
+# time — and only then is the overlap looked for, so the warning comes once
+# per file and sibling rather than at every edit.
+if [[ "$EVENT" == touch ]]; then
+  [[ -n "$file" ]] || exit 0
+  wt=$(db_session_field "$me" worktree)
+  [[ -n "$wt" ]] || exit 0
+  [[ "$file" == /* ]] || file="$PWD/$file"
+  rel=""
+  for root in "$wt" "${wt:A}"; do
+    for f in "$file" "${file:A}"; do
+      if [[ "$f" == "$root"/* ]]; then rel="${f#$root/}"; break 2; fi
+    done
+  done
+  [[ -n "$rel" ]] || exit 0   # outside the worktree: not this repository's file
+  added=$(db_q "INSERT OR IGNORE INTO touches (session, path, at)
+                VALUES ($(sql_str "$me"), $(sql_str "$rel"), $now);
+                SELECT changes();" 2>/dev/null)
+  [[ "$added" == 1 ]] || exit 0
+  $quiet && exit 0
+  typeset -a sibs
+  sibs=("${(@f)$(db_repo_siblings "$me")}")
+  sibs=("${(@)sibs:#}")
+  (( ${#sibs} )) || exit 0
+  typeset -a who
+  who=()
+  out=$(db_rows "SELECT t.session, s.branch, CAST(($now - t.at) / 60 AS INTEGER)
+                 FROM touches t JOIN sessions s ON s.name = t.session
+                 WHERE t.path = $(sql_str "$rel") AND t.session IN $(sql_list "${sibs[@]}")
+                 ORDER BY t.at" 2>/dev/null)
+  for row in "${(@ps:\x1e:)out}"; do
+    f3=("${(@ps:\x1f:)row}")
+    [[ -n "${f3[1]:-}" ]] || continue
+    who+=("\`${f3[1]}\` (branch ${f3[2]}, first edited it ${f3[3]} min ago)")
+  done
+  (( ${#who} )) || exit 0
+  text="wts: $rel is also being changed by session ${(j:, :)who}. Read their notes (wts db notes --all) before going further, and leave one if your change affects them (wts db set <key> \"<one line>\")."
+  jq -cn --arg t "$text" \
+    '{hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext: $t}}' >&3 2>/dev/null
+  exit 0
+fi
+
+# The previous turn's start, read before this one is recorded: what "since
+# your last turn" means for the note line below.
+prev=""
+if [[ "$EVENT" == prompt ]]; then
+  prev=$(db_ro "SELECT max(at) FROM agent_events
+                WHERE session = $(sql_str "$me") AND event = 'prompt'" 2>/dev/null)
+fi
+
 db_q "INSERT INTO agent_events (session, claude_session, event, kind, message, at)
       VALUES ($(sql_str "$me"), $(sql_str "$sid"), $(sql_str "$EVENT"),
               $(sql_str "$kind"), $(sql_str "${msg[1,400]}"), $now);
       DELETE FROM agent_events WHERE at < $now - 7 * 86400;" >/dev/null 2>&1 || exit 0
+
+# ─── prompt: the notes left since the last turn ──────────────────────────────
+# Same repository only, newest first, five at most; nothing at all when there
+# is nothing new — and nothing on the first turn, which SessionStart covered.
+if [[ "$EVENT" == prompt && "$prev" == <-> ]] && ! $quiet; then
+  fresh=$(db_rows "SELECT session, key, value FROM notes
+                   WHERE session != $(sql_str "$me")
+                     AND updated_at > strftime('%Y-%m-%dT%H:%M:%SZ', $prev, 'unixepoch')
+                   ORDER BY updated_at DESC LIMIT 50" 2>/dev/null)
+  if [[ -n "$fresh" ]]; then
+    typeset -a sibs lines
+    sibs=("${(@f)$(db_repo_siblings "$me")}")
+    sibs=("${(@)sibs:#}")
+    lines=()
+    for row in "${(@ps:\x1e:)fresh}"; do
+      f3=("${(@ps:\x1f:)row}")
+      [[ -n "${f3[1]:-}" ]] || continue
+      (( ${sibs[(Ie)${f3[1]}]} )) || continue
+      lines+=("- ${f3[1]}/${f3[2]}: $(cut120 "${f3[3]:-}")")
+    done
+    if (( ${#lines} )); then
+      print -u3 -r -- "wts: new notes from the other sessions on this repository since your last turn:"
+      print -u3 -rl -- "${(@)lines[1,5]}"
+      (( ${#lines} > 5 )) && print -u3 -r -- "- (… $(( ${#lines} - 5 )) more: wts db notes --all)"
+    fi
+  fi
+fi
 
 # ─── Attention ───────────────────────────────────────────────────────────────
 

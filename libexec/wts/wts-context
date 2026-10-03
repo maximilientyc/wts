@@ -53,11 +53,13 @@ cut80() {
 }
 
 IFS=$'\x1f' read -r -d $'\x1e' my_branch my_worktree my_repo my_task my_task_notes my_task_links my_task_id \
+    my_linked_at my_linked_late \
   < <(db_rows "SELECT s.branch, s.worktree, s.repo_root,
                       coalesce(t.title, ''), coalesce(t.notes, ''),
                       coalesce((SELECT group_concat(json_extract(value, '\$.url'), ' ')
                                 FROM json_each(t.links) WHERE json_valid(t.links)), ''),
-                      coalesce(l.task, '')
+                      coalesce(l.task, ''), substr(coalesce(l.linked_at, ''), 1, 10),
+                      coalesce(unixepoch(l.linked_at) - unixepoch(s.created_at) > 300, 0)
                FROM sessions s
                LEFT JOIN task_links l ON l.session = s.name
                LEFT JOIN tasks t ON t.id = l.task
@@ -139,6 +141,14 @@ if [[ -n "${my_task:-}" ]]; then
   # `$wts`, not `wts`: the agent's Bash tool may not have it on its PATH.
   print -r -- "Other sessions may serve the same task: \`$wts task show ${my_task_id:-<id>}\` lists them."
   print -r -- "Add to it as you learn: \`$wts task note \"<what you found>\"\` — it outlives this session."
+  # How the link was made, so a link the work has outgrown can be recognized:
+  # a session keeps the task it was created for while the user moves it on to
+  # the next piece of work, and the roadmap that asked for this line was
+  # written by a session still introduced as the previous item's.
+  if [[ -n "${my_linked_at:-}" ]]; then
+    if [[ "${my_linked_late:-0}" == 1 ]]; then how="linked on $my_linked_at"; else how="linked at its creation, $my_linked_at"; fi
+    print -r -- "This session was $how. If the work has moved on to something else: \`$wts task link <id>\`, or \`$wts task new \"<title>\"\` then link it."
+  fi
   print -r -- ""
 fi
 # Same repository only: those are the sessions whose work can collide with
@@ -218,19 +228,37 @@ if (( ${#notes} )); then
   print -rl -- "${notes[@]}"
 fi
 
+# The files this session has already edited and a sibling has too — the exact
+# overlap, from the PostToolUse hook. Only after /clear, /compact or a resume
+# can there be any; at a first start this prints nothing.
+typeset -a overlap
+overlap=()
+while IFS=$'\x1f' read -r -d $'\x1e' opath osess; do
+  [[ -n "$opath" ]] || continue
+  overlap+=("- $opath (also: $osess)")
+done < <(db_rows "SELECT mine.path, group_concat(theirs.session, ', ')
+                  FROM touches mine JOIN touches theirs
+                    ON theirs.path = mine.path AND theirs.session != mine.session
+                  WHERE mine.session = $(sql_str "$me")
+                    AND theirs.session IN $(sql_list "${sibling_names[@]}")
+                  GROUP BY mine.path ORDER BY max(theirs.at) DESC LIMIT 6" 2>/dev/null)
+if (( ${#overlap} )); then
+  print -r -- ""
+  print -r -- "Files you and another session have both edited:"
+  print -rl -- "${(@)overlap[1,5]}"
+  (( ${#overlap} > 5 )) && print -r -- "- (… more: $wts db sql \"select * from touches\")"
+fi
+
+# The rest is in the skill (`wts setup claude --install` installs it): this
+# block is re-injected at every start, /clear and /compact, and a reference
+# loaded when needed costs nothing until then. When a file you edit is also
+# edited in one of these sessions, the PostToolUse hook says so at that moment.
 cat <<EOF
 
-Query it when your work may overlap theirs (same files, same API, a shared
-migration), or when the user asks what the others are doing:
-  $wts db notes --all        # every note the agents left
-  $wts status --json         # live agent states (working, blocked, idle...)
-  $wts db sql "<SELECT ...>" # anything else; $wts db schema lists the tables
-
-Before you change a file, a migration, a schema or an API that one of the
-sessions above may also touch, read their notes. After a change another session
-depends on (a migration, a shared model, an API contract), leave one line, keyed
-by your session:
-  $wts db set <key> "<one line>"     # also: $wts db get <key>, $wts db del <key>
-Only then: a note nobody needs is one more line every other agent reads.
+If you edit a file one of them also edits, wts tells you then. When your change
+affects them (a migration, a shared model, an API contract), leave one line:
+  $wts db set <key> "<one line>"
+Everything else — their notes, live states, sending to or waiting for another
+agent — is in the wts skill (or: $wts help).
 EOF
 exit 0

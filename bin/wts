@@ -5,24 +5,30 @@
 #        wts <name> "<phrase>" [layout] [context...]
 #        wts "<phrase>" [layout] [context...]
 #        wts new [-p layout] <name|"phrase"...>
-#        wts doc add <url|path> | ls | show | sync | forget | use <slug> [session] | tools
+#        wts doc add <url|path> | ls [--json] | show [--json] | sync | forget
+#        wts doc use <slug> [session] | tools
 #        wts ls | wts status [--json|--table|--fzf]
-#        wts brief [name...]
+#        wts brief [name...] | brief --cached [--json] [name...]
+#        wts send <session> <text...>
+#        wts wait <session>... [--until <state>,...] [--timeout <s>] [--json]
+#        wts tail <session> [-n <k>] [--json]
 #        wts restore [name...]
 #        wts stop <name>
 #        wts pr [name]
 #        wts rm <name> [-f]
 #        wts gc [--all] [--all-branches] [--apply] [--no-fetch] [--no-retro]
+#        wts gc [--all] [--all-branches] [--no-fetch] --json
 #        wts log [--since <when>] [--until <when>] [--task <id>] [--brief]
 #                [--no-notes] [--no-things]
 #        wts retro [name...] [--force] [--jobs <n>]
-#        wts task ls [--all] | show <id> | link [<id>] [session] | unlink [session]
+#        wts task ls [--all] [--json] | show <id> [--json]
+#        wts task link [<id>] [session] | unlink [session]
 #        wts task new "<title>" | add [<id>] | edit [<id>] | done [<id>]
 #        wts task note [<id>] "<text>" | note [<id>] --clear
 #        wts task doc [<id>] [<doc>] | doc [<id>] --rm <slug>
 #        wts layouts
 #        wts keys
-#        wts doctor
+#        wts doctor [--json]
 #        wts setup tmux [--install] | git | claude [--install]
 #        wts db path | schema | sql "<SELECT>" | notes [--all] | get | set | del
 #        wts help | wts version | wts <command> --help
@@ -38,11 +44,22 @@
 #   --task <t> : the session serves this task (`wts task ls`): its notes and
 #                documents become the agent's context; bare --task at the end
 #                picks one. Both options work with `new` too
+#   --detach   : start the session without attaching to it; implied when stdin
+#                is not a terminal (an agent's shell, a script)
+#   --json     : detached, progress on stderr, and the session on stdout as
+#                JSON: name, branch, worktree, task (an array for `new`)
 #
 #   new        : create several sessions at once, then attach to the first
 #   ls         : list registered sessions and their state (agent, git delta)
 #   status     : same collection, as JSON (--json), table (--table) or fzf lines (--fzf)
-#   brief      : where each session stands, "done / next", summarized by Claude
+#   brief      : where each session stands, "done / next", summarized by Claude;
+#                --cached: the last summaries, from the database, no model call
+#   send       : type a line into a session's agent and submit it (the agent's
+#                own pane; refused when it is not known)
+#   wait       : return once each session's agent is in one of the states
+#                (default: no longer working), or after --timeout (90 s); exit 1
+#                on timeout
+#   tail       : the agent's last messages, from its transcript
 #   restore    : restart registered sessions missing from tmux (after a reboot)
 #                and pre-fill `claude --continue`
 #   stop       : kill the tmux session only; the worktree, the branch and the
@@ -71,13 +88,14 @@
 #   layouts    : list available layouts (yours shadow the built-in ones)
 #   keys       : switcher keys and tmux bindings (the popup shows them too)
 #   doctor     : check what wts needs (tmux, tmuxinator, fzf, claude, ...) and
-#                that the tmux snippet and the Claude hooks are installed and
-#                current
+#                that the tmux snippet, the Claude hooks and the skill are
+#                installed and current
 #   setup tmux : print the tmux.conf snippet (switcher popup, `wts` command);
 #                --install writes it into ~/.tmux.conf, replacing an older one
 #   setup git  : print the two git settings that keep `wts ls` fast on a large repository
-#   setup claude : print (--install: add) the Claude Code hook that tells every
-#                agent in a wts session about the others and about `wts db`
+#   setup claude : print (--install: add) the Claude Code hooks that tell every
+#                agent in a wts session about the others, the permissions for
+#                the read-only verbs, and (--install) the wts skill
 #   db         : the state database (SQLite): read anything, and notes the
 #                agents leave for each other (`wts db help`)
 #
@@ -176,6 +194,8 @@ registry_del() {
         DELETE FROM notes WHERE session IN $in;
         DELETE FROM task_links WHERE session IN $in;
         DELETE FROM agent_events WHERE session IN $in;
+        DELETE FROM agent_panes WHERE session IN $in;
+        DELETE FROM touches WHERE session IN $in;
         COMMIT;" >/dev/null 2>&1 || true
 }
 
@@ -326,7 +346,7 @@ registry_resolve_name() {
     0) print -r -- "$want" ;;
     1) print -u2 "→ '$want' not found, single match: '${cands[1]}'"
        print -r -- "${cands[1]}" ;;
-    *) if [[ -t 0 ]] && command -v fzf >/dev/null 2>&1; then
+    *) if [[ -t 0 && -t 2 ]] && command -v fzf >/dev/null 2>&1; then
          local pick
          pick=$(print -rl -- "${cands[@]}" | fzf --reverse --height=40% \
                   --prompt="'$want' ? " --header="several matches") || return 1
@@ -415,8 +435,11 @@ usage() {
 start_detached() {
   local err rc=0
   # `|| rc=$?` and not `if …; then`: after the `if`, $? is the if's own status.
+  # `3>&-`: under --json, fd 3 is the caller's capture of this command, and a
+  # tmux server started here would inherit it and hold `$(wts … --json)` open
+  # for as long as it runs.
   err=$(tmuxinator start --project-config "$1" --name "$2" --no-attach \
-          --suppress-tmux-version-warning </dev/null 2>&1) || rc=$?
+          --suppress-tmux-version-warning </dev/null 2>&1 3>&-) || rc=$?
   (( rc )) || return 0
   # A tmuxinator that cannot run at all says nothing: a version manager's shim
   # whose Ruby is not found exits 126 in silence. The status is then the reason.
@@ -449,8 +472,11 @@ first_line() {
 # --task rides in the same pass, and not in a second one: this is already "the
 # pass that removes options", it already implements the bare-flag-at-the-end
 # convention, and two scans would only double the chance of the two disagreeing.
+#
+# --detach and --json ride here too, for the same reason: they are options of a
+# creation, and the creation's own parsing is positional.
 typeset -ga DOC_REQ DOC_REST
-typeset -g TASK_REQ TASK_ASKED
+typeset -g TASK_REQ TASK_ASKED DETACH JSON_OUT
 strip_doc_args() {
   DOC_REQ=(${(@ps:\x1f:)${WTS_DOC_ARGS:-}})
   DOC_REQ=("${(@)DOC_REQ:#}")
@@ -458,8 +484,13 @@ strip_doc_args() {
   TASK_REQ="${WTS_TASK_ARG:-}"
   TASK_ASKED=false
   [[ -n "$TASK_REQ" ]] && TASK_ASKED=true
+  DETACH=false
+  JSON_OUT=false
+  [[ -n "${WTS_NO_ATTACH:-}" ]] && DETACH=true
   while (( $# )); do
     case "$1" in
+      --detach) DETACH=true ;;
+      --json)   JSON_OUT=true ;;
       --doc=*)  DOC_REQ+=("${1#--doc=}") ;;
       --doc)    if (( $# == 1 )); then
                   DOC_REQ+=("")
@@ -495,7 +526,7 @@ fi
 # nineteen words a session cannot be called, and one list to read them from.
 typeset -ga WTS_COMMANDS
 WTS_COMMANDS=(new ls status brief restore stop pr rm gc log retro task doc db
-              layouts keys doctor setup help version)
+              send wait tail layouts keys doctor setup help version)
 
 # sub_usage <command> — its own lines of the header above: the usage lines that
 # name it, then its paragraph. Cut from the same text `wts help` prints, so the
@@ -579,6 +610,19 @@ if [[ "$1" == "keys" ]]; then
   exec "$WTS_LIBEXEC/wts-keys"
 fi
 
+# ─── Subcommands: send, wait, tail ───────────────────────────────────────────
+# Another session's agent, driven from a command: what the switcher does with
+# keys, for an agent that delegated. In libexec/wts/wts-agent.
+
+if [[ "$1" == (send|wait|tail) ]]; then
+  if [[ ! -x "$WTS_LIBEXEC/wts-agent" ]]; then
+    print -u2 -r -- "wts: $WTS_LIBEXEC/wts-agent not found"
+    exit 1
+  fi
+  registry_init
+  exec "$WTS_LIBEXEC/wts-agent" "$@"
+fi
+
 # ─── Subcommand: doctor ──────────────────────────────────────────────────────
 
 if [[ "$1" == "doctor" ]]; then
@@ -586,7 +630,11 @@ if [[ "$1" == "doctor" ]]; then
     print -u2 -r -- "wts: $WTS_LIBEXEC/wts-doctor not found"
     exit 1
   fi
-  exec "$WTS_LIBEXEC/wts-doctor" "$WTS_VERSION"
+  if [[ -n "${2:-}" && "${2:-}" != --json ]]; then
+    echo "usage: wts doctor [--json]" >&2
+    exit 2
+  fi
+  exec "$WTS_LIBEXEC/wts-doctor" "$WTS_VERSION" "${2:-}"
 fi
 
 # ─── Subcommand: setup ───────────────────────────────────────────────────────
@@ -600,32 +648,44 @@ if [[ "$1" == "setup" ]]; then
     libexec="${match[1]}/opt/wts/${match[2]}"
   fi
 
-  # `wts setup claude`: the SessionStart hook that tells every Claude Code
-  # session started in a wts session about the others and about `wts db`.
-  # Without it an agent never learns the shared database exists: nothing in
-  # its context mentions it. User-wide on purpose — the hook is silent outside
-  # a wts session, and a per-repository hook would miss every new repository.
+  # `wts setup claude`: the hooks that tell every Claude Code session started
+  # in a wts session about the others, record what it reports about itself and
+  # the files it edits, the permissions for the read-only verbs, and the skill
+  # that documents the rest. Without them an agent never learns the shared
+  # database exists: nothing in its context mentions it. User-wide on purpose —
+  # the hooks are silent outside a wts session, a per-repository hook would miss
+  # every new repository, and the skill is what lets a Claude started anywhere
+  # find wts when the user asks about parallel work.
   if [[ "${2:-}" == "claude" ]]; then
     claude_settings="${CLAUDE_DIR}/settings.json"
     hook_cmd="$libexec/wts-context"
     event_cmd="$libexec/wts-hook"
+    skill_dir="${CLAUDE_DIR}/skills/wts"
+    skill_src="$WTS_PREFIX/share/wts/skill/SKILL.md"
+    # The command the skill names when `wts` is not on the agent's PATH: the
+    # same stable (opt/) prefix as the hooks.
+    wts_cmd="${libexec:h:h}/bin/wts"
+    allow_json=$(print -rl -- "${WTS_CLAUDE_ALLOW[@]}" | jq -Rsc 'split("\n") | map(select(. != ""))' 2>/dev/null)
     if [[ "${3:-}" != "--install" ]]; then
       cat <<EOF
 // ─── wts setup claude (wts $WTS_VERSION) ─────────────────────────────────────
-// Five Claude Code hooks. SessionStart (wts-context): in a wts session it adds
-// to the agent's context its session, the other sessions and their last
-// brief, the latest notes the agents left, and how to use \`wts db\`. The four
-// others (wts-hook) record what the agent reports about itself — a turn
-// starts, ends, waits for a permission or an answer, the agent quits — which
-// is what dates the states in \`wts ls\` and the switcher, feeds the status
-// line, and rings the pane's bell and posts a banner when an agent needs you
-// (WTS_NOTIFY=0 to turn that off). Anywhere outside a wts session every hook
-// is silent. They read and write the wts database only: no git, no model.
+// Six Claude Code hooks. SessionStart (wts-context): in a wts session it adds
+// to the agent's context its session, its task, the same repository's other
+// sessions and their notes, and the files both have edited. The others
+// (wts-hook) record what the agent reports about itself — a turn starts, ends,
+// waits for a permission or an answer, the agent quits — which dates the states
+// in \`wts ls\` and the switcher and rings when an agent needs you
+// (WTS_NOTIFY=0 to turn that off); at a turn's start they hand the agent the
+// notes its siblings left since its last turn; after an edit (PostToolUse)
+// they record the file and say when another session edits it too. Anywhere
+// outside a wts session every hook is silent. They read and write the wts
+// database only: no git, no model.
 //
-// The permissions let an agent run what the hook asks of it without a prompt:
-// the shared notes (\`wts db\`, read anything, write its own notes only), its
-// task's notes, and the live agent states. Without them the first thing every
-// agent did was wait, blocked, for you to allow \`wts db notes --all\`.
+// The permissions let an agent run the read-only verbs, and write its own
+// notes, without a prompt. Never rm, gc, stop, send or a creation.
+//
+// --install also writes the wts skill to $skill_dir/SKILL.md:
+// the reference an agent loads when it needs it, inside a session or not.
 //
 // Merge into $claude_settings, or let wts do it (backup kept):
 //   wts setup claude --install
@@ -645,10 +705,14 @@ if [[ "$1" == "setup" ]]; then
     ],
     "SessionEnd": [
       { "hooks": [ { "type": "command", "command": "$event_cmd end", "timeout": 10 } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [ { "type": "command", "command": "$event_cmd touch", "timeout": 10 } ] }
     ]
   },
   "permissions": {
-    "allow": [ "Bash(wts db:*)", "Bash(wts task note:*)", "Bash(wts task show:*)", "Bash(wts status:*)" ]
+    "allow": $allow_json
   }
 }
 EOF
@@ -661,32 +725,43 @@ EOF
     # Idempotent: on each event, any earlier wts entry (an older install path
     # included) is dropped before the current one is added; other hooks stay.
     # The allow rules are appended once each, in the user's own order.
-    if jq --arg cmd "$hook_cmd" --arg ev "$event_cmd" '
+    if jq --arg cmd "$hook_cmd" --arg ev "$event_cmd" --argjson allow "$allow_json" '
          def wts_free(e): [ (.hooks[e] // [])[]
            | .hooks = [ (.hooks // [])[]
                         | select((.command // "") | test("/wts-(context|hook)( |$)") | not) ]
            | select((.hooks | length) > 0) ];
          def add(e; c; t): .hooks[e] = (wts_free(e) + [ { hooks: [ { type: "command", command: c, timeout: t } ] } ]);
+         def addm(e; m; c; t): .hooks[e] = (wts_free(e) + [ { matcher: m, hooks: [ { type: "command", command: c, timeout: t } ] } ]);
          add("SessionStart"; $cmd; 5)
          | add("UserPromptSubmit"; $ev + " prompt"; 10)
          | add("Stop"; $ev + " stop"; 10)
          | add("Notification"; $ev + " notification"; 10)
          | add("SessionEnd"; $ev + " end"; 10)
+         | addm("PostToolUse"; "Edit|Write|MultiEdit|NotebookEdit"; $ev + " touch"; 10)
          | (.permissions.allow // []) as $cur
-         | .permissions.allow = $cur + (
-             ["Bash(wts db:*)", "Bash(wts task note:*)", "Bash(wts task show:*)", "Bash(wts status:*)"]
-             | map(select(. as $r | $cur | index($r) | not)))' \
+         | .permissions.allow = $cur + ($allow | map(select(. as $r | $cur | index($r) | not)))' \
          "$claude_settings.bak" > "$claude_settings.tmp.$$"; then
       mv "$claude_settings.tmp.$$" "$claude_settings"
       echo "→ hooks installed in $claude_settings (backup: settings.json.bak):"
-      echo "   SessionStart (wts-context), UserPromptSubmit, Stop, Notification, SessionEnd (wts-hook)"
-      echo "   permissions.allow: wts db, wts task note, wts task show, wts status (no prompt for what the hook asks)"
-      echo "   new Claude sessions pick it up; running ones on their next /clear or /compact"
+      echo "   SessionStart (wts-context), UserPromptSubmit, Stop, Notification, SessionEnd, PostToolUse (wts-hook)"
+      echo "   permissions.allow: the read-only wts verbs and the agent's own notes (no prompt for them)"
     else
       rm -f "$claude_settings.tmp.$$"
       echo "wts: $claude_settings is not valid JSON, left untouched" >&2
       exit 1
     fi
+    # The skill: ours to overwrite (it says so in its first lines), never a
+    # file of the same name the user wrote.
+    if [[ -f "$skill_src" ]]; then
+      if [[ -f "$skill_dir/SKILL.md" ]] && ! grep -q 'generated by `wts setup claude' "$skill_dir/SKILL.md"; then
+        echo "⚠ $skill_dir/SKILL.md is not wts's own: left as it is" >&2
+      else
+        mkdir -p "$skill_dir"
+        sed -e "s|{{WTS}}|$wts_cmd|g" -e "s|{{VERSION}}|$WTS_VERSION|g" "$skill_src" > "$skill_dir/SKILL.md"
+        echo "   skill: $skill_dir/SKILL.md (what an agent loads when it needs wts)"
+      fi
+    fi
+    echo "   new Claude sessions pick it up; running ones on their next /clear or /compact"
     exit 0
   fi
 
@@ -863,6 +938,51 @@ if [[ "$1" == "brief" ]]; then
   registry_init
   registry_prune
   shift
+
+  # --cached [--json]: what the last `wts brief` wrote, from the database alone —
+  # no git, no transcript, no model call. For an agent that wants to know where
+  # its siblings stand without spending a summary per session on it, and for
+  # anything that must not wait. `age_s` says how old each one is; a brief is
+  # not re-validated here, which is the whole point of the flag.
+  typeset -a brief_names
+  brief_cached=false brief_json=false brief_names=()
+  for n in "$@"; do
+    case "$n" in
+      --cached) brief_cached=true ;;
+      --json)   brief_json=true ;;
+      *)        brief_names+=("$n") ;;
+    esac
+  done
+  if $brief_json && ! $brief_cached; then
+    echo "wts brief: --json goes with --cached (a fresh brief calls the model; run wts brief first)" >&2
+    exit 2
+  fi
+  if $brief_cached; then
+    brief_where="1"
+    (( ${#brief_names} )) && brief_where="s.name IN $(sql_list "${brief_names[@]}")"
+    brief_sql="FROM sessions s LEFT JOIN briefs b ON b.session = s.name
+               WHERE $brief_where ORDER BY s.name"
+    if $brief_json; then
+      db_ro "SELECT json_object('version', 1, 'briefs', coalesce(json_group_array(json_object(
+               'session', s.name, 'body', b.body,
+               'age_s', CASE WHEN b.updated_at IS NULL THEN NULL
+                             ELSE CAST(strftime('%s', 'now') AS INTEGER) - b.updated_at END)), json('[]')))
+             $brief_sql"
+    else
+      while IFS=$'\x1f' read -r -d $'\x1e' bname bbody bage; do
+        [[ -n "$bname" ]] || continue
+        if [[ -z "$bbody" ]]; then
+          print -r -- "$bname  (no brief yet: wts brief $bname)"
+        else
+          print -r -- "$bname  ($(( bage / 60 ))m ago)"
+          print -r -- "$bbody" | sed 's/^/  /'
+        fi
+      done < <(db_rows "SELECT s.name, coalesce(b.body, ''),
+                               coalesce(CAST(strftime('%s', 'now') AS INTEGER) - b.updated_at, 0)
+                        $brief_sql")
+    fi
+    exit 0
+  fi
 
   if [[ ! -x "$WTS_LIBEXEC/wts-brief" ]]; then
     echo "wts: $WTS_LIBEXEC/wts-brief not found" >&2
@@ -1578,6 +1698,34 @@ if [[ "$1" == "db" ]]; then
   exit 0
 fi
 
+# session_json <name> <true|false: started by this call> — what a program needs
+# after a creation, from the registry row it just wrote. A proposed name is only
+# known once wts has made it unique, so an agent cannot guess it from the phrase.
+session_json() {
+  db_ro "SELECT json_object('version', 1, 'name', name, 'branch', branch,
+           'worktree', worktree, 'repo_root', repo_root, 'layout', profile,
+           'prompt', prompt, 'docs', json(docs),
+           'task', coalesce((SELECT task FROM task_links WHERE session = name), ''),
+           'started', json($(sql_str "$2")))
+         FROM sessions WHERE name = $(sql_str "$1")" 2>/dev/null
+}
+
+# Created detached, never attached: --detach, or no terminal on stdin. The
+# normal flow ends with `switch-client` under $TMUX, and run from an agent's
+# pane that moved the human's terminal to the new session. Without a terminal
+# there is nobody to attach anyway. --json implies it: whoever reads JSON is a
+# program. Its progress lines then go to stderr, the JSON alone to stdout.
+detach_mode() {
+  if $JSON_OUT; then
+    DETACH=true
+    exec 3>&1 1>&2
+  fi
+  if [[ ! -t 0 ]]; then
+    DETACH=true
+  fi
+  return 0
+}
+
 # ─── Subcommand: new ─────────────────────────────────────────────────────────
 # Batch creation. Why: `wts a & wts b & wts c` does NOT work, because the
 # normal flow ends with `exec tmuxinator start`: the first call replaces the
@@ -1588,6 +1736,7 @@ if [[ "$1" == "new" ]]; then
   shift
   strip_doc_args "$@"
   set -- "${DOC_REST[@]}"
+  detach_mode
   # A bare --doc is resolved once here: left to the children, the picker would
   # open once per session of the batch.
   if (( ${#DOC_REQ} )) && [[ -x "$WTS_LIBEXEC/wts-doc" ]]; then
@@ -1619,8 +1768,11 @@ if [[ "$1" == "new" ]]; then
     exit 1
   fi
 
-  typeset -a started failed
-  started=(); failed=()
+  typeset -a started failed created_json json_opt
+  started=(); failed=(); created_json=(); json_opt=()
+  if $JSON_OUT; then
+    json_opt=(--json)
+  fi
 
   # Each session's final name comes back through a file: with a phrase, it is
   # only known once the child has proposed it (and made it unique). No
@@ -1637,13 +1789,32 @@ if [[ "$1" == "new" ]]; then
     # WTS_TASK_ARG as well as the documents: strip_doc_args has always read it,
     # but nothing ever set it, so `wts new --task <id> a b` parsed the flag and
     # then created three sessions linked to nothing.
-    if WTS_NO_ATTACH=1 WTS_SESSION_OUT="$session_out" \
-       WTS_DOC_ARGS="${(pj:\x1f:)DOC_REQ}" WTS_TASK_ARG="${TASK_REQ:-}" \
-       "$WTS_SELF" "$n" "$NEW_PROFILE"; then
+    # The child's stdout is captured only under --json, where it is the JSON
+    # and nothing else; otherwise it is this command's progress, as it was.
+    child_out=""
+    if $JSON_OUT; then
+      if child_out=$(WTS_NO_ATTACH=1 WTS_SESSION_OUT="$session_out" \
+           WTS_DOC_ARGS="${(pj:\x1f:)DOC_REQ}" WTS_TASK_ARG="${TASK_REQ:-}" \
+           "$WTS_SELF" "$n" "$NEW_PROFILE" --json); then
+        child_ok=true
+      else
+        child_ok=false
+      fi
+    elif WTS_NO_ATTACH=1 WTS_SESSION_OUT="$session_out" \
+         WTS_DOC_ARGS="${(pj:\x1f:)DOC_REQ}" WTS_TASK_ARG="${TASK_REQ:-}" \
+         "$WTS_SELF" "$n" "$NEW_PROFILE"; then
+      child_ok=true
+    else
+      child_ok=false
+    fi
+    if $child_ok; then
       if [[ -s "$session_out" ]]; then
         started+=("$(<"$session_out")")
       else
         started+=("${n//\//-}")
+      fi
+      if [[ -n "$child_out" ]]; then
+        created_json+=("$child_out")
       fi
     else
       failed+=("$n")
@@ -1653,6 +1824,15 @@ if [[ "$1" == "new" ]]; then
 
   echo "→ ${#started} session(s) started$( (( ${#failed} )) && echo ", ${#failed} failed: ${(j:, :)failed}")"
 
+  if $JSON_OUT; then
+    print -r -- "${(F)created_json}" | jq -sc '.' >&3
+  fi
+  if $DETACH; then
+    if (( ${#failed} )); then
+      exit 1
+    fi
+    exit 0
+  fi
   if (( ${#started} )); then
     echo "   attaching: ${started[1]}"
     attach_or_switch "${started[1]}"
@@ -1668,6 +1848,7 @@ if (( $# < 1 )); then
   echo "wts: nothing to create (see: wts help)" >&2
   exit 2
 fi
+detach_mode
 # `wts auth-form --help` asked for a layout named `--help`.
 for _a in "$@"; do
   if [[ "$_a" == (-h|--help) ]]; then
@@ -2172,15 +2353,21 @@ if [[ -n "${WTS_SESSION_OUT:-}" ]]; then
   print -r -- "$SESSION" > "$WTS_SESSION_OUT"
 fi
 
-# WTS_NO_ATTACH: used by `wts new` to chain several creations.
-# Without it, the `exec` below would make any chaining impossible.
-if [[ -n "${WTS_NO_ATTACH:-}" ]]; then
+# Detached (--detach, --json, no terminal, or WTS_NO_ATTACH from `wts new`):
+# without it, the `exec` below would make any chaining impossible, and from an
+# agent's pane it would move the human's terminal.
+if $DETACH; then
+  started_now=false
   if tmux has-session -t "=$SESSION" 2>/dev/null; then
     echo "→ tmux session '$SESSION' already running"
   elif start_detached "$LAYOUT_FILE" "$SESSION"; then
     echo "→ session '$SESSION' started"
+    started_now=true
   else
     exit 1
+  fi
+  if $JSON_OUT; then
+    session_json "$SESSION" "$started_now" >&3
   fi
   exit 0
 fi

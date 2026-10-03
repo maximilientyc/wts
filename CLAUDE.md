@@ -13,8 +13,9 @@ libexec/wts/wts-gc         squash-aware cleanup, dry run by default
 libexec/wts/wts-fresh      tmux `command-alias` entry: fetch origin/<default>, then wts
 libexec/wts/wts-name       slug from a phrase (Claude Haiku, local fallback)
 libexec/wts/wts-keys       the key table: switcher footer and `wts keys`
-libexec/wts/wts-doctor     `wts doctor`: dependencies, fzf gates, tmux snippet and
-                           Claude hooks installed and current; read-only
+libexec/wts/wts-doctor     `wts doctor`: dependencies, fzf gates, tmux snippet,
+                           Claude hooks and skill installed and current; read-only
+libexec/wts/wts-agent      `wts send | wait | tail`: drive another session's agent
 libexec/wts/wts-brief      done/next per session (Claude Haiku, cached)
 libexec/wts/wts-doc        context document library: fetch (any MCP), cache, materialize
 libexec/wts/wts-retro      capture at teardown: collect/store facts, write the retro (Haiku)
@@ -28,6 +29,8 @@ libexec/wts/wts-context    Claude Code SessionStart hook: tells an agent about t
 libexec/wts/wts-hook       Claude Code UserPromptSubmit/Stop/Notification/SessionEnd hooks:
                            records agent_events, rings the bell, posts the banner
 share/wts/layouts/         built-in layouts (default.yml)
+share/wts/skill/SKILL.md   the Claude Code skill `setup claude --install` writes
+                           ({{WTS}} and {{VERSION}} filled in)
 examples/layouts/          richer layouts, not installed as built-ins
 completions/_wts           zsh completion
 test/smoke.zsh             end-to-end test in a sandbox
@@ -53,17 +56,25 @@ straight from the checkout. Scripts locate each other from their own path
   (`blocked working idle done failed stopped`, plus `stale`) do not change
   without a version bump and a CHANGELOG entry (1.5.0 added `agent_since` and
   `agent_source`; adding a key is fine that way, renaming one is not).
-- A Claude Code hook never prints on stdout and always exits 0: Claude Code
-  adds a `UserPromptSubmit` hook's stdout to the conversation, and reads a
-  non-zero `Stop` hook as "block the turn, hand stderr to the model". `wts-hook`
-  does `exec >/dev/null` right after reading its payload for that reason;
-  `wts-context` is the one hook whose stdout is the point. So is `wts log`: its payload
-  carries `version`, and the `outcome` vocabulary (`merged squashed
+- A Claude Code hook never prints on stdout unless printing is its job, and
+  always exits 0: Claude Code adds a `UserPromptSubmit` hook's stdout to the
+  conversation, and reads a non-zero `Stop` hook as "block the turn, hand
+  stderr to the model". `wts-hook` does `exec 3>&1 >/dev/null` right after
+  reading its payload, and writes to fd 3 in exactly two places: the new notes
+  at a turn's start (`prompt`) and the overlap warning after an edit (`touch`,
+  as PostToolUse's `additionalContext` JSON), each only when there is something
+  new. `wts-context` is the hook whose stdout is the point. So is `wts log`:
+  its payload carries `version`, and the `outcome` vocabulary (`merged squashed
   remote-deleted removed abandoned in-progress unknown`) is closed — a seventh
   value breaks whatever agent is reading the corpus.
-- Degrade, don't die: without `claude`, `jq`, `curl` or a tmux server, the
-  affected columns show `-` and the rest works. Helpers use `set -uo pipefail`
-  without `-e` for that reason; `bin/wts` uses `set -euo pipefail`.
+- **An agent is a caller with no terminal.** Its Bash tool has no tty on stdin
+  and `$TMUX` set. So: no picker or question without `-t 0 && -t 2` (exit 2 and
+  name what to pass); no attach without a terminal (`detach_mode` in `bin/wts`);
+  every listing has `--json` with `"version": 1`; nothing types into a pane
+  wts cannot name as the agent's (`agent_pane_of` in `wts-db.zsh`, never the
+  session's active pane). `WTS_CLAUDE_ALLOW` in `wts-db.zsh` is what an agent
+  may run without a prompt: read-only verbs and its own notes, nothing that
+  acts on someone's work.
 - The model is only called on explicit commands (`wts "<phrase>"`, `wts brief`,
   `wts doc add|sync`, `wts retro`, and `wts gc --apply`), never from `ls`, the
   switcher or hooks. `WTS_NO_LLM=1` disables it. `gc` is the widest of these and
@@ -78,7 +89,9 @@ straight from the checkout. Scripts locate each other from their own path
   `~/Library/Group Containers`): the first touch raises "iTerm would like to
   access data from other apps" — the *glob* raises it, before any open, and a
   denial is remembered. So the same rule as the model: only a command the user
-  typed may read Things. Anything that merely describes what a key does asks
+  typed may read Things — enforced in `wts-things` itself, which refuses
+  (exit 3, never cached) without a terminal unless `WTS_THINGS_FROM_SCRIPT` or a
+  fixture (`WTS_THINGS_DB`) says otherwise. Anything that merely describes what a key does asks
   `wts-things available`, which reads the cached verdict in `kv['things.db']`
   and nothing else. The switcher asked `wts-things db` on every popup open, to
   word one footer line: that dialog on every `prefix+s` is how it was found.

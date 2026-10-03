@@ -11,7 +11,7 @@
 # Usage: wts-fresh <name> ["<phrase>"] [layout] [context...]
 #        wts-fresh "<phrase>" [layout] [context...]
 #        wts-fresh new [-p layout] <name|"phrase"...>
-#        wts-fresh ls | status | brief | restore | stop | pr | doc | db | log | retro
+#        wts-fresh ls | status | brief | restore | stop | pr | doc | db | log | retro | send | wait | tail
 #                  | task | layouts | keys | doctor | setup | help | version ...
 #                                                   (passed through, no fetch)
 #        wts-fresh gc | rm ...                      (passed through from the main worktree)
@@ -96,7 +96,7 @@ unset _arg
 # doctor, doc, stop and pr were missing: they waited for a fetch of origin, then
 # the window closed before their output could be read.
 case "$1" in
-  ls|status|brief|restore|stop|pr|doc|db|log|retro|task|layouts|keys|doctor|setup|help|-h|--help|version|-V|--version)
+  ls|status|brief|restore|stop|pr|doc|db|log|retro|task|send|wait|tail|layouts|keys|doctor|setup|help|-h|--help|version|-V|--version)
     passthrough "$@" ;;
 esac
 

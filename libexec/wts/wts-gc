@@ -2,6 +2,11 @@
 # wts-gc — garbage collector for worktrees, branches and registry entries.
 #
 # Usage: wts gc [--all] [--all-branches] [--apply] [--no-fetch] [--no-retro]
+#        wts gc [--all] [--all-branches] [--no-fetch] --json
+#
+# --json prints the dry run's plan, and only that: every category with its
+# entries and why, as one object (an array of them under --all). It is never
+# combined with --apply: a program decides from the plan, then asks for it.
 #
 # Default: DRY RUN. Nothing is deleted without --apply.
 #
@@ -78,6 +83,7 @@
 set -uo pipefail
 
 APPLY=false
+JSON=false
 FETCH=true
 RETRO=true
 ALL=false
@@ -91,12 +97,17 @@ while [[ $# -gt 0 ]]; do
     --no-fetch) FETCH=false; pass+=("$1") ;;
     --no-retro) RETRO=false; pass+=("$1") ;;
     --dry-run)  pass+=("$1") ;;
+    --json)     JSON=true; pass+=("$1") ;;
     --all-branches) ALL_BRANCHES=true; pass+=("$1") ;;
     --all)      ALL=true ;;
-    *) print -u2 "wts gc: unknown option '$1' (--all, --all-branches, --apply, --no-fetch, --no-retro)"; exit 2 ;;
+    *) print -u2 "wts gc: unknown option '$1' (--all, --all-branches, --apply, --no-fetch, --no-retro, --json)"; exit 2 ;;
   esac
   shift
 done
+if $JSON && $APPLY; then
+  print -u2 "wts gc: --json is the dry run's plan; --apply acts on it, without --json"
+  exit 2
+fi
 
 # --all: one run per repository, each in a process of its own so the per-
 # repository code below stays exactly what a plain `wts gc` runs. A repository
@@ -135,10 +146,19 @@ if $ALL; then
     exit 0
   fi
   integer rc=0 one=0
+  typeset -a plans
+  plans=()
   for main in "${mains[@]}"; do
+    if $JSON; then
+      plans+=("$(cd "$main" && WTS_GC_ALL=1 "$WTS_GC" "${pass[@]}")") || rc=1
+      continue
+    fi
     (( one++ )) && print ""
     ( cd "$main" && WTS_GC_ALL=1 "$WTS_GC" "${pass[@]}" ) || rc=1
   done
+  if $JSON; then
+    print -r -- "${(F)plans}" | jq -sc '.'
+  fi
   exit $rc
 fi
 
@@ -147,7 +167,20 @@ if ! git rev-parse --git-dir >/dev/null 2>&1; then
   exit 1
 fi
 
-repo_root=$(git rev-parse --show-toplevel)
+# --json: the report below still runs, into /dev/null, and the plan is printed
+# on the real stdout (fd 3) at the point where --apply would start acting.
+if $JSON; then
+  exec 3>&1 >/dev/null
+fi
+fetch_state=skipped
+
+# The main worktree, not --show-toplevel: run from inside a session — where an
+# agent always is — that named the session's worktree, and gc reported on
+# `<worktree>-worktrees/` and a repository named after the session. wts-fresh
+# and `--all` hopped to the main worktree already; a plain `wts gc` did not.
+repo_root=$(git worktree list --porcelain 2>/dev/null \
+              | awk 'NR == 1 && /^worktree / { print substr($0, 10); exit }')
+[[ -n "$repo_root" && -d "$repo_root" ]] || repo_root=$(git rev-parse --show-toplevel)
 repo_name=$(basename "$repo_root")
 parent=$(dirname "$repo_root")
 worktree_base="${WTS_WORKTREES_BASE:-${parent}/${repo_name}-worktrees}"
@@ -233,8 +266,10 @@ if $FETCH && [[ -n "$(git -C "$repo_root" remote 2>/dev/null)" ]]; then
   fetch_err=$(mktemp "${TMPDIR:-/tmp}/wts-gc-fetch.XXXXXX" 2>/dev/null) || fetch_err=""
   if git -C "$repo_root" fetch --all --prune --quiet 2>"${fetch_err:-/dev/null}"; then
     print "Remote: fetch --prune ok"
+    fetch_state=ok
   else
     print "Remote: fetch --prune FAILED"
+    fetch_state=failed
     report_fetch_error "$fetch_err"
     # An aborted transaction updated NOTHING, origin/<base> included. Without
     # --prune each update is its own transaction and the refs that cannot be
@@ -461,6 +496,8 @@ outcome_of() {
 # working (or waiting for a permission, or looks stuck) is not torn down under
 # its feet. Without wts-status or jq, nothing is known and nothing is held back
 # for this reason: the other safeguards still apply.
+# Filled by the report, read by --json: what it measured on the way.
+typeset -A husk_kb gone_ahead
 typeset -A busy_wt
 if [[ -x "${0:A:h}/wts-status" ]] && command -v jq >/dev/null 2>&1; then
   # Keyed by both spellings of the path, looked up with git's canonical one:
@@ -534,6 +571,7 @@ if (( ${#husks} )); then
   print "Husk folders (no .git, leftovers of \`git worktree remove\`):"
   for d in "${husks[@]}"; do
     kb=$(du -sk "$d" 2>/dev/null | cut -f1)
+    husk_kb[$d]="${kb:-0}"
     total_kb=$(( total_kb + ${kb:-0} ))
     printf '  %8s  %s\n' "$(human ${kb:-0})" "$d"
   done
@@ -640,6 +678,7 @@ if (( ${#gone_branches} )); then
   print "Branches whose remote is gone, content MISSING from '$base_ref':"
   for b in "${gone_branches[@]}"; do
     ahead=$(git -C "$repo_root" rev-list --count "$base_ref..$b" 2>/dev/null)
+    gone_ahead[$b]="${ahead:-0}"
     printf '  %-28s %s commit(s) the base does not have\n' "$b" "${ahead:-?}"
   done
   print "  → never deleted automatically: check before \`git branch -D\`"
@@ -778,6 +817,45 @@ if (( to_archive )); then
   print ""
 fi
 
+# ─── The plan, as JSON ───────────────────────────────────────────────────────
+if $JSON; then
+  integer retro_calls=0
+  if $RETRO && [[ -z "${WTS_NO_LLM:-}" ]] && command -v claude >/dev/null 2>&1; then
+    retro_calls=$to_archive
+  fi
+  # One jq per category, from \x1f records: the fields are paths and reasons,
+  # free text that only jq can quote.
+  recs() {  # <field names…> — reads \x1f records on stdin
+    jq -Rc --args 'split("\u001f") as $f | [$ARGS.positional, $f] | transpose
+                   | map({(.[0]): (.[1] // "")}) | add' "$@" | jq -sc '.'
+  }
+  j_husks=$(for d in "${husks[@]}"; do print -r -- "$d"$'\x1f'"${husk_kb[$d]:-0}"; done | recs path kb)
+  j_teardown=$(print -rl -- "${teardown[@]}" | grep . | recs branch worktree session why)
+  j_held=$(print -rl -- "${held[@]}" | grep . | recs branch worktree reason)
+  j_dead=$(print -rl -- "${free_branches[@]}" | grep . | recs branch why)
+  j_gone=$(for b in "${gone_branches[@]}"; do print -r -- "$b"$'\x1f'"${gone_ahead[$b]:-0}"; done | recs branch ahead)
+  j_locks=$(print -rl -- "${stale_locks[@]}" | grep . | recs owner path age)
+  jq -nc --arg repo "$repo_name" --arg root "$repo_root" --arg base "${base:-}" \
+     --arg base_ref "${base_ref:-}" --arg fetch "$fetch_state" \
+     --arg scope "$($ALL_BRANCHES && print all || print wts)" \
+     --argjson husks "$j_husks" --argjson teardown "$j_teardown" --argjson held "$j_held" \
+     --argjson dead "$j_dead" --argjson gone "$j_gone" --argjson locks "$j_locks" \
+     --argjson new "$(print -rl -- "${new_branches[@]}" | grep . | jq -Rsc 'split("\n") | map(select(. != ""))')" \
+     --argjson orphans "$(print -rl -- "${orphans[@]}" | grep . | jq -Rsc 'split("\n") | map(select(. != ""))')" \
+     --argjson fb "$foreign_branches" --argjson fh "$foreign_husks" \
+     --argjson archive "$to_archive" --argjson calls "$retro_calls" '
+     {version: 1, repo: $repo, repo_root: $root, base: $base, compared_to: $base_ref,
+      fetch: $fetch, scope: $scope,
+      husks: ($husks | map(.kb |= (tonumber? // 0))),
+      teardown: ($teardown | map(.session |= (if . == "" then null else . end))),
+      held: $held, dead_branches: $dead, new_branches: $new,
+      orphan_branches: ($gone | map(.ahead |= (tonumber? // 0))),
+      orphan_registry: $orphans, stale_locks: $locks,
+      not_looked_at: {branches: $fb, folders: $fh},
+      to_archive: $archive, retro_calls: $calls}' >&3
+  exit 0
+fi
+
 if ! $APPLY; then
   if (( ${#husks} + ${#teardown} + ${#free_branches} + ${#orphans} + ${#stale_locks} > 0 )); then
     print "Nothing was deleted. Run again with: wts gc${WTS_GC_ALL:+ --all} --apply"
@@ -883,6 +961,8 @@ if db_available && [[ -s "$WTS_DB" ]]; then
            DELETE FROM notes WHERE session NOT IN (SELECT name FROM sessions);
            DELETE FROM task_links WHERE session NOT IN (SELECT name FROM sessions);
            DELETE FROM agent_events WHERE session NOT IN (SELECT name FROM sessions);
+           DELETE FROM agent_panes WHERE session NOT IN (SELECT name FROM sessions);
+           DELETE FROM touches WHERE session NOT IN (SELECT name FROM sessions);
            DELETE FROM pane_hashes WHERE since < unixepoch() - 7 * 86400;
            COMMIT;" 2>&1 >/dev/null); then
     (( ${#purge} )) && print "✓ registry: ${#purge} entry(ies) removed"

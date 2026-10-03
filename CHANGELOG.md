@@ -72,6 +72,46 @@ or fails, and what wts says about its own setup.
   completion for `--task`, `new --doc`, `task doc`, `task unlink` (a session),
   `gc --all-branches`, `retro --jobs` and `setup tmux --install`.
 
+wts, from the agent's side: a Bash tool with no terminal and `$TMUX` set. An
+agent working in a session was served well; an agent driving wts found nothing
+built for it. Schema 5, two new tables, imported on the first command.
+
+- **Never in the way.** Things is read from a terminal only: the hook told
+  every agent to run `wts task show <id>`, `setup claude` allowed it, and its
+  snapshot read Things — the privileged read (and macOS dialog) reserved for a
+  command you type. `WTS_THINGS_FROM_SCRIPT=1` for a cron job. Without a
+  terminal no picker opens and no question is asked: exit 2, and what to pass
+  instead. A creation without a terminal never attaches (`--detach` says so
+  explicitly): from an agent's pane it used to move your terminal.
+- **JSON for every listing**, versioned: a creation's `--json` (detached, the
+  session on stdout; an array for `wts new`), `task ls/show --json`, `doc
+  ls/show --json`, `brief --cached [--json]` (the last summaries, no model
+  call), `gc --json` (the dry run's plan), `doctor --json`.
+- **`wts send`, `wts wait`, `wts tail`**: type into a session's agent, wait until
+  it stops working (`--until`, `--timeout`, 90 s by default), read its last
+  messages from its transcript. `send` types into the agent's own pane, which
+  its hooks now record (`agent_panes`), and refuses when it is not known; the
+  switcher's reply mode and `ctrl-e` follow the same rule instead of typing
+  into the session's active pane (the editor of the default layout).
+- **Real file overlap.** A sixth hook, `PostToolUse` on edits, records each
+  file an agent edits (`touches`); the first time it edits one another session
+  of the repository has edited, the tool result names that session. The
+  SessionStart hook lists the files both have edited.
+- **Notes as they are written.** At the start of each turn, the notes the
+  repository's other agents left since the agent's last turn — five lines at
+  most, nothing when there is nothing new.
+- **A task link the agent can judge**: the hook says when and how the session
+  was linked, and how to relink it.
+- **The wts skill.** `wts setup claude --install` writes
+  `~/.claude/skills/wts/SKILL.md`: what an agent loads when it needs wts —
+  inside a session, or anywhere you ask your Claude about parallel work. The
+  SessionStart hook shrinks to who the agent is, its task, its siblings and
+  the overlap, and points to it. `--install` also allows the read-only verbs
+  (`ls`, `task ls`, `doc ls`, `log`, `wait`, `tail`…), never `rm`, `gc`,
+  `stop`, `send` or a creation. `wts doctor` checks all of it.
+- **`wts gc` from inside a session** works on the repository: it took the
+  session's worktree for the repository, as `--all` and `wts-fresh` did not.
+
 ## 1.5.2 — 2026-10-02
 
 - **A task's preview in the switcher lists its sessions**: the live ones with

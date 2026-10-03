@@ -483,9 +483,16 @@ tmux_target() { # $1 = target
   [[ "$1" == *%* ]] && print -r -- "$1" || print -r -- "=$1:"
 }
 
+# Status 1, and nothing typed, when the target is a bare session name whose
+# agent pane wts does not know: `=name:` is the session's ACTIVE pane, the
+# editor of the default layout, and a reply typed there plus Enter went into
+# the user's buffer. The agent's pane comes from its own hooks or the collector.
 send_reply() { # $1 = target, $2 = text
-  local t
-  t=$(tmux_target "$1")
+  local t="$1"
+  if [[ "$t" != *%* ]]; then
+    t=$(agent_pane_of "${t#=}") || return 1
+  fi
+  t=$(tmux_target "$t")
   [[ -n "$2" ]] && tmux send-keys -t "$t" -l -- "$2" 2>/dev/null
   # Text and newline in one read look like a multi-line paste to Claude Code,
   # which then inserts the newline instead of submitting.
@@ -568,8 +575,12 @@ reply() { # $1 = verb, then verb arguments
         print -r -- "clear-query+reload-sync('$WTS_BIN/wts-switch' --list)+refresh-preview"
         return
       fi
-      send_reply "$(resolve_target "${2:-}" "${3:-}")" "${1:-}"
-      print -r -- "clear-query+refresh-preview"
+      if send_reply "$(resolve_target "${2:-}" "${3:-}")" "${1:-}"; then
+        print -r -- "clear-query+refresh-preview"
+      else
+        # The text stays in the query: nothing was sent, nothing is lost.
+        print -r -- "change-prompt(no agent pane known — not sent> )"
+      fi
       ;;
   esac
 }
@@ -1397,7 +1408,7 @@ fi
 # knowledge stays here and wts-doc calls this verb.
 if [[ "${1:-}" == "--send" ]]; then
   send_reply "${2:-}" "${3:-}"
-  exit 0
+  exit $?
 fi
 
 # Jump straight to the agent that is waiting (bound to prefix+a).

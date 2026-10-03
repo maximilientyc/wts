@@ -362,6 +362,13 @@ check "tab enters reply mode" \
 check "fzf parses the enter chain" fzf_parses "$chain"
 check "reply mode is pinned on disk" \
   eval '[[ $(head -1 "$WTS_SWITCH_REPLY") == auth-form ]]'
+# No agent pane known yet: the reply is refused, the text stays in the query,
+# and nothing reaches the session's active pane (the editor, in a real layout).
+check "a reply with no known agent pane is refused" \
+  eval '[[ $("$SWITCH" --reply send "echo wts-reply-refused" auth-form auth-form) == "change-prompt("*"not sent> )" ]]'
+refute "and nothing was typed" pane_contains auth-form wts-reply-refused
+# What the agent's hooks record from its own environment ($TMUX_PANE).
+q "INSERT OR REPLACE INTO agent_panes VALUES ('auth-form', '', '$(tmux display-message -p -t "=auth-form:" '#{pane_id}')', strftime('%s','now'))"
 check "enter sends the line to the pane" \
   eval '[[ $("$SWITCH" --reply send "echo wts-reply-ok" auth-form auth-form) == "clear-query+refresh-preview" ]]'
 check "the line reached the pane" pane_shows auth-form wts-reply-ok
@@ -632,6 +639,9 @@ rm -rf "$WT/docsess/.wts"
 "$WTS" restore docsess >/dev/null
 check "restore rebuilds a context file that disappeared" test -s "$WT/docsess/.wts/context.md"
 
+refute "--send refuses a session whose agent pane is unknown" \
+  "$SWITCH" --send docsess "echo wts-doc-send-refused"
+q "INSERT OR REPLACE INTO agent_panes VALUES ('docsess', '', '$(tmux display-message -p -t "=docsess:" '#{pane_id}')', strftime('%s','now'))"
 check "--send is the one sender into a pane" \
   "$SWITCH" --send docsess "echo wts-doc-send-ok"
 check "the sent line lands" pane_shows docsess wts-doc-send-ok
@@ -1789,8 +1799,153 @@ check "the base it was compared against is recorded" eval '
   [[ "$(q "select base from archive where session = '"'"'gcarch'"'"'")" == main ]]'
 check "the worktree really is gone" eval '[[ ! -e "$WT/gcarch" ]]'
 
-check "the schema is at version 4" eval '
-  [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 4 ]]'
+check "the schema is at version 5" eval '
+  [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 5 ]]'
+
+# ─── Agent friendly ──────────────────────────────────────────────────────────
+# What wts is like for the Claude agent in a pane: a Bash tool with no terminal
+# on stdin. Every command here runs with </dev/null for that reason.
+
+# Things is read from a terminal only, and a refusal is not cached as "absent".
+things_kv() { q "SELECT count(*) FROM kv WHERE key = 'things.db'" }
+kv_before=$(things_kv)
+check "wts-things refuses to read Things without a terminal (exit 3)" eval '
+  out=$(env -u WTS_THINGS_DB -u WTS_NO_THINGS "$ROOT/libexec/wts/wts-things" tasks </dev/null 2>&1)
+  (( $? == 3 )) && [[ "$out" == *"from a terminal only"* ]]'
+check "and caches no verdict for it" eval '[[ "$(things_kv)" == "$kv_before" ]]'
+check "a task picker without a terminal names what to pass, exit 2" eval '
+  out=$(env -u WTS_THINGS_DB "$WTS" task show </dev/null 2>&1)
+  [[ "$out" == *"no terminal to pick a task in"*"wts task ls --json"* ]]'
+check "so does the document picker" eval '
+  out=$("$ROOT/libexec/wts/wts-doc" pick </dev/null 2>&1); (( $? == 2 )) && [[ "$out" == *"pass its slug"* ]]'
+
+# Creation from an agent: detached, and the result as JSON on stdout only.
+check "--json creates detached and prints the session" eval '
+  out=$("$WTS" agent-a "write the agent docs" smoke --json </dev/null 2>/dev/null)
+  print -r -- "$out" | jq -e ".version == 1 and .name == \"agent-a\" and .started == true
+                             and .branch == \"feature/agent-a\" and (.worktree | endswith(\"/agent-a\"))"'
+check "without a terminal a creation never attaches" eval '
+  "$WTS" agent-b smoke </dev/null >/dev/null 2>&1 && has_session agent-b'
+check "new --json prints every session it created" eval '
+  out=$("$WTS" new -p smoke --json agent-c agent-d </dev/null 2>/dev/null)
+  print -r -- "$out" | jq -e "map(.name) == [\"agent-c\", \"agent-d\"]"'
+"$WTS" rm agent-c -f >/dev/null 2>&1
+"$WTS" rm agent-d -f >/dev/null 2>&1
+
+# JSON for every listing.
+AT=$(tt new "Make wts agent friendly")
+tt link "$AT" agent-a >/dev/null
+check "task ls --json lists the task and its live session" eval '
+  "$WTS" task ls --json </dev/null | jq -e --arg t "$AT" \
+    ".version == 1 and any(.tasks[]; .id == \$t and .sessions[0].name == \"agent-a\" and .sessions[0].state == \"live\")"'
+check "task show --json carries notes, sessions and attempts" eval '
+  tt note "$AT" "start with the Things guard" >/dev/null
+  "$WTS" task show "$AT" --json </dev/null | jq -e \
+    ".title == \"Make wts agent friendly\" and .wts_notes[0].body == \"start with the Things guard\"
+     and (.sessions | length) == 1 and (.attempts | type) == \"array\""'
+check "doc ls --json is versioned" eval '"$WTS" doc ls --json </dev/null | jq -e ".version == 1 and (.documents | type) == \"array\""'
+q "INSERT OR REPLACE INTO briefs VALUES ('agent-a', 'k', 'done: docs drafted' || char(10) || 'next: review', strftime('%s','now') - 120)"
+check "brief --cached --json reads the database, no model" eval '
+  "$WTS" brief --cached --json agent-a </dev/null | jq -e \
+    ".briefs[0].session == \"agent-a\" and (.briefs[0].body | startswith(\"done: docs drafted\")) and .briefs[0].age_s >= 120"'
+refute "brief --json alone would call the model: refused" eval '"$WTS" brief --json </dev/null 2>/dev/null'
+check "gc --json is the plan" eval '
+  "$WTS" gc --no-fetch --json </dev/null | jq -e ".version == 1 and .scope == \"wts\" and (.teardown | type) == \"array\""'
+check "gc --json from inside a worktree plans for the repository" eval '
+  out=$(cd "$WT/agent-a" && "$WTS" gc --no-fetch --json </dev/null)
+  print -r -- "$out" | jq -e --arg r "$REPO" ".repo_root == \$r"'
+check "gc --json --apply is refused, exit 2" eval '"$WTS" gc --json --apply </dev/null 2>/dev/null; (( $? == 2 ))'
+check "doctor --json says whether wts is ready" eval '
+  "$WTS" doctor --json </dev/null | jq -e ".version == 1 and .ready == true and (.checks | length) > 5"'
+
+# The pane an agent runs in, from its own hooks.
+pane_a=$(tmux display-message -p -t "=agent-a:" '#{pane_id}')
+(cd "$WT/agent-a" && print -r -- '{"session_id":"0123abcd-ef01-2345-6789-abcdef0000aa"}' \
+  | TMUX_PANE="$pane_a" "$HOOK" prompt)
+check "a hook records its agent's pane" eval '[[ "$(q "SELECT pane FROM agent_panes WHERE session = '\''agent-a'\''")" == "$pane_a" ]]'
+check "send types into it and submits" eval '"$WTS" send agent-a "echo wts-send-ok" </dev/null >/dev/null'
+check "the line ran in the agent pane" pane_shows agent-a wts-send-ok
+refute "send to a session whose agent pane is unknown is refused" eval '"$WTS" send agent-b "echo nope" </dev/null 2>/dev/null'
+refute "send to no session is refused" eval '"$WTS" send no-such "x" </dev/null 2>/dev/null'
+
+# wait: the states of `wts status --json`.
+print -r -- '[]' > "$WTS_SMOKE_AGENTS"
+check "wait times out on an agent that never reports, exit 1" eval '
+  out=$("$WTS" wait agent-b --until idle --timeout 2 </dev/null 2>/dev/null); (( $? == 1 )) && [[ "$out" == "agent-b "* ]]'
+jq -n --arg cwd "$WT/agent-b" '[{kind: "interactive", status: "idle", cwd: $cwd, sessionId: "smoke-b"}]' > "$WTS_SMOKE_AGENTS"
+check "wait returns once the agent is idle" eval '
+  "$WTS" wait agent-b --timeout 10 --json </dev/null | jq -e ".reached == true and .sessions[0].state == \"idle\""'
+refute "wait refuses an unknown state" eval '"$WTS" wait agent-b --until sleeping </dev/null 2>/dev/null'
+print -r -- '[]' > "$WTS_SMOKE_AGENTS"
+
+# tail: the agent's last words, from the transcript its hooks named.
+proj_a="$CLAUDE_CONFIG_DIR/projects/$(print -r -- "$WT/agent-a" | sed 's/[^a-zA-Z0-9]/-/g')"
+mkdir -p "$proj_a"
+{
+  print -r -- '{"type":"user","message":{"content":"go"}}'
+  print -r -- '{"type":"assistant","timestamp":"2026-10-03T12:00:00Z","message":{"content":[{"type":"text","text":"first answer"}]}}'
+  print -r -- '{"type":"assistant","timestamp":"2026-10-03T12:01:00Z","message":{"content":[{"type":"tool_use","name":"Bash"}]}}'
+  print -r -- '{"type":"assistant","timestamp":"2026-10-03T12:02:00Z","message":{"content":[{"type":"text","text":"done: the docs are written"}]}}'
+} > "$proj_a/0123abcd-ef01-2345-6789-abcdef0000aa.jsonl"
+check "tail prints the agent's last message" eval '[[ "$("$WTS" tail agent-a </dev/null)" == *"done: the docs are written"* ]]'
+check "tail -n 2 --json skips tool calls" eval '
+  "$WTS" tail agent-a -n 2 --json </dev/null | jq -e "[.messages[].text] == [\"first answer\", \"done: the docs are written\"]"'
+
+# Overlap: the first time a session edits a file a sibling has edited.
+touch_as() { # <session> <relative path> — the PostToolUse hook, as Claude Code runs it
+  (cd "$WT/$1" && print -r -- "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$WT/$1/$2\"}}" \
+     | env -u TMUX_PANE "$HOOK" touch)
+}
+check "an edit nobody else made says nothing" eval '[[ -z "$(touch_as agent-a src/api.ts)" ]]'
+check "the same file edited next door names the other session" eval '
+  touch_as agent-b src/api.ts | jq -e ".hookSpecificOutput.hookEventName == \"PostToolUse\"
+    and (.hookSpecificOutput.additionalContext | contains(\"src/api.ts\") and contains(\"agent-a\"))"'
+check "once per file" eval '[[ -z "$(touch_as agent-b src/api.ts)" ]]'
+check "a file outside the worktree is not recorded" eval '
+  (cd "$WT/agent-b" && print -r -- "{\"tool_input\":{\"file_path\":\"/etc/hosts\"}}" | "$HOOK" touch)
+  [[ "$(q "SELECT count(*) FROM touches WHERE path LIKE '\''%hosts'\''")" == 0 ]]'
+check "SessionStart lists the files both have edited" eval '
+  out=$(cd "$WT/agent-b" && env -u TMUX -u TMUX_PANE "$CONTEXT")
+  [[ "$out" == *"Files you and another session have both edited:"*"src/api.ts (also: agent-a)"* ]]'
+check "and how the task was linked" eval '
+  out=$(cd "$WT/agent-a" && env -u TMUX -u TMUX_PANE "$CONTEXT")
+  [[ "$out" == *"This session was linked"*"wts task link <id>"* ]]'
+
+# Notes reach the other agents at their next turn.
+prompt_as() { (cd "$WT/$1" && print -r -- '{"session_id":"s"}' | env -u TMUX_PANE "$HOOK" prompt) }
+prompt_as agent-b >/dev/null
+check "a first turn adds nothing (SessionStart covered it)" eval '[[ -z "$(prompt_as agent-b)" ]]'
+sleep 1
+"$WTS" db set api-contract "POST /login answers 422 on bad input" --session agent-a >/dev/null 2>&1
+check "the next turn carries the note a sibling left" eval '
+  out=$(prompt_as agent-b)
+  [[ "$out" == *"new notes"*"agent-a/api-contract: POST /login answers 422"* ]]'
+check "and not twice" eval '[[ -z "$(prompt_as agent-b)" ]]'
+check "WTS_CONTEXT_QUIET silences it" eval '
+  sleep 1; "$WTS" db set other "x" --session agent-a >/dev/null 2>&1
+  [[ -z "$(cd "$WT/agent-b" && print -r -- "{}" | WTS_CONTEXT_QUIET=1 env -u TMUX_PANE "$HOOK" prompt)" ]]'
+check "a Stop hook still prints nothing" eval '[[ -z "$(cd "$WT/agent-b" && print -r -- "{}" | "$HOOK" stop)" ]]'
+check "rm drops the session's touches and pane" eval '
+  "$WTS" rm agent-b -f >/dev/null
+  [[ "$(q "SELECT count(*) FROM touches WHERE session = '\''agent-b'\''") $(q "SELECT count(*) FROM agent_panes WHERE session = '\''agent-b'\''")" == "0 0" ]]'
+
+# setup claude --install: six hooks, the read-only permissions, the skill.
+CS="$SANDBOX/claude-setup"
+mkdir -p "$CS"
+CLAUDE_CONFIG_DIR="$CS" "$WTS" setup claude --install >/dev/null
+CLAUDE_CONFIG_DIR="$CS" "$WTS" setup claude --install >/dev/null
+check "setup claude installs the PostToolUse hook on edits, once" eval '
+  jq -e "[.hooks.PostToolUse[] | select(.matcher == \"Edit|Write|MultiEdit|NotebookEdit\")] | length == 1" "$CS/settings.json"'
+check "and allows the read-only verbs" eval '
+  jq -e "(.permissions.allow | index(\"Bash(wts ls:*)\")) and (.permissions.allow | index(\"Bash(wts wait:*)\"))
+         and ((.permissions.allow | index(\"Bash(wts rm:*)\")) | not)" "$CS/settings.json"'
+check "and writes the skill, its paths filled in" eval '
+  grep -q "^name: wts$" "$CS/skills/wts/SKILL.md" && ! grep -q "{{" "$CS/skills/wts/SKILL.md"'
+check "doctor finds the skill" eval '[[ "$(CLAUDE_CONFIG_DIR="$CS" "$WTS" doctor)" == *"✓ Claude skill"* ]]'
+print -r -- "my own skill" > "$CS/skills/wts/SKILL.md"
+CLAUDE_CONFIG_DIR="$CS" "$WTS" setup claude --install >/dev/null 2>&1
+check "a SKILL.md of your own is left alone" eval '[[ "$(<"$CS/skills/wts/SKILL.md")" == "my own skill" ]]'
+"$WTS" rm agent-a -f >/dev/null
 check "log, retro, doctor, keys, doc, stop and pr are info commands for wts-fresh" eval '
   line=$(grep -E "^  ls\|status\|" "$ROOT/libexec/wts/wts-fresh")
   for c in log retro doctor keys doc stop pr; do [[ "$line" == *"|$c|"* ]] || exit 1; done'

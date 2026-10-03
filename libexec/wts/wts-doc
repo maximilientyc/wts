@@ -731,7 +731,14 @@ pick_doc() {  # -> a slug on stdout, empty when the user gave up
     print -r -- "${${(z)choice}[1]:-}"
     return 0
   fi
-  # No fzf, or no terminal: degrade to a numbered list rather than give up.
+  # No terminal at all (an agent's Bash tool, a script): nobody can answer, so
+  # no question. The numbered list below read the caller's stdin, which for an
+  # agent is whatever its tool happened to connect.
+  if ! [[ -t 0 && -t 2 ]]; then
+    print -u2 -r -- "wts doc: no terminal to pick a document in — pass its slug (wts doc ls --json)"
+    return 2
+  fi
+  # No fzf: degrade to a numbered list rather than give up.
   local -i i=0
   for line in "${slugs[@]}"; do
     (( ++i ))
@@ -780,16 +787,6 @@ registry_docs() {  # <session> -> one slug per line
          WHERE name = $(sql_str "$1")" 2>/dev/null
 }
 
-# The collector is the single source for an agent's pane (it reads Claude Code's
-# undocumented session file); never re-derive it here. --no-git: this needs no
-# git column and would otherwise pay seconds on a large repository.
-agent_pane_of() {  # <session>
-  local pane
-  pane=$("$WTS_LIBEXEC/wts-status" --json --no-git "$1" 2>/dev/null \
-         | jq -r '.[0].agent_pane // ""' 2>/dev/null)
-  [[ -n "$pane" ]] || pane="$1"
-  print -r -- "$pane"
-}
 
 use_doc() {  # <slug|""> <session> <worktree> <workdir>
   local slug="$1" session="$2" worktree="$3" workdir="${4:-$3}"
@@ -824,8 +821,9 @@ use_doc() {  # <slug|""> <session> <worktree> <workdir>
   title="${title//[[:cntrl:]]/ }"
   title="${title//\"/\'}"
   line="Read @$rel - I have just attached \"${title:0:60}\" to this session."
-  target=$(agent_pane_of "$session")
-  if "$WTS_LIBEXEC/wts-switch" --send "$target" "$line" 2>/dev/null; then
+  # The session name: --send finds its agent pane, and refuses when it
+  # cannot, rather than type into the editor.
+  if "$WTS_LIBEXEC/wts-switch" --send "$session" "$line" 2>/dev/null; then
     print -r -- "→ sent to the agent of '$session'"
   else
     print -r -- "→ paste this into the agent: Read @$rel"
@@ -852,6 +850,29 @@ case "$cmd" in
     ;;
 
   ls)
+    # --json: the library joined with the cache and with the sessions each
+    # document is attached to. The text table cuts titles at 40 and has no
+    # source: a program needs both.
+    if [[ "${1:-}" == --json ]]; then
+      cache=$(db_ro "SELECT coalesce(json_group_object(slug, json_object(
+                       'fetched_at', fetched_at, 'bytes', bytes, 'ok', json(CASE WHEN ok THEN 'true' ELSE 'false' END),
+                       'error', error, 'truncated', json(CASE WHEN truncated THEN 'true' ELSE 'false' END))), '{}')
+                     FROM doc_cache" 2>/dev/null)
+      users=$(db_ro "SELECT coalesce(json_group_object(slug, json(names)), '{}') FROM (
+                       SELECT value AS slug, json_group_array(name) AS names
+                         FROM sessions, json_each(sessions.docs) GROUP BY value)" 2>/dev/null)
+      lib='{}'
+      [[ -s "$DOCS_FILE" ]] && lib=$(<"$DOCS_FILE")
+      jq -cn --argjson lib "$lib" --argjson cache "${cache:-{\}}" --argjson users "${users:-{\}}" '
+        {version: 1, documents: [($lib.docs // {}) | to_entries[] | .key as $s
+          | {slug: $s, title: (.value.title // ""), kind: (.value.kind // ""),
+             source: (.value.source // ""),
+             fetched_at: ($cache[$s].fetched_at // null), bytes: ($cache[$s].bytes // 0),
+             cached: (($cache[$s].ok // false) and (($cache[$s].bytes // 0) > 0)),
+             error: ($cache[$s].error // ""), truncated: ($cache[$s].truncated // false),
+             attached_to: ($users[$s] // [])}]}'
+      exit $?
+    fi
     slugs=(${(f)"$(doc_slugs)"})
     slugs=("${(@)slugs:#}")
     if (( ${#slugs} == 0 )); then
@@ -863,6 +884,9 @@ case "$cmd" in
     ;;
 
   show)
+    show_json=false
+    if [[ "${1:-}" == --json ]]; then show_json=true; shift; fi
+    if [[ "${2:-}" == --json ]]; then show_json=true; fi
     slug="${1:-}"
     if [[ -z "$slug" ]]; then
       slugs=(${(f)"$(doc_slugs)"})
@@ -871,6 +895,18 @@ case "$cmd" in
       slug="${slugs[1]}"
     fi
     doc_exists "$slug" || die "wts doc: '$slug' is not in the library (wts doc ls)"
+    if $show_json; then
+      body=""
+      has_body "$slug" && body=$(cat_body "$slug")
+      jq -cn --arg slug "$slug" --arg title "$(doc_field "$slug" title)" \
+        --arg kind "$(doc_field "$slug" kind)" --arg source "$(doc_field "$slug" source)" \
+        --arg body "$body" --arg error "$(meta_field "$slug" error 2>/dev/null)" \
+        --arg at "$(meta_field "$slug" fetched_at 2>/dev/null)" '
+        {version: 1, slug: $slug, title: $title, kind: $kind, source: $source,
+         fetched_at: (if $at == "" then null else ($at | tonumber? // null) end),
+         body: (if $body == "" then null else $body end), error: $error}'
+      exit $?
+    fi
     if has_body "$slug"; then
       cat_body "$slug"
     else
