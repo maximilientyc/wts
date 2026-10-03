@@ -17,6 +17,10 @@
     elsif !context.empty? then "Investigate Sentry issue #{context}: find the root cause, propose a fix and a regression test"
     else ''
     end
+  # The phrase is read from the file wts wrote, not typed (see default.yml);
+  # the task built from the context is short and stays on the command line.
+  prompt_file = ENV['WTS_PROMPT_FILE'].to_s.dup.force_encoding('UTF-8')
+  prompt_file = '' unless !prompt.empty? && prompt_file.valid_encoding? && File.file?(prompt_file)
   claude_cmd =
     if restore
       if ENV['WTS_RESUME_ID'].to_s =~ /\A[0-9a-f-]+\z/
@@ -26,6 +30,8 @@
       else
         %q{" print -z claude"}
       end
+    elsif !prompt_file.empty?
+      "'" + %Q{claude "$(cat #{prompt_file.shellescape})"}.gsub("'", "''") + "'"
     elsif task.empty?
       'claude'
     else

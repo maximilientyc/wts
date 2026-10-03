@@ -177,6 +177,62 @@ WTS_NO_ATTACH=1 "$WTS" "export users as csv" smoke >/dev/null
 check "name derived locally from a phrase" has_session export-users-csv
 check "phrase stored in the registry" \
   eval '[[ "$(reg_field export-users-csv prompt)" == "export users as csv" ]]'
+check "phrase written to .wts/prompt" \
+  eval '[[ "$(<"$WT/export-users-csv/.wts/prompt")" == "export users as csv" ]]'
+check "and ignored by git" eval '[[ -z "$(git -C "$WT/export-users-csv" status --porcelain)" ]]'
+
+# A long phrase reaches claude whole. The layout used to type `claude '<phrase>'`
+# into the pane before its shell was ready: the tty, still in canonical mode,
+# kept 1024 bytes of the line, the closing quote was lost and claude never
+# started. The built-in layout runs here with the stand-in named by absolute
+# path (the pane's login shell rebuilds PATH), which logs what it was given.
+cat > "$SANDBOX/claude-logger" <<EOF
+#!/bin/sh
+printf '%s' "\$*" > "$SANDBOX/claude-arg"
+exec sleep 3600
+EOF
+chmod +x "$SANDBOX/claude-logger"
+sed -e "s#{claude #{$SANDBOX/claude-logger #; s#\"claude #\"$SANDBOX/claude-logger #" \
+    -e "s#? 'claude' :#? '$SANDBOX/claude-logger' :#" \
+    -e 's#^name: #tmux_options: -f /dev/null\nname: #' \
+    "$ROOT/share/wts/layouts/default.yml" > "$XDG_CONFIG_HOME/wts/layouts/longp.yml"
+long=$(perl -e 'print join(" ", map { "step $_: keep the \$HOME, the `ticks` and \"quotes\" (it'"'"'s fine);" } 1..30)')
+claude_got() { # <text> — the stand-in was started with exactly that argument
+  local i
+  for i in {1..100}; do
+    [[ -s "$SANDBOX/claude-arg" ]] && break
+    sleep 0.1
+  done
+  [[ "$(cat "$SANDBOX/claude-arg" 2>/dev/null)" == "$1" ]]
+}
+check "the long phrase is over the tty's 1024-byte line" eval '(( ${#long} > 1024 ))'
+EDITOR=true WTS_NO_ATTACH=1 "$WTS" longp "$long" longp >/dev/null
+check "a long phrase reaches claude whole" claude_got "$long"
+"$WTS" rm longp -f >/dev/null
+rm -f "$SANDBOX/claude-arg"
+# The line each layout types, replayed in a shell: a path with a space and a
+# quote, and the context document's lead sentence before the phrase.
+mkdir -p "$SANDBOX/pf dir"
+print -r -- "it's a \$HOME test; ok" > "$SANDBOX/pf dir/it's"
+typed_arg() { # <layout> [env=value...] — what the claude pane receives as its argument
+  local layout="$1" out line
+  shift
+  out=$(env WTS_NAME=render WTS_ROOT="$SANDBOX" WTS_WORKDIR="$SANDBOX" WTS_RESTORE= WTS_DOC= \
+          WTS_PROMPT="it's a test; ok" WTS_PROMPT_FILE="$SANDBOX/pf dir/it's" "$@" \
+          tmuxinator debug --suppress-tmux-version-warning --project-config "$layout") || return 1
+  line=${${(M)${(f)out}:#*send-keys -t render:0.1 *}[1]}
+  line=${${line#*render:0.1 }% C-m}
+  [[ "$line" == *'$\(cat'* ]] || return 1     # read from the file, not typed
+  line=$(eval "print -r -- $line")              # the layer tmuxinator adds
+  zsh -fc "claude() { print -r -- \"\$*\" }; $line"
+}
+check "the default layout reads the phrase file, after the document's lead" eval '
+  [[ "$(typed_arg "$ROOT/share/wts/layouts/default.yml" WTS_DOC=.wts/context.md)" \
+     == "Read @.wts/context.md first, it is the context for this task. it'"'"'s a \$HOME test; ok" ]]'
+for ex in feature sentry; do
+  check "examples/$ex reads the phrase file" eval '
+    [[ "$(typed_arg "$ROOT/examples/layouts/$ex.yml")" == "it'"'"'s a \$HOME test; ok" ]]'
+done
 
 refute "missing layout fails" env WTS_NO_ATTACH=1 "$WTS" other nope
 refute "missing layout creates nothing" test -e "$WT/other"
