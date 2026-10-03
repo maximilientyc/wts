@@ -1068,6 +1068,7 @@ if [[ "$1" == "restore" ]]; then
     export WTS_WORKDIR="$workdir"
     export WTS_CONTEXT="$context"
     export WTS_PROMPT=""
+    export WTS_PROMPT_FILE=""
 
     # The context file lives in the worktree, which survives a reboot — but not
     # a `wts gc` husk sweep or a manual rm. Rebuilt from the cache, never
@@ -2326,6 +2327,24 @@ if (( ${#DOC_SLUGS} )) || (( ${#TASK_OPT} )); then
   fi
 fi
 
+# ─── The phrase, as a file ───────────────────────────────────────────────────
+# The layout used to type `claude '<phrase>'` into the pane, and tmuxinator
+# types it before the pane's shell is ready: the tty is still in canonical
+# mode, which keeps 1024 bytes of a line (MAX_CANON on macOS) and drops the
+# rest. A phrase of about 1 KB once escaped lost its closing quote, the shell
+# waited for it, and claude never started. The pane now reads the phrase from
+# this file (`claude "$(cat …)"`), a line of fixed length. Same directory and
+# ignore rule as the context document (wts-doc materialize).
+WTS_PROMPT_FILE=""
+if [[ -n "$PROMPT" ]] && mkdir -p "$worktree_path/.wts" 2>/dev/null; then
+  if [[ ! -f "$worktree_path/.wts/.gitignore" ]]; then
+    print -r -- '*' > "$worktree_path/.wts/.gitignore" 2>/dev/null || true
+  fi
+  if print -r -- "$PROMPT" > "$worktree_path/.wts/prompt" 2>/dev/null; then
+    WTS_PROMPT_FILE="$worktree_path/.wts/prompt"
+  fi
+fi
+
 # ─── tmuxinator ──────────────────────────────────────────────────────────────
 
 # Variables exposed to the YAML layout through ERB (ENV['WTS_*'])
@@ -2334,6 +2353,7 @@ export WTS_ROOT="$worktree_path"
 export WTS_WORKDIR="$WORKDIR"
 export WTS_CONTEXT="$CONTEXT"
 export WTS_PROMPT="$PROMPT"
+export WTS_PROMPT_FILE
 export WTS_DOC
 
 # ─── Registry ────────────────────────────────────────────────────────────────
