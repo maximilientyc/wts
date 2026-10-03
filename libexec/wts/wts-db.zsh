@@ -12,6 +12,8 @@
 #   task_docs    the context documents a task opens its sessions on
 #   task_links   which session serves which task, while the session lives
 #   archive      finished work: what `wts log` reports and nothing ever deletes
+#   agent_panes  the tmux pane each agent reported from its own hooks
+#   touches      the files each agent edited, relative to its worktree
 #
 # Why a database: the registry used to be one JSON file rewritten whole with
 # `jq … > tmp && mv` by bin/wts, wts-gc and wts-doc. Two writers at once lost one
@@ -24,7 +26,23 @@
 
 WTS_STATE_DIR="${WTS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wts}"
 WTS_DB="${WTS_DB:-$WTS_STATE_DIR/wts.db}"
-WTS_DB_SCHEMA=4
+WTS_DB_SCHEMA=5
+# Where the helpers are, for the few functions below that call one. Top level:
+# when this file is sourced, $0 is this file.
+WTS_DB_HOME="${0:A:h}"
+
+# What `wts setup claude --install` lets an agent run without a prompt, and what
+# `wts doctor` checks for: read-only verbs, plus the notes an agent writes. An
+# agent's first reflexes are `wts ls`, `wts task ls`, `wts doc ls`, and each one
+# used to wait on a permission prompt. Never rm, gc, stop, send or a creation:
+# those act on someone's work, and the user says yes to each.
+typeset -ga WTS_CLAUDE_ALLOW
+WTS_CLAUDE_ALLOW=(
+  "Bash(wts db:*)" "Bash(wts task note:*)" "Bash(wts task show:*)" "Bash(wts task ls:*)"
+  "Bash(wts status:*)" "Bash(wts ls:*)" "Bash(wts doc ls:*)" "Bash(wts doc show:*)"
+  "Bash(wts log:*)" "Bash(wts help:*)" "Bash(wts doctor:*)" "Bash(wts brief --cached:*)"
+  "Bash(wts wait:*)" "Bash(wts tail:*)"
+)
 
 db_available() {
   (( ${+commands[sqlite3]} ))
@@ -335,6 +353,28 @@ CREATE TABLE IF NOT EXISTS archive (
 );
 CREATE INDEX IF NOT EXISTS archive_by_finish ON archive(finished_at);
 CREATE INDEX IF NOT EXISTS archive_by_task   ON archive(task);
+-- The pane each agent runs in, as its own hooks saw it (TMUX_PANE in the
+-- agent's environment): exact, where the collector has to match a Claude
+-- session file to a pane and the pane's command is Claude Code's version
+-- number. What wts send and the switcher's reply type into. Kept with its
+-- session, dropped with it.
+CREATE TABLE IF NOT EXISTS agent_panes (
+  session        TEXT PRIMARY KEY,
+  claude_session TEXT NOT NULL DEFAULT '',
+  pane           TEXT NOT NULL,
+  at             INTEGER NOT NULL
+);
+-- Every file an agent edited (PostToolUse on Edit, Write, MultiEdit,
+-- NotebookEdit), relative to its worktree: two sessions of one repository
+-- touching the same relative path is the overlap the hook warns about. One row
+-- per session and path, the first time; at is that first time.
+CREATE TABLE IF NOT EXISTS touches (
+  session TEXT NOT NULL,
+  path    TEXT NOT NULL,
+  at      INTEGER NOT NULL,
+  PRIMARY KEY (session, path)
+);
+CREATE INDEX IF NOT EXISTS touches_by_path ON touches(path);
 $imports
 PRAGMA user_version = $WTS_DB_SCHEMA;
 COMMIT;"
@@ -533,6 +573,64 @@ task_attempts_md() {  # <task id> [<max attempts>]
   (( total > max )) && print -r -- "- ($(( total - max )) earlier: wts task show $id)"
   print -r -- ""
   return 0
+}
+
+# git's common directory of a repository root, cached per process: the one
+# definition of "same repository" (a session created from inside another
+# worktree records that worktree as its root, so repo_root alone is not it).
+typeset -gA _WTS_COMMON
+db_common_of() {  # <repo_root>
+  if [[ -z "${_WTS_COMMON[$1]+x}" ]]; then
+    _WTS_COMMON[$1]=$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+    [[ -n "${_WTS_COMMON[$1]}" ]] || _WTS_COMMON[$1]="$1"
+  fi
+  print -r -- "${_WTS_COMMON[$1]}"
+}
+
+# The other sessions of the same repository as <session>, newest first, one
+# name per line. What the SessionStart hook lists, what the note line and the
+# overlap warning are about: another repository's sessions cannot collide.
+db_repo_siblings() {  # <session>
+  local me="$1" mine name root out row
+  local -a f
+  mine=$(db_session_field "$me" repo_root)
+  [[ -n "$mine" ]] || return 0
+  mine=$(db_common_of "$mine")
+  out=$(db_rows "SELECT name, repo_root FROM sessions
+                 WHERE name != $(sql_str "$me") ORDER BY created_at DESC" 2>/dev/null)
+  for row in "${(@ps:\x1e:)out}"; do
+    f=("${(@ps:\x1f:)row}")
+    name="${f[1]:-}" root="${f[2]:-}"
+    [[ -n "$name" && -n "$root" ]] || continue
+    [[ "$(db_common_of "$root")" == "$mine" ]] && print -r -- "$name"
+  done
+  return 0
+}
+
+# The tmux pane of <session>'s Claude agent, or failure — never a guess. The
+# pane its hooks recorded, while it is still in that session; else the one the
+# collector matched from Claude Code's session file. Typing into the session's
+# active pane instead, as reply mode and `wts doc use` did, typed into the
+# editor of the default layout.
+agent_pane_of() {  # <session>
+  local p s
+  p=$(db_ro "SELECT pane FROM agent_panes WHERE session = $(sql_str "$1")" 2>/dev/null)
+  if [[ -n "$p" ]]; then
+    s=$(tmux display-message -p -t "$p" '#{session_name}' 2>/dev/null)
+    if [[ "$s" == "$1" ]]; then
+      print -r -- "$p"
+      return 0
+    fi
+  fi
+  if [[ -x "$WTS_DB_HOME/wts-status" ]] && command -v jq >/dev/null 2>&1; then
+    p=$("$WTS_DB_HOME/wts-status" --json --no-git "$1" 2>/dev/null \
+          | jq -r --arg n "$1" '.[] | select(.name == $n) | .agent_pane // empty' 2>/dev/null)
+    if [[ "$p" == *%* ]]; then
+      print -r -- "$p"
+      return 0
+    fi
+  fi
+  return 1
 }
 
 # The wts session the caller runs in, or failure. For `wts db` and the Claude

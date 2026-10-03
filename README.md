@@ -112,15 +112,19 @@ runs `command-alias` programs directly, without a shell, so neither `~` nor
 `PATH` lookups are reliable there. Homebrew paths point to the stable `opt/wts`
 location and survive `brew upgrade`.
 
-**Claude Code integration** (optional, recommended): five hooks. `SessionStart`
-tells every agent started in a wts session about the other sessions and about
-`wts db` — see [Agents share state](#agents-share-state-wts-db); the four
-others record what the agent reports about itself, which is what dates the
-states and rings when one needs you — see [When an agent needs you](#when-an-agent-needs-you).
+**Claude Code integration** (optional, recommended): six hooks, the
+permissions for wts's read-only verbs, and a skill. `SessionStart` tells every
+agent started in a wts session about the other sessions — see [Agents share
+state](#agents-share-state-wts-db); four others record what the agent reports
+about itself, which is what dates the states and rings when one needs you — see
+[When an agent needs you](#when-an-agent-needs-you); `PostToolUse` records the
+files it edits. The skill (`~/.claude/skills/wts/SKILL.md`) is what lets a
+Claude started *anywhere* find wts when you ask about parallel work — see
+[Driving wts from an agent](#driving-wts-from-an-agent).
 
 ```sh
 wts setup claude             # read it first
-wts setup claude --install   # adds it to ~/.claude/settings.json (backup kept)
+wts setup claude --install   # adds it to ~/.claude/settings.json (backup kept), writes the skill
 ```
 
 ## Quick start
@@ -138,26 +142,29 @@ wts rm auth-form -f                    # session + worktree + branch + registry 
 ## Usage
 
 ```
-wts <name> ["<phrase>"] [layout] [context...] [--doc <d>] [--task [<id>]]
-wts "<phrase>" [layout] [context...] [--doc <d>] [--task [<id>]]
-wts new [-p layout] [--doc <d>] [--task [<id>]] <name|"phrase">...
-wts doc add <url|path> | ls | show | sync | forget | use <slug> [name] | tools
+wts <name> ["<phrase>"] [layout] [context...] [--doc <d>] [--task [<id>]] [--detach] [--json]
+wts "<phrase>" [layout] [context...] [--doc <d>] [--task [<id>]] [--detach] [--json]
+wts new [-p layout] [--doc <d>] [--task [<id>]] [--detach] [--json] <name|"phrase">...
+wts doc add <url|path> | ls [--json] | show [--json] | sync | forget | use <slug> [name] | tools
 wts ls
 wts status [--json|--table|--fzf]
-wts brief [name...]
+wts brief [name...] | brief --cached [--json] [name...]
+wts send <name> <text...>
+wts wait <name>... [--until <state>,...] [--timeout <s>] [--json]
+wts tail <name> [-n <k>] [--json]
 wts restore [name...]
 wts stop <name>
 wts pr [name]
 wts rm <name> [-f]
-wts gc [--all] [--all-branches] [--apply] [--no-fetch] [--no-retro]
+wts gc [--all] [--all-branches] [--apply] [--no-fetch] [--no-retro] | gc [...] --json
 wts log [--since <when>] [--until <when>] [--task <id>] [--brief] [--no-notes] [--no-things]
 wts retro [name...] [--force] [--jobs <n>]
-wts task ls [--all] | show <id> | link [<id>] [name] | unlink [name] | new "<title>"
+wts task ls [--all] [--json] | show <id> [--json] | link [<id>] [name] | unlink [name] | new "<title>"
 wts task add [<id>] | note [<id>] "<text>" | note [<id>] --clear | edit [<id>]
 wts task doc [<id>] [<url|slug>] | doc [<id>] --rm <slug> | done [<id>]
 wts layouts
 wts keys
-wts doctor
+wts doctor [--json]
 wts db path | schema | sql "<SELECT ...>" | notes [--all] | get | set | del
 wts setup tmux [--install] | git | claude [--install]
 wts help [<command>] | wts <command> --help | wts version
@@ -903,12 +910,13 @@ that knowledge with the agents themselves.
 
 **Every agent is told, automatically.** `wts setup claude --install` adds a
 Claude Code `SessionStart` hook (user-wide, in `~/.claude/settings.json`), the
-four event hooks of [When an agent needs you](#when-an-agent-needs-you), and
-the permissions the block below asks the agent to use — `Bash(wts db:*)`,
-`wts task note`, `wts task show`, `wts status` — so no agent starts its work
-blocked on a prompt to allow `wts db notes --all`. In a wts session the
-`SessionStart` hook puts a short block at the top of the agent's context —
-again after `/clear`, `/compact` and a resume:
+four event hooks of [When an agent needs you](#when-an-agent-needs-you), a
+`PostToolUse` hook on edits, the permissions for wts's read-only verbs and the
+agent's own notes (`wts ls`, `wts status`, `wts task ls/show`, `wts doc ls/show`,
+`wts log`, `wts db`, `wts wait`, `wts tail`… never `rm`, `gc`, `stop`, `send` or
+a creation) so no agent starts its work blocked on a prompt, and the wts skill.
+In a wts session the `SessionStart` hook puts a short block at the top of the
+agent's context — again after `/clear`, `/compact` and a resume:
 
 ```
 # wts: you are in session `auth-form` (branch feature/auth-form, worktree …)
@@ -921,6 +929,7 @@ Previous attempts (newest first):
     resisted: the email check raced the CSRF token refresh
 Other sessions may serve the same task: `wts task show <id>` lists them.
 Add to it as you learn: `wts task note "<what you found>"` — it outlives this session.
+This session was linked at its creation, 2026-09-28. If the work has moved on to something else: `wts task link <id>`, or `wts task new "<title>"` then link it.
 
 Other agents work in parallel on this repository, one per wts session (a git
 worktree + a tmux session each). Their shared state is a SQLite database: …/wts.db
@@ -932,31 +941,43 @@ Sessions on this repository (newest first):
 Latest notes they left:
 - rate-limit/api-contract (2026-09-28T09:12:03Z): /login now answers 429 with Retry-After
 
-Query it when your work may overlap theirs (same files, same API, a shared
-migration), or when the user asks what the others are doing:
-  wts db notes --all        # every note the agents left
-  wts status --json         # live agent states (working, blocked, idle...)
-  wts db sql "<SELECT ...>" # anything else; wts db schema lists the tables
+Files you and another session have both edited:
+- src/api/limits.ts (also: rate-limit)
 
-Before you change a file, a migration, a schema or an API that one of the
-sessions above may also touch, read their notes. After a change another session
-depends on (a migration, a shared model, an API contract), leave one line, keyed
-by your session:
-  wts db set <key> "<one line>"     # also: wts db get <key>, wts db del <key>
-Only then: a note nobody needs is one more line every other agent reads.
+If you edit a file one of them also edits, wts tells you then. When your change
+affects them (a migration, a shared model, an API contract), leave one line:
+  wts db set <key> "<one line>"
+Everything else — their notes, live states, sending to or waiting for another
+agent — is in the wts skill (or: wts help).
 ```
 
-The task section is there when the session serves a [task](#a-task-is-where-the-context-lives).
-The rest is about the sessions **of the same repository** — another repository's
-cannot collide with this worktree, so they are not listed — eight at most, with
-their five latest notes. An agent alone on its repository gets one line instead
-of the sibling list and the directives. The task's own notes are cut at twelve
-lines. All of this is re-read at every start, `/clear`, `/compact` and resume,
-so it is kept to what can change what the agent does; `WTS_CONTEXT_QUIET=1` in
-the agent's environment keeps only the first line and the task's title.
+The task section is there when the session serves a [task](#a-task-is-where-the-context-lives),
+with how and when the link was made: a session keeps the task it was created
+for while the work moves on, and the agent can now tell. The rest is about the
+sessions **of the same repository** — another repository's cannot collide with
+this worktree, so they are not listed — eight at most, with their five latest
+notes and the files both sessions have edited. An agent alone on its repository
+gets one line instead. The task's own notes are cut at twelve lines. All of this
+is re-read at every start, `/clear`, `/compact` and resume, so it is kept to
+what can change what the agent does — the reference is the skill, loaded when
+needed; `WTS_CONTEXT_QUIET=1` in the agent's environment keeps only the first
+line and the task's title.
 
-Anywhere else — a Claude started outside wts — the hook prints nothing. It reads
-the database only: no `git status`, no model call, about 0.1 s.
+**The rest arrives when it happens.** Two hooks speak during the session, and
+only when there is something to say:
+
+- **At the start of a turn** (`UserPromptSubmit`): the notes the same
+  repository's other agents left since this agent's last turn, five at most —
+  a note written an hour after `SessionStart` used to reach nobody who did not
+  poll.
+- **After an edit** (`PostToolUse` on `Edit`, `Write`, `MultiEdit`,
+  `NotebookEdit`): the first time the agent edits a file another session of the
+  repository has edited too, the tool result says which session, on which
+  branch, since when. Every edited path is recorded in the `touches` table,
+  relative to the worktree, which is what makes the overlap exact.
+
+Anywhere else — a Claude started outside wts — the hooks print nothing. They
+read and write the database only: no `git status`, no model call, about 0.1 s.
 
 **What an agent (or you) can do:**
 
@@ -976,6 +997,49 @@ containing the working directory; `--session <name>` overrides it. `wts db sql`
 opens the database read-only and in sqlite3's safe mode (no `.shell`, no
 `ATTACH`, no `readfile`), so no query can damage the registry. `wts rm` and
 `wts gc` drop the notes of the sessions they remove.
+
+## Driving wts from an agent
+
+An agent can do what you do in the switcher, from its Bash tool — which has no
+terminal. Ask your Claude to "start three sessions on these tasks and tell me
+when they are done", and with the skill installed it knows how:
+
+```sh
+wts "add a --json flag to wts brief" --json      # {name, branch, worktree, task, …}, detached
+wts new -p default --json cors rate-limit        # several: an array
+wts wait cors rate-limit --timeout 90            # 0 once neither is working, 1 on timeout
+wts status --json | jq '.[] | {name, agent_state, agent_waiting_for}'
+wts send cors "1"                                # answer the question it is blocked on
+wts tail cors -n 3 --json                        # what it said last, from its transcript
+```
+
+- **Nothing waits on a terminal that is not there.** Without one on stdin, a
+  creation never attaches (`--detach` says so explicitly): from an agent's pane
+  it used to `switch-client` and move *your* terminal. Pickers and
+  confirmations exit 2 and name what to pass instead (`pass its id (wts task ls
+  --json)`), and Things is never read — macOS asks before another app's data is
+  read, and an agent is not you (`WTS_THINGS_FROM_SCRIPT=1` lets a cron job).
+- **JSON for every listing**, each with `"version": 1`, keys added and never
+  renamed: `wts status --json`, `wts task ls --json`, `wts task show <id>
+  --json`, `wts doc ls --json`, `wts doc show <slug> --json`, `wts brief
+  --cached --json` (the last summaries, no model call), `wts gc --json` (the dry
+  run's plan: what would go and why; never with `--apply`), `wts doctor --json`,
+  `wts wait --json`, `wts tail --json`, and a creation's `--json`.
+- **Exit codes**: 0 done, 1 failed (a session that did not come back, a wait
+  that timed out, a refused send), 2 usage (an unknown option, a typo of a
+  command, a picker with no terminal).
+- **`wts send`** types into the agent's own pane — the one its hooks recorded
+  from `$TMUX_PANE`, or the one the collector matched — and refuses when it does
+  not know it. The switcher's reply mode and `ctrl-e` follow the same rule: they
+  used to type into the session's active pane, the editor of the default layout.
+- **`wts wait`** returns after `--timeout` (90 s by default, under the two
+  minutes an agent's Bash tool gives a command): call it again to keep waiting.
+  `--until blocked,idle` waits for those states only.
+
+The skill (`wts setup claude --install` writes it, `wts doctor` checks it) is
+this section and the commands above, for the agent: when to read, when to
+delegate, and what to ask you before doing — `rm`, `stop`, `gc --apply`, and
+anything that calls the model.
 
 ## Upgrading to 1.0
 
@@ -1079,9 +1143,10 @@ locale (`LANG=C`), Ruby refuses to read them ("invalid byte sequence in US-ASCII
 | `WTS_NO_ARCHIVE`        | (none)                        | `1`: `wts rm` and `wts gc` archive nothing for `wts log` |
 | `WTS_ARCHIVE_TRANSCRIPT`| `1`                           | `0`: the archive points at the transcript without copying it |
 | `WTS_NO_THINGS`         | (none)                        | `1`: never read Things (a machine without it, or to keep the macOS prompt away) |
+| `WTS_THINGS_FROM_SCRIPT`| (none)                        | `1`: read Things without a terminal (a cron job); never set it for an agent |
 | `WTS_THINGS_DB`         | found in Things' container    | path of the Things database to read instead            |
 | `WTS_TASK_MAX_CHARS`    | `16000`                       | cap on a task's section of the context file            |
-| `WTS_CONTEXT_QUIET`     | (none)                        | `1`: the SessionStart hook says only who the agent is and its task |
+| `WTS_CONTEXT_QUIET`     | (none)                        | `1`: the SessionStart hook says only who the agent is and its task; the note line and the overlap warning are silent |
 | `WTS_DOCS_PATH`         | `~/.config/wts/docs.json`     | the context document library                           |
 | `WTS_DOC_TTL`           | `86400`                       | seconds before an attached URL document is fetched again |
 | `WTS_DOC_TIMEOUT`       | `90`                          | fetch timeout, seconds (MCP handshakes are slow)       |

@@ -12,11 +12,12 @@ EXAMPLES = $(wildcard examples/layouts/*.yml)
 .PHONY: install uninstall lint test bench demo
 
 install:
-	install -d "$(BINDIR)" "$(LIBEXECDIR)" "$(SHAREDIR)/layouts" "$(SHAREDIR)/examples/layouts" "$(ZSHCOMPDIR)"
+	install -d "$(BINDIR)" "$(LIBEXECDIR)" "$(SHAREDIR)/layouts" "$(SHAREDIR)/examples/layouts" "$(SHAREDIR)/skill" "$(ZSHCOMPDIR)"
 	install -m 755 bin/wts "$(BINDIR)/wts"
 	install -m 755 $(HELPERS) "$(LIBEXECDIR)/"
 	install -m 644 $(LAYOUTS) "$(SHAREDIR)/layouts/"
 	install -m 644 $(EXAMPLES) "$(SHAREDIR)/examples/layouts/"
+	install -m 644 share/wts/skill/SKILL.md "$(SHAREDIR)/skill/SKILL.md"
 	install -m 644 completions/_wts "$(ZSHCOMPDIR)/_wts"
 
 uninstall:

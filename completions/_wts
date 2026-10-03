@@ -267,6 +267,9 @@ _wts() {
       "ls:list registered sessions" \
       "status:session state (--json, --table, --fzf)" \
       "brief:where each session stands (done / next, by Claude)" \
+      "send:type a line into a session's agent" \
+      "wait:wait until sessions' agents stop working" \
+      "tail:a session agent's last messages" \
       "restore:restart sessions missing from tmux" \
       "stop:kill the tmux session only, keep the worktree" \
       "rm:remove session, worktree and branch" \
@@ -352,7 +355,35 @@ _wts() {
       fi ;;
 
     brief)
-      _wts_brief_targets ;;
+      if [[ $PREFIX == -* ]]; then
+        _wts_offer options option "" "--cached:the last summaries, no model call" \
+          "--json:with --cached, as JSON"
+      else
+        _wts_brief_targets
+      fi ;;
+
+    send|tail)
+      if (( CURRENT == 3 )); then
+        _wts_pr_targets
+      elif [[ ${words[2]} == tail && $PREFIX == -* ]]; then
+        _wts_offer options option "" "-n:how many messages" "--json:as JSON"
+      elif [[ ${words[2]} == send ]]; then
+        _wts_say "the line to type (free text)"
+      else
+        _wts_say "-n <k>, --json"
+      fi ;;
+
+    wait)
+      if [[ ${words[CURRENT-1]} == --until ]]; then
+        _wts_offer states state "" blocked working idle done failed stopped
+      elif [[ ${words[CURRENT-1]} == --timeout ]]; then
+        _wts_say "seconds (default 90)"
+      elif [[ $PREFIX == -* ]]; then
+        _wts_offer options option "" "--until:states to wait for (comma-separated)" \
+          "--timeout:seconds before giving up (default 90)" "--json:as JSON"
+      else
+        _wts_brief_targets
+      fi ;;
 
     pr)
       if (( CURRENT == 3 )); then
@@ -375,6 +406,8 @@ _wts() {
         opts+=("--all:every repository that has a session")
       (( ${before[(Ie)--all-branches]} )) ||
         opts+=("--all-branches:every local branch, not only those of wts sessions")
+      (( ${before[(Ie)--json]} || ${before[(Ie)--apply]} )) ||
+        opts+=("--json:the dry run's plan as JSON")
       _wts_offer flags option "no more options" "${opts[@]}" ;;
 
     log)
@@ -401,7 +434,8 @@ _wts() {
           "done:mark a local task done"
       elif [[ $PREFIX == -* ]]; then
         case ${words[3]} in
-          ls)   _wts_offer options option "" "--all:done tasks too" ;;
+          ls)   _wts_offer options option "" "--all:done tasks too" "--json:as JSON" ;;
+          show) _wts_offer options option "" "--json:as JSON" ;;
           note) _wts_offer options option "" "--clear:remove the notes added in wts" ;;
           doc)  _wts_offer options option "" "--rm:detach a document from the task" ;;
           *)    _wts_say "no option" ;;
@@ -480,12 +514,15 @@ _wts() {
         esac
       fi ;;
 
-    ls|layouts|keys|doctor|version)
+    ls|layouts|keys|version)
       _wts_say "no arguments" ;;
+
+    doctor)
+      _wts_offer flags option "no more options" "--json:as JSON" ;;
 
     help)
       if (( CURRENT == 3 )); then
-        _wts_offer commands "wts command" "" ls status brief restore stop rm pr doc db \
+        _wts_offer commands "wts command" "" ls status brief send wait tail restore stop rm pr doc db \
           gc log retro task new layouts keys doctor setup
       else
         _wts_say "no more arguments"
@@ -502,7 +539,9 @@ _wts() {
         _wts_offer options option "" \
           "-p:choose the layout (default: default)" \
           "--doc:attach a context document to every session (wts doc ls)" \
-          "--task:every session serves this task (wts task ls)"
+          "--task:every session serves this task (wts task ls)" \
+          "--detach:do not attach to the first one" \
+          "--json:print the sessions as JSON (detached)"
       elif (( CURRENT == 3 )); then
         _wts_offer flags option "" "-p:choose the layout (default: default)"
       else
@@ -523,7 +562,9 @@ _wts() {
         # would be Tab-inserted by reflex into a plain creation.
         _wts_offer options option "" \
           "--doc:attach a context document (wts doc ls)" \
-          "--task:the session serves a task (wts task ls)"
+          "--task:the session serves a task (wts task ls)" \
+          "--detach:start it without attaching" \
+          "--json:print the session as JSON (detached)"
       elif (( CURRENT == 3 )) ||
          { (( CURRENT == 4 )) && [[ ${(Q)words[3]} == *[[:space:]]* ]] }; then
         _wts_layouts

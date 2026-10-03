@@ -1,0 +1,187 @@
+#!/usr/bin/env zsh
+# wts-agent — drive another session's agent from a command: what the switcher
+# does with keys, for an agent that delegated work to other sessions.
+#
+# Usage: wts send <session> <text…>
+#        wts wait <session>… [--until <state>[,<state>…]] [--timeout <s>] [--json]
+#        wts tail <session> [-n <k>] [--json]
+#
+#   send   types <text> into the session's agent and submits it. Into the
+#          agent's own pane, from its hooks or the collector — refused when that
+#          pane is unknown, never typed into whatever pane is active.
+#   wait   returns once every named session's agent is in one of the states
+#          (default: anything but working — it stopped, finished, failed or
+#          needs someone), or after --timeout seconds (default 90: under the
+#          2 minutes an agent's Bash tool allows a command; call it again to
+#          keep waiting). Exit 0 when reached, 1 on timeout. States are those of
+#          `wts status --json`: blocked working idle done failed stopped.
+#   tail   the agent's last <k> messages (default 1), from its transcript — what
+#          it concluded, rather than a capture of a terminal UI.
+#
+# No model call, no git: wts-status --no-git for the states, the transcript
+# for the messages.
+
+set -uo pipefail
+
+WTS_BIN="${0:A:h}"
+source "$WTS_BIN/wts-db.zsh"
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+
+die() { print -u2 -r -- "wts $VERB: $1"; exit "${2:-1}" }
+
+VERB="${1:-}"
+(( $# )) && shift
+
+# A session wts knows, by its exact name: these verbs act on another agent, and
+# the typo tolerance of `stop` would send a message to the wrong one.
+need_session() {  # <name>
+  [[ -n "$1" ]] || die "a session name is required" 2
+  db_has_session "$1" || die "'$1' is not a wts session (wts ls)"
+}
+
+# ─── send ────────────────────────────────────────────────────────────────────
+
+cmd_send() {
+  local name="${1:-}"
+  (( $# )) && shift
+  need_session "$name"
+  local text="$*"
+  [[ -n "${text//[[:space:]]/}" ]] || die "nothing to send" 2
+  # One line: a newline in the middle would submit half of it.
+  text="${text//[[:cntrl:]]/ }"
+  local me=""
+  me=$(db_current_session 2>/dev/null) || me=""
+  [[ "$name" != "$me" ]] || die "'$name' is your own session"
+  local pane
+  pane=$(agent_pane_of "$name") \
+    || die "no agent pane known for '$name' (its agent has not run since wts recorded panes; wts status --json)"
+  "$WTS_BIN/wts-switch" --send "$pane" "$text" || die "could not type into $pane"
+  print -r -- "→ sent to the agent of '$name' ($pane)"
+}
+
+# ─── wait ────────────────────────────────────────────────────────────────────
+
+cmd_wait() {
+  local -a names
+  local until_states="" timeout=90 json=false
+  names=()
+  while (( $# )); do
+    case "$1" in
+      --until)     until_states="${2:-}"; shift ;;
+      --until=*)   until_states="${1#--until=}" ;;
+      --timeout)   timeout="${2:-}"; shift ;;
+      --timeout=*) timeout="${1#--timeout=}" ;;
+      --json)      json=true ;;
+      -*)          die "unknown option '$1'" 2 ;;
+      *)           names+=("$1") ;;
+    esac
+    shift
+  done
+  (( ${#names} )) || die "name at least one session" 2
+  [[ "$timeout" == <-> ]] || die "--timeout takes seconds" 2
+  local n s
+  for n in "${names[@]}"; do need_session "$n"; done
+  local -a wanted
+  wanted=(${(s:,:)until_states})
+  for s in "${wanted[@]}"; do
+    [[ "$s" == (blocked|working|idle|done|failed|stopped) ]] \
+      || die "unknown state '$s' (blocked working idle done failed stopped)" 2
+  done
+
+  zmodload zsh/datetime 2>/dev/null
+  local start=$EPOCHSECONDS st reached=false
+  local -A state
+  while :; do
+    st=$("$WTS_BIN/wts-status" --json --no-git "${names[@]}" 2>/dev/null)
+    reached=true
+    for n in "${names[@]}"; do
+      s=$(print -r -- "$st" | jq -r --arg n "$n" \
+            '.[] | select(.name == $n) | if .tmux_alive then (.agent_state // "unknown") else "stopped" end' 2>/dev/null)
+      state[$n]="${s:-unknown}"
+      if (( ${#wanted} )); then
+        (( ${wanted[(Ie)${state[$n]}]} )) || reached=false
+      else
+        [[ "${state[$n]}" != (working|unknown) ]] || reached=false
+      fi
+    done
+    $reached && break
+    (( EPOCHSECONDS - start >= timeout )) && break
+    sleep 2
+  done
+
+  if $json; then
+    for n in "${names[@]}"; do print -r -- "$n"$'\x1f'"${state[$n]}"; done \
+      | jq -Rc 'split("\u001f") | {name: .[0], state: .[1]}' \
+      | jq -sc --argjson r "$($reached && print true || print false)" \
+          --argjson w "$(( EPOCHSECONDS - start ))" '{version: 1, reached: $r, waited_s: $w, sessions: .}'
+  else
+    for n in "${names[@]}"; do print -r -- "$n ${state[$n]}"; done
+    $reached || print -u2 -r -- "wts wait: not reached after ${timeout}s; call it again to keep waiting"
+  fi
+  $reached
+}
+
+# ─── tail ────────────────────────────────────────────────────────────────────
+
+# The transcript of <session>'s agent: the conversation its hooks named, when
+# its file is there, else the newest one of the session's working directory.
+transcript_of() {  # <session>
+  local wt sub wd sid proj
+  wt=$(db_session_field "$1" worktree)
+  sub=$(db_session_field "$1" subdir)
+  wd="$wt"
+  [[ -n "$sub" && -d "$wt/$sub" ]] && wd="$wt/$sub"
+  proj="$CLAUDE_DIR/projects/${wd//[^a-zA-Z0-9]/-}"
+  sid=$(db_ro "SELECT claude_session FROM agent_panes WHERE session = $(sql_str "$1")" 2>/dev/null)
+  if [[ -z "$sid" ]]; then
+    sid=$(db_ro "SELECT claude_session FROM agent_events WHERE session = $(sql_str "$1")
+                 AND claude_session != '' ORDER BY at DESC, id DESC LIMIT 1" 2>/dev/null)
+  fi
+  if [[ "$sid" =~ '^[0-9a-f-]+$' && -f "$proj/$sid.jsonl" ]]; then
+    print -r -- "$proj/$sid.jsonl"
+    return 0
+  fi
+  local -a newest
+  newest=("$proj"/*.jsonl(N.om[1]))
+  (( ${#newest} )) || return 1
+  print -r -- "${newest[1]}"
+}
+
+cmd_tail() {
+  local name="" k=1 json=false
+  while (( $# )); do
+    case "$1" in
+      -n)     k="${2:-}"; shift ;;
+      -n*)    k="${1#-n}" ;;
+      --json) json=true ;;
+      -*)     die "unknown option '$1'" 2 ;;
+      *)      [[ -z "$name" ]] || die "one session at a time" 2; name="$1" ;;
+    esac
+    shift
+  done
+  need_session "$name"
+  [[ "$k" == <-> ]] && (( k > 0 )) || die "-n takes a count" 2
+  local tr
+  tr=$(transcript_of "$name") || die "no transcript for '$name' yet"
+  # The assistant's text blocks, newest last; tool calls and thinking left out:
+  # what the agent said, not what it did on the way.
+  local msgs
+  msgs=$(jq -c 'select(.type == "assistant")
+                | {at: (.timestamp // ""),
+                   text: ([.message.content[]? | select(.type == "text") | .text] | join("\n"))}
+                | select(.text != "")' "$tr" 2>/dev/null | tail -n "$k")
+  if $json; then
+    print -r -- "$msgs" | jq -sc --arg s "$name" --arg t "$tr" \
+      '{version: 1, session: $s, transcript: $t, messages: .}'
+    return 0
+  fi
+  [[ -n "$msgs" ]] || { print -r -- "(no message from the agent yet)"; return 0 }
+  print -r -- "$msgs" | jq -r '"── \(.at)\n\(.text)\n"'
+}
+
+case "$VERB" in
+  send) cmd_send "$@" ;;
+  wait) cmd_wait "$@" ;;
+  tail) cmd_tail "$@" ;;
+  *) print -u2 "usage: wts send|wait|tail …"; exit 2 ;;
+esac

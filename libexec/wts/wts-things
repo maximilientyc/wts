@@ -29,7 +29,8 @@
 #   * status: 0 open, 2 canceled, 3 completed. type: 0 task, 1 project, 2 heading.
 #
 # Variables: WTS_THINGS_DB (override the path; how the test suite gets a
-#            fixture), WTS_NO_THINGS=1 (behave as if Things were not installed)
+#            fixture), WTS_NO_THINGS=1 (behave as if Things were not installed),
+#            WTS_THINGS_FROM_SCRIPT=1 (read it without a terminal, see below)
 
 set -uo pipefail
 
@@ -325,6 +326,20 @@ cmd_pick() {
 if [[ "${1:-}" == "available" ]]; then
   cmd_available "${2:-}"
   exit $?
+fi
+
+# From a terminal only. A Claude agent's Bash tool has none, and an agent ran
+# this freely: the SessionStart hook tells every agent `wts task show <id>`,
+# `setup claude` allows it without a prompt, and its snapshot read Things — the
+# privileged read CLAUDE.md reserves for a command the user typed, with the
+# macOS dialog it raises, on behalf of an agent the user was not watching.
+# Stdin AND stderr, as for every picker: a captured stdout is still a person.
+# Exit 3, before the probe, so the refusal is never cached as "unavailable".
+# A fixture (WTS_THINGS_DB) is not privileged; a cron job can opt in.
+if [[ -z "${WTS_THINGS_DB:-}${WTS_NO_THINGS:-}${WTS_THINGS_FROM_SCRIPT:-}" ]] \
+   && ! [[ -t 0 && -t 2 ]]; then
+  print -u2 -r -- "Things is read from a terminal only (macOS asks before another app's data is read); from a script: WTS_THINGS_FROM_SCRIPT=1"
+  exit 3
 fi
 
 # Every other verb reads Things for real, and records what it found for the
