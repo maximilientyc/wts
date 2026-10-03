@@ -1,9 +1,19 @@
 #!/usr/bin/env zsh
 # wts-gc — garbage collector for worktrees, branches and registry entries.
 #
-# Usage: wts gc [--all] [--apply] [--no-fetch] [--no-retro]
+# Usage: wts gc [--all] [--all-branches] [--apply] [--no-fetch] [--no-retro]
 #
 # Default: DRY RUN. Nothing is deleted without --apply.
+#
+# Default scope: what wts made. A branch is considered only when a session of
+# this repository had it (the registry, or the archive of finished sessions),
+# and a husk folder only when it bears the name of such a session. gc used to
+# classify EVERY local branch: a local `develop` fully contained in `main` was
+# `branch -D`'d, a worktree made by hand on a merged branch was removed, and any
+# folder without `.git` under a shared WTS_WORKTREES_BASE was offered for
+# `rm -rf`. The dry run listed it all, so it was a choice and not a bug — but
+# the wrong default for a tool that only made some of them. --all-branches is
+# the old scope, for a repository where every branch is disposable.
 #
 # --all runs the same gc, unchanged, once per repository that has a registered
 # session, from that repository's main worktree. Without it, a repository you
@@ -71,6 +81,7 @@ APPLY=false
 FETCH=true
 RETRO=true
 ALL=false
+ALL_BRANCHES=false
 WTS_BIN="${0:A:h}"
 WTS_GC="${0:A}"
 typeset -a pass=()
@@ -80,8 +91,9 @@ while [[ $# -gt 0 ]]; do
     --no-fetch) FETCH=false; pass+=("$1") ;;
     --no-retro) RETRO=false; pass+=("$1") ;;
     --dry-run)  pass+=("$1") ;;
+    --all-branches) ALL_BRANCHES=true; pass+=("$1") ;;
     --all)      ALL=true ;;
-    *) print -u2 "wts gc: unknown option '$1' (--all, --apply, --no-fetch, --no-retro)"; exit 2 ;;
+    *) print -u2 "wts gc: unknown option '$1' (--all, --all-branches, --apply, --no-fetch, --no-retro)"; exit 2 ;;
   esac
   shift
 done
@@ -157,6 +169,11 @@ fi
 
 print "Garbage collection — $repo_name (base: ${base:-?})"
 $APPLY && print "Mode: DELETE" || print "Mode: dry run (--apply to execute)"
+if $ALL_BRANCHES; then
+  print "Scope: every local branch (--all-branches)"
+else
+  print "Scope: the branches of wts sessions (--all-branches for every one)"
+fi
 
 # ─── Sync with the remote ────────────────────────────────────────────────────
 # Without --prune, a branch deleted on origin keeps its local tracking ref and
@@ -456,6 +473,35 @@ if [[ -x "${0:A:h}/wts-status" ]] && command -v jq >/dev/null 2>&1; then
     | "\(.worktree)\(if .stale == true then "stuck?" else .agent_state end)"' 2>/dev/null)
 fi
 
+# ─── Scope ───────────────────────────────────────────────────────────────────
+# The branches and session names wts has had in THIS repository: live sessions,
+# and the archive, which outlives them (a branch whose session `wts rm` removed
+# keeps its row there). Same repository = same git common directory, as in
+# --all above; a root that no longer exists is matched by path instead.
+typeset -A known_branch known_name
+foreign_branches=0
+foreign_husks=0
+if ! $ALL_BRANCHES && db_available; then
+  this_common=$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+  typeset -A common_cache
+  while IFS=$'\x1f' read -r -d $'\x1e' n b root; do
+    [[ -n "$root" ]] || continue
+    if [[ -d "$root" ]]; then
+      if [[ -z "${common_cache[$root]+x}" ]]; then
+        common_cache[$root]=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+      fi
+      [[ -n "$this_common" && "${common_cache[$root]:A}" == "${this_common:A}" ]] || continue
+    else
+      [[ "$root" == "$repo_root" || "$root" == "${worktree_base:A}"/* ]] || continue
+    fi
+    [[ -n "$b" ]] && known_branch[$b]=1
+    [[ -n "$n" ]] && known_name[$n]=1
+  done < <(db_rows "SELECT name, branch, repo_root FROM sessions
+                    UNION SELECT session, branch, repo_root FROM archive" 2>/dev/null)
+fi
+wts_branch() { $ALL_BRANCHES || (( ${+known_branch[$1]} )) }
+wts_folder() { $ALL_BRANCHES || (( ${+known_name[${1:t}]} )) }
+
 # Outside tmux, `display-message` falls back to the most recently used session,
 # which would then be spared as if it were the one running this command. Only
 # a real client has a current session.
@@ -477,6 +523,10 @@ for d in "${candidates[@]}"; do
   # A `.git` (file for a worktree, folder for a repository) => hands off.
   [[ -e "$d/.git" ]] && continue
   is_live "$d" && continue
+  if ! wts_folder "$d"; then
+    (( foreign_husks++ ))
+    continue
+  fi
   husks+=("$d")
 done
 
@@ -491,6 +541,8 @@ if (( ${#husks} )); then
 else
   print "Husk folders: none"
 fi
+(( foreign_husks )) \
+  && print "  ($foreign_husks other folder(s) without .git, not named after a wts session: --all-branches)"
 print ""
 
 # ─── Classifying branches ────────────────────────────────────────────────────
@@ -508,6 +560,10 @@ if [[ -n "$base" ]]; then
     && print -u2 "→ classifying ${#all_branches} local branches…"
   for b in "${all_branches[@]}"; do
     [[ -n "$b" && "$b" != "$base" ]] || continue
+    if ! wts_branch "$b"; then
+      (( foreign_branches++ ))
+      continue
+    fi
 
     if content_merged "$b"; then
       if is_new_branch "$b"; then
@@ -575,6 +631,8 @@ else
   print "Dead branches without a worktree: none"
 fi
 (( ${#new_branches} )) && print "New branches without commits, left alone: ${(j:, :)new_branches}"
+(( foreign_branches )) \
+  && print "Other branches, not made by a wts session, not looked at: $foreign_branches (--all-branches)"
 print ""
 
 # ─── 4. Orphan branches ──────────────────────────────────────────────────────
@@ -712,6 +770,11 @@ for rec in "${teardown[@]}"; do
 done
 if (( to_archive )); then
   print "To archive (kept for wts log): $to_archive session(s)"
+  # Said before --apply, once: the dry run is where a cost can still be declined.
+  if ! $APPLY && $RETRO && [[ -z "${WTS_NO_LLM:-}" ]] && command -v claude >/dev/null 2>&1; then
+    print "  --apply then asks Claude for $to_archive retrospective(s): one ${WTS_MODEL:-haiku} call each,"
+    print "  ${WTS_RETRO_JOBS:-3} at a time, after the teardown (--no-retro: none now, wts retro later)"
+  fi
   print ""
 fi
 
@@ -761,10 +824,10 @@ for rec in "${teardown[@]}"; do
     # Only now: an archive row means "this work ended", and a worktree that
     # could not be removed has not ended.
     if [[ -n "$sess" && -s "$retro_tmp/$sess.facts" ]]; then
-      if "$WTS_BIN/wts-retro" store "$sess" < "$retro_tmp/$sess.facts" 2>/dev/null; then
+      if store_err=$("$WTS_BIN/wts-retro" store "$sess" < "$retro_tmp/$sess.facts" 2>&1 >/dev/null); then
         archived+=("$sess")
       else
-        print -u2 "⚠ $sess: not archived"
+        print -u2 -r -- "⚠ $sess: not archived${store_err:+: ${${(f)store_err}[1]}}"
       fi
     fi
     [[ -n "$sess" ]] && purge+=("$sess")
@@ -814,17 +877,19 @@ purge=("${(@u)purge}")
 # sessions removed some other way, and pane hashes no agent has refreshed in a
 # week (Claude session ids are never reused).
 if db_available && [[ -s "$WTS_DB" ]]; then
-  if db_q "BEGIN IMMEDIATE;
+  if db_err=$(db_q "BEGIN IMMEDIATE;
            DELETE FROM sessions WHERE name IN $(sql_list "${purge[@]}");
            DELETE FROM briefs WHERE session NOT IN (SELECT name FROM sessions);
            DELETE FROM notes WHERE session NOT IN (SELECT name FROM sessions);
            DELETE FROM task_links WHERE session NOT IN (SELECT name FROM sessions);
            DELETE FROM agent_events WHERE session NOT IN (SELECT name FROM sessions);
            DELETE FROM pane_hashes WHERE since < unixepoch() - 7 * 86400;
-           COMMIT;" >/dev/null 2>&1; then
+           COMMIT;" 2>&1 >/dev/null); then
     (( ${#purge} )) && print "✓ registry: ${#purge} entry(ies) removed"
   else
-    print -u2 "⚠ registry not updated"
+    # sqlite3's reason: "database is locked" and "no such function: unixepoch"
+    # (SQLite before 3.38) call for different fixes.
+    print -u2 -r -- "⚠ registry not updated${db_err:+: ${${(f)db_err}[1]}}"
   fi
 fi
 

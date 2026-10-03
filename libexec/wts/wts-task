@@ -31,7 +31,7 @@
 # wts at a Things task once with `wts task add` and it becomes a known row.
 #
 # A task is a LABEL, not a folder: `wts ls` and the switcher stay one flat list
-# of sessions with a `*` on the linked ones, because the switcher is
+# of sessions with an `@` on the linked ones, because the switcher is
 # width-constrained and nesting would cost the one view that has to stay
 # scannable. The grouped view is this command.
 #
@@ -457,6 +457,13 @@ cmd_unlink() {
     print -u2 -r -- "wts task unlink: not inside a wts session, name one"
     return 1
   }
+  # `wts task unlink notasession` said "→ notasession serves no task" and exited
+  # 0: true, and useless — the typo went unnoticed and the real link stayed.
+  if ! db_has_session "$session" \
+     && [[ -z "$(db_ro "SELECT 1 FROM task_links WHERE session = $(sql_str "$session")" 2>/dev/null)" ]]; then
+    print -u2 -r -- "wts task unlink: '$session' is not a session (wts ls)"
+    return 1
+  fi
   db_q "DELETE FROM task_links WHERE session = $(sql_str "$session")" >/dev/null 2>&1
   print -r -- "→ $session serves no task"
 }

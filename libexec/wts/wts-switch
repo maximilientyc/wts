@@ -14,7 +14,7 @@
 #   ctrl-r   reload the list by hand
 #   ctrl-d   delete the session (wts rm) and reload
 #            on a local task: mark it done (wts task done), after a y/N prompt
-#   ctrl-x   kill the tmux session only (wts stop), after a y/N prompt
+#   ctrl-x   stop the session: its tmux session only (wts stop), after a y/N prompt
 #   ctrl-o   open the session's pull request on GitHub (wts pr, needs gh)
 #   ctrl-e   attach a context document to the session, or to the task
 #   ctrl-t   new task: type its title, enter creates it (wts task new);
@@ -151,7 +151,7 @@ emit() {
 #
 # A task a session already serves stays listed, after the ones still to start,
 # with the count of its sessions in SUBJECT. It was hidden once, as a duplicate
-# of that session's `*` row, and that hid the only way to start a second session
+# of that session's `@` row, and that hid the only way to start a second session
 # on it: `enter` on the task row. Only tasks wts already holds — one query on
 # its own database, no `wts-things`, no git, no model, because this runs inside
 # the 2-second refresh. `ctrl-t` is how a Things
@@ -901,8 +901,10 @@ fit_preview() { # $1 = cursor target, $2 = cursor name ; prints the action, or n
   fi
 }
 
-# ─── Kill ────────────────────────────────────────────────────────────────────
-# ctrl-x: `wts stop` on the selected row, after a y/N prompt. Runs under fzf's
+# ─── Stop ────────────────────────────────────────────────────────────────────
+# ctrl-x: `wts stop` on the selected row, after a y/N prompt. "Stop" in every
+# word the user reads — the prompt, the footer, the CLI — where the popup used to
+# say "kill" and the CLI "stop" for the same thing. Runs under fzf's
 # `execute`, which talks to /dev/tty directly, so the prompt reads the keyboard
 # with no redirection. fzf redraws the instant the command exits: a message
 # that is not followed by a key wait is never seen.
@@ -917,7 +919,7 @@ wait_key() {
   read -k1 -s junk
 }
 
-kill_session() { # $1 = session name, $2 = display line (its 2nd word is AGENT)
+stop_session() { # $1 = session name, $2 = display line (its 2nd word is AGENT)
   local name="$1" line="${2:-}" cur agent=""
   [[ -n "$name" ]] || return 0   # `execute` also fires on an empty list
 
@@ -929,7 +931,7 @@ kill_session() { # $1 = session name, $2 = display line (its 2nd word is AGENT)
   # here and not left to `wts stop`: nobody should be asked y/N for a refusal.
   cur=$(tmux display-message -p '#S' 2>/dev/null)
   if [[ "$name" == "$cur" ]]; then
-    print -r -- "wts: '$name' is the current session, not killed (switch away first) — any key"
+    print -r -- "wts: '$name' is the current session, not stopped (switch away first) — any key"
     wait_key
     return 0
   fi
@@ -941,7 +943,7 @@ kill_session() { # $1 = session name, $2 = display line (its 2nd word is AGENT)
     blocked|working|idle|done|failed|stopped|stuck\?|-) agent="${cols[2]}" ;;
   esac
 
-  if ! read -q "?Kill tmux session '$name'${agent:+ (agent: $agent)}? Worktree and registry are kept. [y/N] "; then
+  if ! read -q "?Stop session '$name'${agent:+ (agent: $agent)}? Its tmux session closes; worktree and registry are kept. [y/N] "; then
     print
     return 0
   fi
@@ -997,7 +999,7 @@ remove_session() { # $1 = session name, $2 = preview target, $3 = display line
     wait_key
     return 0
   fi
-  # Same guard as kill_session: nobody should be asked y/N for a refusal.
+  # Same guard as stop_session: nobody should be asked y/N for a refusal.
   cur=$(tmux display-message -p '#S' 2>/dev/null)
   if [[ "$name" == "$cur" ]]; then
     print -r -- "wts: '$name' is the current session, not removed (switch away first) — any key"
@@ -1023,7 +1025,7 @@ remove_session() { # $1 = session name, $2 = preview target, $3 = display line
 
 # ctrl-d on a task. A Things task is only explained, not closed: it is completed
 # in Things, and `wts task done` would refuse it anyway — asking y/N first for a
-# refusal is what kill_session avoids too. The source is read here for that
+# refusal is what stop_session avoids too. The source is read here for that
 # reason, from wts's own database; Things itself is not opened.
 close_task() { # $1 = task id
   local id="$1" src title
@@ -1054,7 +1056,7 @@ close_task() { # $1 = task id
 # ctrl-e: `wts doc use` on the selected row, under `execute` like ctrl-o. With
 # no slug it opens the library picker, an inner fzf: `execute` hands over the
 # alternate screen and blocks this one until it exits — the same terminal
-# kill_session reads its y/N from. It always waits for a key: unlike ctrl-o,
+# stop_session reads its y/N from. It always waits for a key: unlike ctrl-o,
 # nothing else takes the focus, and what was attached is worth reading.
 #
 # On a task row the document goes on the TASK instead, which is the difference
@@ -1349,8 +1351,8 @@ if [[ "${1:-}" == "--fit" ]]; then
   exit 0
 fi
 
-if [[ "${1:-}" == "--kill" ]]; then
-  kill_session "${2:-}" "${3:-}"
+if [[ "${1:-}" == "--stop" ]]; then
+  stop_session "${2:-}" "${3:-}"
   exit 0
 fi
 
@@ -1557,15 +1559,15 @@ rm -f "$WTS_SWITCH_REPLY" "$WTS_SWITCH_FOCUS"
 
 # ctrl-d and ctrl-x: without a resolvable wts, the binds would fail silently in
 # the popup. fzf quotes {1} and {3} itself; {1} is the display line, from which
-# --kill reads the agent state shown to the user.
-typeset -a delete_bind kill_bind
+# --stop reads the agent state shown to the user.
+typeset -a delete_bind stop_bind
 delete_bind=()
-kill_bind=()
+stop_bind=()
 if [[ -n "$WTS_CMD" ]]; then
   # Through --rm and not `wts rm {3}` directly: see remove_session for why an
   # empty {3} must never reach `wts rm`.
   delete_bind=(--bind="ctrl-d:execute('$self' --rm {3} {2} {1})+reload('$self' --list)")
-  kill_bind=(--bind="ctrl-x:execute('$self' --kill {3} {1})+reload('$self' --list)")
+  stop_bind=(--bind="ctrl-x:execute('$self' --stop {3} {1})+reload('$self' --list)")
 fi
 
 # ctrl-o: `wts pr` needs gh. Without it the key is not bound, and wts-keys reads
@@ -1725,7 +1727,7 @@ selection=$(print -r -- "$list" | fzf \
   --preview-window="right,${preview_cols},border-left" \
   --bind="ctrl-r:reload('$self' --list)" \
   "${delete_bind[@]}" \
-  "${kill_bind[@]}" \
+  "${stop_bind[@]}" \
   "${pr_bind[@]}" \
   "${doc_bind[@]}" \
   "${things_bind[@]}" \

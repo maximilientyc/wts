@@ -5,32 +5,39 @@
 #        wts <name> "<phrase>" [layout] [context...]
 #        wts "<phrase>" [layout] [context...]
 #        wts new [-p layout] <name|"phrase"...>
-#        wts doc add <url|path> | ls | show | sync | rm | use <slug> [session]
+#        wts doc add <url|path> | ls | show | sync | forget | use <slug> [session] | tools
 #        wts ls | wts status [--json|--table|--fzf]
 #        wts brief [name...]
 #        wts restore [name...]
 #        wts stop <name>
 #        wts pr [name]
 #        wts rm <name> [-f]
-#        wts gc [--all] [--apply] [--no-fetch] [--no-retro]
-#        wts log [--since <when>] [--until <when>] [--brief] [--no-notes]
-#        wts retro [name...] [--force]
-#        wts task ls | show <id> | link [<id>] [session] | unlink | new "<title>"
-#        wts task add [<id>] | note [<id>] "<text>" | edit [<id>] | doc [<id>] [<doc>]
-#        wts task done [<id>]
+#        wts gc [--all] [--all-branches] [--apply] [--no-fetch] [--no-retro]
+#        wts log [--since <when>] [--until <when>] [--task <id>] [--brief]
+#                [--no-notes] [--no-things]
+#        wts retro [name...] [--force] [--jobs <n>]
+#        wts task ls [--all] | show <id> | link [<id>] [session] | unlink [session]
+#        wts task new "<title>" | add [<id>] | edit [<id>] | done [<id>]
+#        wts task note [<id>] "<text>" | note [<id>] --clear
+#        wts task doc [<id>] [<doc>] | doc [<id>] --rm <slug>
 #        wts layouts
 #        wts keys
-#        wts setup tmux | git | claude [--install]
+#        wts doctor
+#        wts setup tmux [--install] | git | claude [--install]
 #        wts db path | schema | sql "<SELECT>" | notes [--all] | get | set | del
-#        wts help | wts version
+#        wts help | wts version | wts <command> --help
 #
 #   <name>     : name of the worktree AND of the tmux session
 #   <phrase>   : the task in plain words, quoted; Claude starts with it.
-#                Without <name>, Claude proposes the name (a few seconds)
+#                Without <name>, Claude proposes the name (a few seconds;
+#                Ctrl-C takes the name derived locally instead)
 #   [layout]   : tmuxinator layout (default: default), see `wts layouts`
 #   [context]  : exposed to the layout as $WTS_CONTEXT
 #   --doc <d>  : attach a context document (a slug of `wts doc ls`, a URL or a
 #                markdown file); repeatable, and bare --doc at the end picks one
+#   --task <t> : the session serves this task (`wts task ls`): its notes and
+#                documents become the agent's context; bare --task at the end
+#                picks one. Both options work with `new` too
 #
 #   new        : create several sessions at once, then attach to the first
 #   ls         : list registered sessions and their state (agent, git delta)
@@ -49,7 +56,9 @@
 #   gc         : clean up from the remote: worktrees and branches whose PR is
 #                merged (squash included) or whose remote branch is gone,
 #                plus any stale index.lock blocking writes in a worktree.
-#                --apply also archives what it tears down, for `wts log`;
+#                Only the branches wts created, unless --all-branches.
+#                --apply also archives what it tears down, for `wts log`, and
+#                asks Claude for one retrospective each (--no-retro: none);
 #                --all does every repository that has a session
 #   log        : the work journal as JSON: every finished session with its
 #                outcome, its diff, its retrospective and a pointer to its
@@ -61,7 +70,11 @@
 #                hands over the task's notes and documents as context
 #   layouts    : list available layouts (yours shadow the built-in ones)
 #   keys       : switcher keys and tmux bindings (the popup shows them too)
-#   setup tmux : print the tmux.conf snippet (switcher popup, `wts` command)
+#   doctor     : check what wts needs (tmux, tmuxinator, fzf, claude, ...) and
+#                that the tmux snippet and the Claude hooks are installed and
+#                current
+#   setup tmux : print the tmux.conf snippet (switcher popup, `wts` command);
+#                --install writes it into ~/.tmux.conf, replacing an older one
 #   setup git  : print the two git settings that keep `wts ls` fast on a large repository
 #   setup claude : print (--install: add) the Claude Code hook that tells every
 #                agent in a wts session about the others and about `wts db`
@@ -129,7 +142,8 @@ registry_init() {
 registry_put() {
   registry_available || return 0
   registry_init || return 0
-  if ! db_q "INSERT INTO sessions
+  local err
+  if ! err=$(db_q "INSERT INTO sessions
       (name, profile, repo_root, worktree, branch, subdir, context, prompt, docs, created_at)
     VALUES ($(sql_str "$1"), $(sql_str "$2"), $(sql_str "$3"), $(sql_str "$4"),
             $(sql_str "$5"), $(sql_str "$6"), $(sql_str "$7"), $(sql_str "${8:-}"),
@@ -140,8 +154,10 @@ registry_put() {
       subdir = excluded.subdir, context = excluded.context,
       prompt = CASE WHEN excluded.prompt = '' THEN sessions.prompt ELSE excluded.prompt END,
       docs = CASE WHEN json_array_length(excluded.docs) = 0 THEN sessions.docs ELSE excluded.docs END" \
-      >/dev/null; then
-    echo "⚠ registry not updated ($WTS_DB)" >&2
+      2>&1 >/dev/null); then
+    # sqlite3's own reason ("database is locked", "readonly database", a full
+    # disk): "not updated" alone sent people to look at the wrong thing.
+    echo "⚠ registry not updated ($WTS_DB)${err:+: $(first_line "$err")}" >&2
   fi
 }
 
@@ -232,6 +248,29 @@ attach_or_switch() {
   exec tmux attach -t "=$1"
 }
 
+# Edit distance, for awk: lev(a, b) counts insertions, deletions, substitutions
+# and a swap of two adjacent letters as one edit each (optimal string
+# alignment). The swap matters: `wts lsit` is one slip of the fingers, and plain
+# Levenshtein counts it as two. Shared by the name resolver below and by the
+# typo guard of the normal flow, which must agree on what "close" means.
+WTS_LEV_AWK='
+  function lev(a, b,   la, lb, i, j, c, x, y, z, d) {
+    la = length(a); lb = length(b)
+    for (i = 0; i <= la; i++) d[i, 0] = i
+    for (j = 0; j <= lb; j++) d[0, j] = j
+    for (i = 1; i <= la; i++)
+      for (j = 1; j <= lb; j++) {
+        c = (substr(a, i, 1) == substr(b, j, 1)) ? 0 : 1
+        x = d[i-1, j] + 1; y = d[i, j-1] + 1; z = d[i-1, j-1] + c
+        d[i, j] = (x < y ? (x < z ? x : z) : (y < z ? y : z))
+        if (i > 1 && j > 1 && substr(a, i, 1) == substr(b, j-1, 1) \
+            && substr(a, i-1, 1) == substr(b, j, 1) && d[i-2, j-2] + 1 < d[i, j])
+          d[i, j] = d[i-2, j-2] + 1
+      }
+    return d[la, lb]
+  }
+'
+
 # Resolve an approximate name to a registry key.
 # Writes the chosen name on stdout, messages on stderr.
 # Why: `wts rm` matches the literal string, and a typo (`rm auth-fom`) used to
@@ -276,19 +315,7 @@ registry_resolve_name() {
   # Fallback 2: edit distance. fzf matches subsequences, so it does NOT see an
   # extra character (auth-foorm vs auth-form).
   if (( ${#cands} == 0 )); then
-    cands=("${(@f)$(print -rl -- "${keys[@]}" | awk -v q="$want" '
-      function lev(a, b,   la, lb, i, j, c, x, y, z, d) {
-        la = length(a); lb = length(b)
-        for (i = 0; i <= la; i++) d[i, 0] = i
-        for (j = 0; j <= lb; j++) d[0, j] = j
-        for (i = 1; i <= la; i++)
-          for (j = 1; j <= lb; j++) {
-            c = (substr(a, i, 1) == substr(b, j, 1)) ? 0 : 1
-            x = d[i-1, j] + 1; y = d[i, j-1] + 1; z = d[i-1, j-1] + c
-            d[i, j] = (x < y ? (x < z ? x : z) : (y < z ? y : z))
-          }
-        return d[la, lb]
-      }
+    cands=("${(@f)$(print -rl -- "${keys[@]}" | awk -v q="$want" "$WTS_LEV_AWK"'
       BEGIN { max = int(length(q) / 4); if (max < 2) max = 2 }
       { d = lev(tolower(q), tolower($0)); if (d <= max) print d "\t" $0 }
     ' | sort -n | cut -f2- | head -5)}")
@@ -379,6 +406,35 @@ usage() {
   sed -n '3,/^$/p' "$WTS_SELF" | sed 's/^# \{0,1\}//'
 }
 
+# start_detached <layout file> <session> — tmuxinator with nothing on the
+# terminal, and on failure its own first line on ours. `restore` and `new` sent
+# its output to /dev/null and said "tmuxinator failed to start", which left a
+# YAML error or a dead tmux server to be found by running tmuxinator by hand.
+# Both streams are read: tmuxinator prints "Failed to parse config file" on
+# STDOUT, and its stderr is where tmux and the shell complain.
+start_detached() {
+  local err rc=0
+  # `|| rc=$?` and not `if …; then`: after the `if`, $? is the if's own status.
+  err=$(tmuxinator start --project-config "$1" --name "$2" --no-attach \
+          --suppress-tmux-version-warning </dev/null 2>&1) || rc=$?
+  (( rc )) || return 0
+  # A tmuxinator that cannot run at all says nothing: a version manager's shim
+  # whose Ruby is not found exits 126 in silence. The status is then the reason.
+  err=$(first_line "$err")
+  [[ -n "$err" ]] || err="exit status $rc (does \`tmuxinator version\` run? wts doctor)"
+  print -u2 -r -- "⚠ $2: tmuxinator failed to start${err:+ — $err}"
+  return 1
+}
+
+# first_line <text> — the first non-blank line, for a one-line reason.
+first_line() {
+  local l
+  for l in "${(@f)1}"; do
+    [[ -n "${l//[[:space:]]/}" ]] && { print -r -- "$l"; return 0 }
+  done
+  return 0
+}
+
 # ─── --doc ───────────────────────────────────────────────────────────────────
 # Fills $DOC_REQ with the requested documents and $DOC_REST with everything
 # else. It must run BEFORE the phrase/layout/context parsing, which is purely
@@ -434,8 +490,46 @@ if [[ $# -lt 1 ]]; then
   exit 1
 fi
 
+# Every subcommand, in one place. The --help guard, the typo guard and the
+# dispatch below must agree on what is a command and what is a session name:
+# nineteen words a session cannot be called, and one list to read them from.
+typeset -ga WTS_COMMANDS
+WTS_COMMANDS=(new ls status brief restore stop pr rm gc log retro task doc db
+              layouts keys doctor setup help version)
+
+# sub_usage <command> — its own lines of the header above: the usage lines that
+# name it, then its paragraph. Cut from the same text `wts help` prints, so the
+# two cannot disagree.
+sub_usage() {
+  sed -n '3,/^$/p' "$WTS_SELF" | sed 's/^# \{0,1\}//' | awk -v c="$1" '
+    /^Examples:/ { exit }
+    # A usage line: "Usage: wts rm …", "       wts rm …", or a "| wts status" in one.
+    /^(Usage:)? *wts / {
+      inu = (index($0, "wts " c " ") || $0 ~ ("wts " c "$") || index($0, "wts " c "|"))
+      if (inu) { sub(/^Usage: */, ""); sub(/^ */, ""); u[++nu] = $0 }
+      next
+    }
+    inu && /^        +\[/ { sub(/^ */, "  "); u[++nu] = $0; next }
+    { inu = 0 }
+    # A description starts at two spaces and the command, and runs on through
+    # the deeper-indented lines under it (an option like `-f` included).
+    /^  [^ ]/ { ind = (index($0, "  " c " ") == 1) }
+    ind && NF { d[++nd] = $0 }
+    END {
+      if (!nu && !nd) exit 1
+      for (i = 1; i <= nu; i++) print (i == 1 ? "usage: " : "       ") u[i]
+      if (nd) print ""
+      for (i = 1; i <= nd; i++) print d[i]
+    }'
+}
+
 case "$1" in
-  help|-h|--help)       usage; exit 0 ;;
+  help|-h|--help)       if [[ -n "${2:-}" ]] && (( ${WTS_COMMANDS[(Ie)$2]} )); then
+                          sub_usage "$2"
+                        else
+                          usage
+                        fi
+                        exit 0 ;;
   version|-V|--version) print -r -- "wts $WTS_VERSION"; exit 0 ;;
   # --doc and --task are real options, they just cannot come first: the name (or
   # the phrase) does. Named here rather than reported as unknown, because
@@ -446,6 +540,20 @@ case "$1" in
                         exit 2 ;;
   -*)                   print -u2 -r -- "wts: unknown option '$1' (see: wts help)"; exit 2 ;;
 esac
+
+# `wts <command> --help`, for every command, before any of them runs. `wts new
+# --help` started a session named `--help`, `wts rm --help` tried to remove one,
+# and each subcommand that had a guard had its own. An exact word only: a phrase
+# or a note that merely contains "--help" is text.
+if (( ${WTS_COMMANDS[(Ie)$1]} )); then
+  for _a in "${@[2,-1]}"; do
+    if [[ "$_a" == (-h|--help) ]]; then
+      sub_usage "$1"
+      exit 0
+    fi
+  done
+  unset _a
+fi
 
 # ─── Subcommand: layouts ─────────────────────────────────────────────────────
 
@@ -469,6 +577,16 @@ if [[ "$1" == "keys" ]]; then
     exit 1
   fi
   exec "$WTS_LIBEXEC/wts-keys"
+fi
+
+# ─── Subcommand: doctor ──────────────────────────────────────────────────────
+
+if [[ "$1" == "doctor" ]]; then
+  if [[ ! -x "$WTS_LIBEXEC/wts-doctor" ]]; then
+    print -u2 -r -- "wts: $WTS_LIBEXEC/wts-doctor not found"
+    exit 1
+  fi
+  exec "$WTS_LIBEXEC/wts-doctor" "$WTS_VERSION"
 fi
 
 # ─── Subcommand: setup ───────────────────────────────────────────────────────
@@ -592,13 +710,18 @@ EOF
     exit 0
   fi
   if [[ "${2:-}" != "tmux" ]]; then
-    print -u2 "usage: wts setup tmux | git | claude [--install]   (then: wts setup tmux >> ~/.tmux.conf)"
+    print -u2 "usage: wts setup tmux [--install] | git | claude [--install]"
     exit 2
   fi
 
-  cat <<EOF
-
-# ─── wts (generated by \`wts setup tmux\`, wts $WTS_VERSION) ───────────────────
+  # Between markers, so that a newer wts finds its own block and replaces it:
+  # `wts setup tmux >> ~/.tmux.conf` was the only way in, and every upgrade
+  # that followed the README appended a second block under the first. No blank
+  # line inside the block — the releases before the markers are recognized by
+  # "their header line down to the first blank line", and the rule must hold.
+  tmux_snippet() {  # [--no-status]
+    cat <<EOF
+# >>> wts $WTS_VERSION >>> generated by \`wts setup tmux\`; \`--install\` replaces this block
 # prefix+s: session switcher (fzf popup, agents that need you first).
 # Replaces tmux's default choose-tree on prefix+s.
 bind s display-popup -E -w 85% -h 70% "$libexec/wts-switch"
@@ -610,12 +733,87 @@ bind a run-shell "$libexec/wts-switch --next"
 set -s command-alias[100] 'wts=new-window -n wts -c "#{pane_current_path}" $libexec/wts-fresh'
 # prefix+g: the same prompt, pre-filled.
 bind -N "wts: new session from a fresh origin base" g command-prompt -T command -I "wts "
+EOF
+    if [[ "${1:-}" == --no-status ]]; then
+      print -r -- "# Status line: left where you put it, outside this block."
+    else
+      cat <<EOF
 # Status line: "wts: 2 blocked · 1 idle" when agents need you, nothing when
 # none does, refreshed every status-interval (15 s by default). Appended to
 # status-right: keep this after the lines that set status-right (a theme's),
-# or they overwrite it.
+# or they overwrite it — moved out of this block, it is left alone.
 set -ag status-right ' #($libexec/wts-status --line)'
 EOF
+    fi
+    print -r -- "# <<< wts <<<"
+  }
+
+  if [[ "${3:-}" != "--install" ]]; then
+    print
+    tmux_snippet
+    print
+    print -r -- "# Write it into your tmux.conf, replacing an older wts block: wts setup tmux --install"
+    exit 0
+  fi
+
+  # --install: ~/.tmux.conf, or the XDG file when that is the one tmux reads.
+  tmux_conf="$HOME/.tmux.conf"
+  xdg_conf="${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf"
+  if [[ ! -e "$tmux_conf" && -e "$xdg_conf" ]]; then
+    tmux_conf="$xdg_conf"
+  fi
+  [[ -e "$tmux_conf" ]] || : > "$tmux_conf"
+  cp "$tmux_conf" "$tmux_conf.bak"
+
+  # One awk for both passes, so they agree on what a wts block is: the marked
+  # one, or a pre-marker one (its "generated by" header line, down to the first
+  # blank line). mode=status counts the status lines OUTSIDE every block: a user
+  # who moved it below a theme's `set -g status-right` (where it has to be) must
+  # not get a second one inside the block.
+  wts_blocks_awk='
+    function in_block(line) {
+      if (inm) { if (line ~ /^# <<< wts <<</) inm = 0; return 1 }
+      if (ino) { if (line ~ /^[[:space:]]*$/) { ino = 0; return 0 } return 1 }
+      if (line ~ /^# >>> wts /) { inm = 1; return 1 }
+      if (line ~ /generated by `wts setup tmux`/) { ino = 1; return 1 }
+      return 0
+    }
+    mode == "status" { if (!in_block($0) && $0 ~ /wts-status --line/) n++; next }
+    {
+      if (in_block($0)) {
+        if (!done) { while ((getline l < snippet) > 0) print l; done = 1 }
+        next
+      }
+      print
+    }
+    END {
+      if (mode == "status") { print n + 0; exit }
+      if (!done) {
+        if (NR) print ""
+        while ((getline l < snippet) > 0) print l
+      }
+    }'
+  status_elsewhere=$(awk -v mode=status "$wts_blocks_awk" "$tmux_conf")
+  snippet_file=$(mktemp "${TMPDIR:-/tmp}/wts-tmux.XXXXXX")
+  if (( ${status_elsewhere:-0} > 0 )); then
+    tmux_snippet --no-status > "$snippet_file"
+  else
+    tmux_snippet > "$snippet_file"
+  fi
+  if awk -v mode=write -v snippet="$snippet_file" "$wts_blocks_awk" "$tmux_conf.bak" \
+       > "$tmux_conf.tmp.$$"; then
+    mv "$tmux_conf.tmp.$$" "$tmux_conf"
+    rm -f "$snippet_file"
+  else
+    rm -f "$snippet_file" "$tmux_conf.tmp.$$"
+    echo "wts: $tmux_conf left untouched" >&2
+    exit 1
+  fi
+  echo "→ wts $WTS_VERSION block written in $tmux_conf (backup: ${tmux_conf:t}.bak)"
+  if (( ${status_elsewhere:-0} > 0 )); then
+    echo "   your own wts-status line, outside the block, is kept as it is"
+  fi
+  echo "   reload: tmux source-file $tmux_conf"
   exit 0
 fi
 
@@ -630,6 +828,14 @@ if [[ "$1" == "ls" || "$1" == "status" ]]; then
   registry_prune
 
   sub="$1"; shift
+
+  # `wts ls --json` printed the table and exited 0: the argument was dropped
+  # without a word, and a script reading JSON got a box. `ls` takes nothing;
+  # `status` is the one with formats.
+  if [[ "$sub" == ls ]] && (( $# )); then
+    echo "wts ls takes no argument (got '$1'); for a format: wts status --json|--table|--fzf" >&2
+    exit 2
+  fi
 
   if [[ ! -x "$WTS_LIBEXEC/wts-status" ]]; then
     echo "wts: status engine not found ($WTS_LIBEXEC/wts-status)" >&2
@@ -693,6 +899,9 @@ if [[ "$1" == "restore" ]]; then
 
   restored=0
   ignored=0
+  failed=0
+  typeset -A seen_wanted
+  seen_wanted=()
 
   while IFS=$'\x1f' read -r -d $'\x1e' name profile worktree subdir context docs; do
     [[ -n "$name" ]] || continue
@@ -700,6 +909,7 @@ if [[ "$1" == "restore" ]]; then
     if (( ${#wanted} )) && [[ -z "${wanted[(r)$name]:-}" ]]; then
       continue
     fi
+    seen_wanted[$name]=1
 
     if tmux has-session -t "=$name" 2>/dev/null; then
       echo "→ $name: already running"
@@ -709,13 +919,13 @@ if [[ "$1" == "restore" ]]; then
 
     if [[ ! -d "$worktree" ]]; then
       echo "⚠ $name: worktree $worktree not found, skipped" >&2
-      (( ignored++ )) || true
+      (( failed++ )) || true
       continue
     fi
 
     if ! layout=$(layout_file "$profile"); then
       echo "⚠ $name: layout '$profile' not found, skipped" >&2
-      (( ignored++ )) || true
+      (( failed++ )) || true
       continue
     fi
 
@@ -770,22 +980,35 @@ if [[ "$1" == "restore" ]]; then
       WTS_RESUME=1
     fi
 
-    if tmuxinator start --project-config "$layout" --name "$name" --no-attach \
-         --suppress-tmux-version-warning </dev/null >/dev/null 2>&1; then
+    if start_detached "$layout" "$name"; then
       echo "→ $name restored ($profile, $workdir)"
       (( restored++ )) || true
     else
-      echo "⚠ $name: tmuxinator failed to start" >&2
-      (( ignored++ )) || true
+      (( failed++ )) || true
     fi
   # docs: space-separated slugs (a slug has no space), split below.
   done < <(db_rows "SELECT name, profile, worktree, subdir, context,
                            (SELECT coalesce(group_concat(value, ' '), '') FROM json_each(docs))
                     FROM sessions ORDER BY name")
 
-  echo "→ $restored session(s) restored, $ignored skipped"
+  # A name the registry does not hold was skipped without a word, and the run
+  # ended "0 restored, 0 skipped", exit 0. Matched exactly, as always, in the
+  # loop above; what it never met is reported here.
+  for n in "${wanted[@]}"; do
+    if [[ -z "${seen_wanted[$n]:-}" ]]; then
+      echo "⚠ $n: no registered session of that name (wts ls)" >&2
+      (( failed++ )) || true
+    fi
+  done
+
+  echo "→ $restored session(s) restored, $ignored already running$( (( failed )) && echo ", $failed failed")"
   if (( restored > 0 )); then
     echo "   attach: tmux attach -t <name>   (or prefix+s)"
+  fi
+  # Non-zero when anything that should have come back did not: a reboot script
+  # running `wts restore` read success with every session failed.
+  if (( failed )); then
+    exit 1
   fi
   exit 0
 fi
@@ -826,12 +1049,14 @@ if [[ "$1" == "stop" ]]; then
   # #S is only meaningful under $TMUX: outside a client it names the last used
   # session.
   if [[ -n "${TMUX:-}" && "$(tmux display-message -p '#S' 2>/dev/null)" == "$SESSION" ]]; then
-    echo "wts: '$SESSION' is the current session, not killed (switch away first)" >&2
+    echo "wts: '$SESSION' is the current session, not stopped (switch away first)" >&2
     exit 1
   fi
 
+  # "Stopped", the verb of the command: the README and the popup said "kill"
+  # for the same key, the CLI "stop", and nobody could tell they were one thing.
   tmux kill-session -t "=$SESSION"
-  echo "→ tmux session '$SESSION' killed"
+  echo "→ session '$SESSION' stopped (tmux session closed)"
   if registry_has "$SESSION"; then
     echo "→ worktree kept, wts restore $SESSION restarts it"
   fi
@@ -1111,10 +1336,10 @@ if [[ "$1" == "rm" ]]; then
   # built from the registry row, the brief and the notes, which the next line
   # deletes. This is the index `wts rm` used to destroy.
   if [[ -n "${RETRO_FACTS:-}" && -s "$RETRO_FACTS" ]]; then
-    if "$WTS_LIBEXEC/wts-retro" store "$SESSION" < "$RETRO_FACTS" 2>/dev/null; then
+    if store_err=$("$WTS_LIBEXEC/wts-retro" store "$SESSION" < "$RETRO_FACTS" 2>&1 >/dev/null); then
       echo "→ archived (wts log) — retrospective pending: wts retro"
     else
-      echo "⚠ not archived"
+      echo "⚠ not archived${store_err:+: $(first_line "$store_err")}"
     fi
   fi
   if [[ -n "${RETRO_FACTS:-}" ]]; then
@@ -1443,6 +1668,64 @@ if (( $# < 1 )); then
   echo "wts: nothing to create (see: wts help)" >&2
   exit 2
 fi
+# `wts auth-form --help` asked for a layout named `--help`.
+for _a in "$@"; do
+  if [[ "$_a" == (-h|--help) ]]; then
+    usage
+    exit 0
+  fi
+done
+unset _a
+
+# ─── A typo is not a session ─────────────────────────────────────────────────
+# `wts lsit` created a branch, a worktree and a tmux session named `lsit`, and
+# started an agent in it. A single bare word close to a command, that names no
+# session and no branch, is far likelier a slip than a new piece of work: say so
+# and create nothing. Exit 2, as for an unknown option.
+#
+# Close means one edit for a word of three or four letters, two from five on,
+# none under three (every two-letter word is one edit from `ls`, `pr`, `rm`,
+# `gc` or `db`). The words people type for a command wts calls otherwise count
+# only exactly or with two letters swapped: `lint` must stay a session name.
+# Only `wts <word>` alone: any second word (a layout, `new`) is the way to say
+# "yes, a session by that name".
+closest_command() {  # <word> → the command, or failure
+  local w="${1:l}"
+  [[ "$w" =~ '^[a-z][a-z-]*$' ]] || return 1
+  (( ${#w} >= 3 )) || return 1
+  local c
+  { for c in "${WTS_COMMANDS[@]}"; do print -r -- "$c $c"; done
+    print -rl -- "list ls" "remove rm" "delete rm" "kill stop" "check doctor"
+  } | awk -v q="$w" "$WTS_LEV_AWK"'
+    function sorted(s,   n, i, j, t, a) {
+      n = split(s, a, "")
+      for (i = 2; i <= n; i++) { t = a[i]; for (j = i - 1; j > 0 && a[j] > t; j--) a[j+1] = a[j]; a[j+1] = t }
+      t = ""; for (i = 1; i <= n; i++) t = t a[i]; return t
+    }
+    BEGIN { max = (length(q) >= 5) ? 2 : 1; best = 99 }
+    {
+      d = lev(q, $1)
+      if ($1 != $2 && !(d == 0 || (d == 1 && sorted(q) == sorted($1)))) next
+      if (d <= max && d < best) { best = d; cmd = $2 }
+    }
+    END { if (best < 99) { print cmd; exit 0 } exit 1 }'
+}
+
+if (( $# == 1 )) && _guess=$(closest_command "$1"); then
+  _branch_hit=""
+  if git rev-parse --git-dir >/dev/null 2>&1; then
+    _branch_hit=$(git for-each-ref --count=1 --format='%(refname)' \
+                    "refs/heads/$1" "refs/heads/*/$1" \
+                    "refs/remotes/origin/$1" "refs/remotes/origin/*/$1" 2>/dev/null || true)
+  fi
+  if [[ -z "$_branch_hit" ]] && ! registry_has "$1" \
+     && ! tmux has-session -t "=$1" 2>/dev/null; then
+    echo "wts: '$1' is not a command — did you mean 'wts $_guess'?" >&2
+    echo "     nothing was created. A session named '$1': wts $1 default" >&2
+    exit 2
+  fi
+fi
+unset _guess _branch_hit
 
 # A phrase (an argument containing whitespace, in position 1 or 2) describes
 # the task: it is removed from the positionals and handed to Claude
@@ -1673,8 +1956,36 @@ fi
 if [[ -z "$NAME" ]]; then
   slug="${WTS_NAME_HINT:-}"
   if [[ ! "$slug" =~ '^[a-z0-9][a-z0-9-]*$' ]]; then
-    echo "→ naming…"
-    slug=$("$WTS_LIBEXEC/wts-name" "$PROMPT")
+    # Up to WTS_NAME_TIMEOUT (30 s) behind one line, and Ctrl-C used to abort
+    # the whole creation — the one key anybody presses while waiting. Now it
+    # cuts the wait short: the terminal's SIGINT reaches wts-name and its
+    # `claude` (same process group), the trap keeps wts alive, and the name is
+    # derived from the phrase locally, which is what a timeout gives anyway.
+    _naming_cut=0
+    _naming_t0=$SECONDS
+    trap '_naming_cut=1' INT
+    if [[ -t 2 ]]; then
+      echo "→ naming… (Ctrl-C: derive it from the phrase now)"
+    else
+      echo "→ naming…"
+    fi
+    slug=$("$WTS_LIBEXEC/wts-name" "$PROMPT") || slug=""
+    if (( _naming_cut )) || [[ -z "$slug" ]]; then
+      slug=$(WTS_NO_LLM=1 "$WTS_LIBEXEC/wts-name" "$PROMPT" 2>/dev/null) || slug=""
+      # A line of its own: the terminal has just echoed `^C` where the cursor was.
+      if (( _naming_cut )); then
+        echo
+      fi
+      echo "→ naming interrupted after $(( SECONDS - _naming_t0 ))s: '$slug', from the phrase"
+    elif (( SECONDS - _naming_t0 >= 3 )); then
+      echo "→ named in $(( SECONDS - _naming_t0 ))s"
+    fi
+    trap - INT
+    unset _naming_cut _naming_t0
+    if [[ -z "$slug" ]]; then
+      echo "wts: no name could be derived from the phrase; name it: wts <name> \"<phrase>\"" >&2
+      exit 1
+    fi
   fi
 
   # A guessed name must NEVER land on an existing branch: the resolution below
@@ -1736,6 +2047,19 @@ if registry_has "$SESSION"; then
       exit 1
     fi
   fi
+fi
+
+# What the session needs to start, checked while nothing exists: tmuxinator was
+# discovered missing by the `exec` at the very end, after the branch and the
+# worktree had been created and the registry row written — a husk, every time.
+# `wts doctor` checks the rest.
+if ! command -v tmuxinator >/dev/null 2>&1; then
+  echo "wts: tmuxinator not found — nothing was created (brew install tmuxinator; wts doctor)" >&2
+  exit 1
+fi
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "wts: tmux not found — nothing was created (brew install tmux; wts doctor)" >&2
+  exit 1
 fi
 
 mkdir -p "$worktree_base"
@@ -1853,11 +2177,9 @@ fi
 if [[ -n "${WTS_NO_ATTACH:-}" ]]; then
   if tmux has-session -t "=$SESSION" 2>/dev/null; then
     echo "→ tmux session '$SESSION' already running"
-  elif tmuxinator start --project-config "$LAYOUT_FILE" --name "$SESSION" --no-attach \
-         --suppress-tmux-version-warning </dev/null >/dev/null 2>&1; then
+  elif start_detached "$LAYOUT_FILE" "$SESSION"; then
     echo "→ session '$SESSION' started"
   else
-    echo "⚠ $SESSION: tmuxinator failed to start" >&2
     exit 1
   fi
   exit 0

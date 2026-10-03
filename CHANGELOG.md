@@ -18,6 +18,60 @@ written at every teardown and read by almost nothing.
   registered session, each from its main worktree, from anywhere.
 - **`wts ls` gets a REPO column** when sessions span more than one repository.
 
+The command surface: what a command does when it is mistyped, asked for help,
+or fails, and what wts says about its own setup.
+
+- **`wts doctor`** checks what wts needs (git, tmux 3.2+, tmuxinator, sqlite3
+  3.38+, jq, perl), what it can use (which switcher features an older fzf turns
+  off, whether `claude agents --json` answers, gh, the banner, Things from its
+  cached verdict only), and whether the tmux snippet and the five Claude hooks
+  are installed and come from this install. Exit 1 when something required is
+  missing. A creation now checks for tmux and tmuxinator before it makes the
+  branch and the worktree, instead of failing on the last line.
+- **A typo is not a session.** `wts lsit` alone, with no session or branch of
+  that name, says "did you mean `wts ls`?", exits 2 and creates nothing. A
+  second word (`wts lsit default`) says the name is meant.
+- **`--help` for every command**: `wts <command> --help` and `wts help
+  <command>` print that command's usage. `wts new --help` started a session
+  named `--help`; `wts rm --help` tried to remove one.
+- **Exit codes that mean something.** `wts restore` exits 1 when a session could
+  not come back, or a name matches none; `wts task unlink` on a name that is no
+  session exits 1; `wts ls --json` refuses the argument (exit 2) instead of
+  printing the table.
+- **Failures say why.** tmuxinator's own first line ("Failed to parse config
+  file…") after "tmuxinator failed to start", in `restore` and `new`; sqlite3's
+  after "registry not updated"; wts-retro's after "not archived", in `rm` and
+  `gc`. Under `C-b : wts`, a failing `wts` keeps its window open on the message,
+  and `doctor`, `keys`, `doc`, `stop` and `pr` no longer wait for a fetch.
+- **Ctrl-C while a phrase is being named** takes the name derived from the
+  phrase and goes on, saying after how long; it used to abort the creation.
+- **The SessionStart hook is shorter.** It lists the sessions of the same
+  repository only (eight at most, their five latest notes, each brief with its
+  age), caps a task's notes at twelve lines, and prints the directives about
+  overlap only when such a session exists; alone on its repository an agent gets
+  one line. "Leave a note anyway" is gone. `WTS_CONTEXT_QUIET=1` keeps only who
+  the agent is and its task.
+- **One word per action.** `ctrl-x` stops a session, in the popup's prompt and
+  the README as in the CLI (they said "kill"). `wts doc forget` removes a
+  document from the library (`wts doc rm` still works): `rm` is a session's
+  teardown. A session serving a task is marked `@` in SUBJECT; `*` after NAME
+  stays the current session.
+- **gc collects what wts made.** By default it looks only at branches a session
+  of the repository had (registry or archive) and husk folders named after one;
+  the dry run counts the rest. `--all-branches` is the former scope. The dry run
+  also says that `--apply` will ask Claude for N retrospectives, and `wts brief`
+  says how many calls it is about to make, before making them.
+- **`wts setup tmux --install`** writes the snippet between markers in
+  `~/.tmux.conf` and replaces it on the next upgrade, an unmarked block from an
+  older wts included; a status line moved below a theme is left there, not
+  doubled. `wts setup tmux >> ~/.tmux.conf` appended a second block per upgrade.
+- **Docs and completion caught up**: every variable in the configuration table
+  (`WTS_RETRO_TIMEOUT`, `WTS_RETRO_JOBS`, `WTS_NO_THINGS`, `WTS_THINGS_DB`,
+  `WTS_TASK_MAX_CHARS`, `WTS_DB`, `WTS_STATE_DIR`, `WTS_SWITCH_TASKS`,
+  `WTS_ARCHIVE_TRANSCRIPT`, `WTS_NO_ARCHIVE`), every option in `wts help`, and
+  completion for `--task`, `new --doc`, `task doc`, `task unlink` (a session),
+  `gc --all-branches`, `retro --jobs` and `setup tmux --install`.
+
 ## 1.5.2 — 2026-10-02
 
 - **A task's preview in the switcher lists its sessions**: the live ones with

@@ -447,7 +447,10 @@ fi
 # (restored session, agent not relaunched yet), otherwise the context. `//` is
 # not enough: jq lets an empty string through.
 #
-# A leading "* " marks a session that serves a task. Only a sign, not the task
+# A leading "@ " marks a session that serves a task ("at" a task). Not "*",
+# which it was: the switcher puts a `*` after the current session's NAME, as
+# tmux does for its current window, and one sign meaning two things in two
+# columns of the same row read as one meaning. Only a sign, not the task
 # title: at 50 shared characters the title would evict the conversation name,
 # which is the more useful of the two day to day — the grouped view is
 # `wts task ls`. ASCII, because macOS `column -t` counts bytes, and truncated
@@ -456,7 +459,7 @@ fi
 # The task title is the last resort, not a competitor: it only shows when the
 # agent, the phrase and the context are all empty, where the alternative is a
 # cell holding nothing but the sign, which reads as a rendering fault.
-SUBJECT='def subject: (if (.task_title // "") != "" then "* " else "" end)
+SUBJECT='def subject: (if (.task_title // "") != "" then "@ " else "" end)
   + ([.agent_name, .prompt, .context, .task_title]
      | map(select(type == "string" and . != "")) | (.[0] // ""))
   | gsub("[\\t\\n\\r]"; " ")
