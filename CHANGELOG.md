@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- **A long phrase starts its agent.** The layouts typed `claude '<phrase>'`
+  into the pane before its shell was ready, while the terminal keeps 1024
+  bytes of a line: a phrase of about 1 KB once escaped lost its closing quote,
+  Claude never started and `wts ls` showed agent `-`. wts now writes the phrase
+  to `.wts/prompt` in the worktree (ignored by git, like `.wts/context.md`) and
+  exposes its path as `WTS_PROMPT_FILE`; the built-in layout and both examples
+  run `claude "$(cat <file>)"`. A layout of your own copied from an older
+  `default.yml` still types the phrase: replace its `claude #{task.shellescape}`
+  branch the same way (see `default.yml`).
+- **An `$EDITOR` that YAML reads as a value no longer breaks the built-in
+  layout.** `EDITOR=true` (or `yes`, `on`, a number) was written bare into the
+  YAML, read as a boolean, and tmuxinator failed with "undefined method
+  shellescape for true". The editor is now always a quoted string.
+
 ## 1.6.0 — 2026-10-03
 
 After upgrading: `wts setup claude --install` (a sixth hook, the read-only

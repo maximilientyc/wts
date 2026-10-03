@@ -1113,6 +1113,7 @@ name.
 | `WTS_WORKDIR` | `WTS_ROOT` + `WTS_SUBDIR` when set, else `WTS_ROOT`              |
 | `WTS_CONTEXT` | remaining arguments, joined                                      |
 | `WTS_PROMPT`  | the phrase of `wts "<phrase>"` (empty otherwise)                 |
+| `WTS_PROMPT_FILE` | absolute path of a file holding that phrase (`.wts/prompt` in the worktree), empty without one |
 | `WTS_RESTORE` | `1` during `wts restore`                                         |
 | `WTS_RESUME`  | `1` during `wts restore` when a Claude conversation exists       |
 | `WTS_RESUME_ID` | during `wts restore`, the id of the agent's own conversation when the hooks recorded it and its transcript exists |
@@ -1121,7 +1122,10 @@ Use `WTS_WORKDIR` for `root:` and `WTS_ROOT` for commands that must run from the
 worktree root. Panes do not inherit the environment of `wts` (the tmux server is
 already running): read variables in ERB, not in pane commands. To start Claude with
 the phrase, copy the `claude_cmd` block of `default.yml`, which escapes it for the
-pane's shell. Keep layout files **ASCII**, comments included: without a UTF-8
+pane's shell. Have the pane read the phrase from `WTS_PROMPT_FILE`
+(`claude "$(cat <file>)"`) rather than type it: tmuxinator types the pane's command
+before its shell is ready, and the terminal then keeps 1024 bytes of a line, so a
+long phrase typed whole loses its end and Claude never starts. Keep layout files **ASCII**, comments included: without a UTF-8
 locale (`LANG=C`), Ruby refuses to read them ("invalid byte sequence in US-ASCII").
 
 ## Configuration
