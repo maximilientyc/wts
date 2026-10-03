@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.8.1 — 2026-10-03
 
 - **A squash of several commits reads merged.** The content test compared
   patch-ids commit by commit, and a squash lands as one combined diff that
