@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## 1.6.0 — 2026-10-03
+
+After upgrading: `wts setup claude --install` (a sixth hook, the read-only
+permissions, the wts skill) and `wts setup tmux --install` (the snippet, now
+between markers, replacing the one an older wts appended); `wts doctor` says
+whether anything is left. Two changes of behaviour to know: `wts gc` now looks
+only at the branches wts sessions had (`--all-branches` for the former scope),
+and a creation without a terminal on stdin no longer attaches. Schema 5, two
+new tables, imported on the first command.
 
 wts reads what it already writes: the archive, the briefs and the notes were
 written at every teardown and read by almost nothing.
