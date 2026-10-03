@@ -6,7 +6,8 @@
 #   --json  (default) JSON array, one object per registered worktree
 #   --table colored column rendering for `wts ls`
 #   --wide  with --table: TOKENS, COST and MODEL too (`wts ls --wide`), read
-#           from the usage table that wts brief and the archive fill
+#           from the usage table that wts brief and the archive fill. --json
+#           carries the same as `usage`, except with --no-git (null there)
 #   --fzf   sorted lines (stuck first) for wts-switch, fields separated by
 #           \x1f: TAB is an IFS whitespace and would collapse empty fields (an
 #           agent without a tmux pane would shift every column).
@@ -451,7 +452,9 @@ fi
 # brief and at teardown, never here — a 20 MB transcript is half a second of jq,
 # and this pass runs on every switcher tick. Not for --fzf or --line either: the
 # switcher shows none of it, and one query less is one query less every 2 s.
-if [[ "$FORMAT" == json ]] || { [[ "$FORMAT" == table ]] && $WIDE; }; then
+# Nor with --no-git, which prefix+a and wts wait poll for agent states alone:
+# usage is then null, like the git columns are zero.
+if { [[ "$FORMAT" == json ]] && $WITH_GIT; } || { [[ "$FORMAT" == table ]] && $WIDE; }; then
   usage_map=$(db_ro "SELECT json_group_object(name, json($(usage_json_sql s.name s.created_at)))
                      FROM sessions s" 2>/dev/null)
   [[ -n "$usage_map" ]] || usage_map='{}'

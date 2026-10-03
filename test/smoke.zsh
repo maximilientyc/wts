@@ -1984,6 +1984,8 @@ check "ls --wide adds tokens, cost and model" eval '
 check "plain ls does not" eval '[[ "$("$WTS" ls)" != *TOKENS* ]]'
 check "status --table --wide is the same table" eval '[[ "$("$WTS" status --table --wide)" == *TOKENS* ]]'
 check "the switcher list keeps its 9 fields" eval '"$WTS" status --fzf | awk -F "\037" "NF != 9 { exit 1 }"'
+check "--no-git, what prefix+a and wait poll, leaves it out" eval '
+  "$WTS" status --json --no-git agent-a | jq -e ".[0].usage == null"'
 q "UPDATE usage SET input = 999 WHERE session = 'agent-a' AND model = 'claude-opus-5-5'"
 "$WTS" brief agent-a </dev/null >/dev/null 2>&1
 check "an unchanged transcript is not read again" eval '

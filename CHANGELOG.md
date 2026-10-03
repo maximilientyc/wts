@@ -18,7 +18,8 @@ Schema 6: one new table, `usage`, created on the first command.
 - **`wts status --json` gets a `usage` key** per session: `input`, `output`,
   `cache_write`, `cache_read`, `tokens`, `messages`, `cost_usd`,
   `cost_complete`, `model`, `models` (per model and speed) and `updated_at`;
-  `null` before the first count. Additive: no existing key changes.
+  `null` before the first count, and with `--no-git` (what `prefix+a` and
+  `wts wait` poll). Additive: no existing key changes.
 - **`wts log`** carries the same `usage` on each session, and on each work item
   the total of its sessions (`tokens`, `cost_usd`, `sessions`…): what a task
   cost over all its attempts. `wts task show` prints that line, and its
