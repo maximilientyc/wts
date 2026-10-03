@@ -14,6 +14,7 @@
 #   archive      finished work: what `wts log` reports and nothing ever deletes
 #   agent_panes  the tmux pane each agent reported from its own hooks
 #   touches      the files each agent edited, relative to its worktree
+#   usage        tokens per session, transcript and model, summed from transcripts
 #
 # Why a database: the registry used to be one JSON file rewritten whole with
 # `jq … > tmp && mv` by bin/wts, wts-gc and wts-doc. Two writers at once lost one
@@ -26,7 +27,7 @@
 
 WTS_STATE_DIR="${WTS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wts}"
 WTS_DB="${WTS_DB:-$WTS_STATE_DIR/wts.db}"
-WTS_DB_SCHEMA=5
+WTS_DB_SCHEMA=6
 # Where the helpers are, for the few functions below that call one. Top level:
 # when this file is sourced, $0 is this file.
 WTS_DB_HOME="${0:A:h}"
@@ -375,6 +376,37 @@ CREATE TABLE IF NOT EXISTS touches (
   PRIMARY KEY (session, path)
 );
 CREATE INDEX IF NOT EXISTS touches_by_path ON touches(path);
+-- What each session's agents consumed, summed from message.usage in the Claude
+-- transcripts of its worktree: one row per transcript (the main one, each one
+-- after a /clear, each subagent's) and per model and speed. Written by
+-- wts-brief and wts-retro, the two readers of a transcript, never by a hook or
+-- the switcher. Keyed by (session, created_at) like the archive, so a reused
+-- name starts from zero and an archived session keeps its numbers: this table
+-- outlives the session and is dropped only when neither the session nor its
+-- archive row is left. bytes and mtime are the transcript's when it was summed:
+-- an unchanged file is not read again.
+--
+-- Tokens and not dollars: prices change and are the reader's business, so the
+-- cost is computed at read time (usage_cost_sql below). A table of its own
+-- rather than columns on archive, because db_init only ever runs CREATE TABLE
+-- IF NOT EXISTS: a new column would never appear on an existing database.
+CREATE TABLE IF NOT EXISTS usage (
+  session     TEXT NOT NULL,
+  created_at  TEXT NOT NULL,
+  transcript  TEXT NOT NULL,
+  model       TEXT NOT NULL DEFAULT '',
+  speed       TEXT NOT NULL DEFAULT '',
+  input       INTEGER NOT NULL DEFAULT 0,
+  output      INTEGER NOT NULL DEFAULT 0,
+  cache_write INTEGER NOT NULL DEFAULT 0,
+  cache_write_1h INTEGER NOT NULL DEFAULT 0,
+  cache_read  INTEGER NOT NULL DEFAULT 0,
+  messages    INTEGER NOT NULL DEFAULT 0,
+  bytes       INTEGER NOT NULL DEFAULT 0,
+  mtime       INTEGER NOT NULL DEFAULT 0,
+  updated_at  INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (session, created_at, transcript, model, speed)
+);
 $imports
 PRAGMA user_version = $WTS_DB_SCHEMA;
 COMMIT;"
@@ -663,4 +695,226 @@ db_current_session() {
     fi
   done
   return 1
+}
+
+# ─── Usage: tokens per session ───────────────────────────────────────────────
+
+# The transcripts a session's agents wrote, one path per line: every *.jsonl of
+# the worktree's project directory (and its subdirectory's) no older than the
+# session — a new file per /clear, and an older one belongs to a previous
+# incarnation of the same name — plus the subagents' own files, which Claude
+# Code keeps under <session id>/subagents/ and which cost as much as the rest.
+# Same matching rule as wts-brief and wts-retro: exact directories, never a
+# prefix (fix-login must not count fix-login-2).
+usage_transcripts() {  # <worktree> <subdir> <created epoch>
+  local wt="$1" sub="$2" created="${3:-0}" root d f p
+  local -a dirs
+  zmodload -F zsh/stat b:zstat 2>/dev/null
+  root="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"
+  dirs=("$root/${wt//[^a-zA-Z0-9]/-}")
+  p="$wt/$sub"
+  [[ -n "$sub" ]] && dirs+=("$root/${p//[^a-zA-Z0-9]/-}")
+  for d in "${dirs[@]}"; do
+    for f in "$d"/*.jsonl(N) "$d"/*/subagents/*.jsonl(N); do
+      (( $(zstat +mtime "$f" 2>/dev/null || print 0) >= created )) && print -r -- "$f"
+    done
+  done
+  return 0
+}
+
+# Sum one transcript into the usage table, unless it has not changed since the
+# last time. <file> may be gzipped (the archive keeps a .gz copy); <key> is the
+# path the row is recorded under, the original one by default.
+#
+# Claude Code writes one record per content block of an assistant message, and
+# each repeats the message's usage: summed naively, a turn with thinking, text
+# and two tool calls counts four times. So one usage per message id, the
+# largest (a streamed message's output count only grows). Model <synthetic>
+# is Claude Code's own placeholder for a message no model wrote, at zero.
+usage_store() {  # <session> <created_at> <file> [<key>]
+  local session="$1" created="$2" file="$3" key="${4:-$3}"
+  [[ -n "$session" && -f "$file" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  zmodload -F zsh/stat b:zstat 2>/dev/null
+  local bytes mtime seen where
+  bytes=$(zstat +size "$file" 2>/dev/null) || return 0
+  mtime=$(zstat +mtime "$file" 2>/dev/null) || return 0
+  where="session = $(sql_str "$session") AND created_at = $(sql_str "$created")
+         AND transcript = $(sql_str "$key")"
+  seen=$(db_ro "SELECT bytes || ':' || mtime FROM usage WHERE $where LIMIT 1" 2>/dev/null)
+  [[ "$seen" == "$bytes:$mtime" ]] && return 0
+
+  local rows
+  # grep first: a transcript is mostly tool results, and jq parsing them all
+  # to keep one record in five is what made a 10 MB file cost half a second.
+  rows=$( { if [[ "$file" == *.gz ]]; then gzip -dc -- "$file"; else cat -- "$file"; fi } 2>/dev/null \
+    | grep -F '"usage"' \
+    | jq -Rrn '
+        [inputs | fromjson?
+         | select(.type == "assistant" and (.message.usage | type) == "object")
+         | {k: (.message.id // .requestId // .uuid // ""),
+            m: (.message.model // ""), s: (.message.usage.speed // ""),
+            u: .message.usage}
+         | select(.m != "<synthetic>")]
+        | group_by(.k) | map(max_by(.u.output_tokens // 0))
+        | group_by([.m, .s])[]
+        | [ .[0].m, .[0].s,
+            (map(.u.input_tokens // 0) | add),
+            (map(.u.output_tokens // 0) | add),
+            (map(.u.cache_creation_input_tokens // 0) | add),
+            (map(.u.cache_creation.ephemeral_1h_input_tokens // 0) | add),
+            (map(.u.cache_read_input_tokens // 0) | add),
+            length ]
+        | map(tostring) | join("\u001f")' 2>/dev/null)
+  # No status test: under pipefail, grep finding no usage at all fails the
+  # pipeline, and that file is exactly the one to remember as empty.
+
+  local sql row n
+  local -a f
+  sql="BEGIN IMMEDIATE; DELETE FROM usage WHERE $where;"
+  n=0
+  for row in "${(@f)rows}"; do
+    [[ -n "$row" ]] || continue
+    f=("${(@ps:\x1f:)row}")
+    (( ${#f} == 8 )) || continue
+    (( n++ ))
+    sql+="
+INSERT OR REPLACE INTO usage VALUES ($(sql_str "$session"), $(sql_str "$created"),
+  $(sql_str "$key"), $(sql_str "${f[1]}"), $(sql_str "${f[2]}"),
+  ${${f[3]//[^0-9]/}:-0}, ${${f[4]//[^0-9]/}:-0}, ${${f[5]//[^0-9]/}:-0},
+  ${${f[6]//[^0-9]/}:-0}, ${${f[7]//[^0-9]/}:-0}, ${${f[8]//[^0-9]/}:-0},
+  ${bytes//[^0-9]/}, ${mtime//[^0-9]/}, unixepoch());"
+  done
+  # A transcript with no usage yet (a session opened, nothing asked) still
+  # gets a row, so its signature is remembered and it is not read again.
+  (( n )) || sql+="
+INSERT OR REPLACE INTO usage (session, created_at, transcript, bytes, mtime, updated_at)
+  VALUES ($(sql_str "$session"), $(sql_str "$created"), $(sql_str "$key"),
+          ${bytes//[^0-9]/}, ${mtime//[^0-9]/}, unixepoch());"
+  sql+="
+COMMIT;"
+  print -r -- "$sql" | db_q >/dev/null 2>&1
+  return 0
+}
+
+# Refresh the usage of registered sessions (all of them without a name) from
+# their transcripts. Reads the transcripts: only wts-brief and wts-retro call
+# it, never ls, the switcher or a hook, which only read the table.
+usage_refresh() {  # [<session>...]
+  command -v jq >/dev/null 2>&1 || return 0
+  db_init 2>/dev/null || return 0
+  local filter="" out row tr
+  local -a f
+  (( $# )) && filter="WHERE name IN $(sql_list "$@")"
+  out=$(db_rows "SELECT name, worktree, subdir, created_at,
+                        coalesce(strftime('%s', created_at), 0)
+                 FROM sessions $filter" 2>/dev/null)
+  for row in "${(@ps:\x1e:)out}"; do
+    f=("${(@ps:\x1f:)row}")
+    [[ -n "${f[1]:-}" && -n "${f[2]:-}" ]] || continue
+    for tr in "${(@f)$(usage_transcripts "${f[2]}" "${f[3]:-}" "${f[5]:-0}")}"; do
+      [[ -n "$tr" ]] && usage_store "${f[1]}" "${f[4]:-}" "$tr"
+    done
+  done
+  return 0
+}
+
+# The list price in USD of a usage row aliased <a>, as a SQL expression, NULL
+# for a model this table does not know. List prices of the Claude API per
+# million tokens: input, output, cache read. A cache write costs 1.25x input
+# (5-minute TTL) or 2x (1-hour TTL, what Claude Code uses); fast mode doubles
+# all of it. This is what the tokens would cost on the API, not what a
+# subscription bills, and it is computed at read time so that a price change
+# is one edit here rather than a migration. First match wins: specific first.
+usage_cost_sql() {  # <alias>
+  local a="$1"
+  print -r -- "(SELECT ($a.input * p.column3 + $a.output * p.column4
+      + ($a.cache_write - $a.cache_write_1h) * p.column3 * 1.25
+      + $a.cache_write_1h * p.column3 * 2 + $a.cache_read * p.column5)
+      * (CASE $a.speed WHEN 'fast' THEN 2 ELSE 1 END) / 1000000.0
+    FROM (VALUES
+      (1,  'claude-fable-5-1*',   10,  50,  0.25),
+      (2,  'claude-mythos-5-1*',  10,  50,  0.25),
+      (3,  'claude-fable-5*',     10,  50,  1.0),
+      (4,  'claude-mythos-5*',    10,  50,  1.0),
+      (5,  'claude-opus-5-5*',     4,  20,  0.2),
+      (6,  'claude-opus-5*',       5,  25,  0.5),
+      (7,  'claude-opus-4-[5-9]*', 5,  25,  0.5),
+      (8,  'claude-opus-4*',      15,  75,  1.5),
+      (9,  'claude-sonnet-5*',     2,  10,  0.2),
+      (10, 'claude-sonnet-4*',     3,  15,  0.3),
+      (11, 'claude-3-7-sonnet*',   3,  15,  0.3),
+      (12, 'claude-haiku-4-5*',    1,   5,  0.1),
+      (13, 'claude-3-5-haiku*',  0.8,   4,  0.08)) p
+    WHERE $a.model GLOB p.column2 ORDER BY p.column1 LIMIT 1)"
+}
+
+# The usage of one session incarnation as a SQL expression yielding a JSON
+# object, or NULL when nothing was ever summed for it. <session> and <created>
+# are SQL expressions (a column of the outer query, or a literal). The shape is
+# what wts status --json and wts log carry under "usage":
+#   {input, output, cache_write, cache_read, tokens, messages, cost_usd,
+#    cost_complete, model, models: [{model, speed, ..., cost_usd}], updated_at}
+# tokens is the four counts added; model is the one that cost the most;
+# cost_complete is false when some model has no price here, in which case
+# cost_usd counts only the priced ones.
+usage_json_sql() {  # <session expr> <created expr>
+  local s="$1" c="$2" cost
+  cost=$(usage_cost_sql u)
+  print -r -- "(SELECT CASE WHEN count(*) = 0 THEN NULL ELSE json_object(
+      'input', sum(input), 'output', sum(output),
+      'cache_write', sum(cache_write), 'cache_read', sum(cache_read),
+      'tokens', sum(input + output + cache_write + cache_read),
+      'messages', sum(messages),
+      'cost_usd', round(coalesce(sum(cost), 0), 4),
+      'cost_complete', json(CASE WHEN sum(model != '' AND cost IS NULL) > 0
+                                 THEN 'false' ELSE 'true' END),
+      'model', (SELECT model FROM usage x WHERE x.session = $s AND x.created_at = $c
+                AND x.model != '' GROUP BY model
+                ORDER BY sum(x.output + x.input + x.cache_write) DESC LIMIT 1),
+      'models', (SELECT json_group_array(json_object('model', model, 'speed', speed,
+                   'input', i, 'output', o, 'cache_write', w, 'cache_read', r,
+                   'messages', n, 'cost_usd', CASE WHEN c IS NULL THEN NULL ELSE round(c, 4) END))
+                 FROM (SELECT model, speed, sum(input) i, sum(output) o,
+                              sum(cache_write) w, sum(cache_read) r, sum(messages) n,
+                              sum($cost) c
+                       FROM usage u WHERE u.session = $s AND u.created_at = $c
+                         AND u.model != '' GROUP BY model, speed
+                       ORDER BY c DESC)),
+      'updated_at', max(updated_at)) END
+    FROM (SELECT u.*, $cost AS cost FROM usage u
+          WHERE u.session = $s AND u.created_at = $c))"
+}
+
+# The usage rows of incarnations that are neither registered nor archived: a
+# session removed under WTS_NO_ARCHIVE=1, or one whose archive store failed.
+# A statement of its own, after the transaction that deletes the session: on a
+# database an older wts created, the table may not exist yet, and with -bail
+# that would abort the deletion itself.
+usage_prune_sql() {
+  print -r -- "DELETE FROM usage
+  WHERE NOT EXISTS (SELECT 1 FROM sessions s
+                    WHERE s.name = usage.session AND s.created_at = usage.created_at)
+    AND NOT EXISTS (SELECT 1 FROM archive a
+                    WHERE a.session = usage.session AND a.created_at = usage.created_at);"
+}
+
+# What a task cost over every attempt, as a SQL expression yielding a JSON
+# object ({tokens, cost_usd, cost_complete, sessions}) or NULL: the archived
+# sessions that served it and the live ones linked to it now. <task> is a SQL
+# literal (sql_str). wts task show prints it, wts log adds the same up itself.
+task_usage_sql() {  # <task literal>
+  local q="$1" cost
+  cost=$(usage_cost_sql u)
+  print -r -- "(SELECT CASE WHEN count(*) = 0 THEN NULL ELSE json_object(
+      'tokens', sum(input + output + cache_write + cache_read),
+      'cost_usd', round(coalesce(sum(cost), 0), 4),
+      'cost_complete', json(CASE WHEN sum(model != '' AND cost IS NULL) > 0
+                                 THEN 'false' ELSE 'true' END),
+      'sessions', count(DISTINCT session || char(31) || created_at)) END
+    FROM (SELECT u.*, $cost AS cost FROM usage u
+          WHERE (u.session, u.created_at) IN (
+            SELECT session, created_at FROM archive WHERE task = $q
+            UNION SELECT s.name, s.created_at FROM sessions s
+                  JOIN task_links l ON l.session = s.name WHERE l.task = $q)))"
 }

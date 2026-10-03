@@ -1,10 +1,12 @@
 #!/usr/bin/env zsh
 # wts-status — state engine: registry + git + tmux + claude agents -> JSON
 #
-# Usage: wts-status [--json | --table | --fzf] [--no-git] [name...]
+# Usage: wts-status [--json | --table [--wide] | --fzf] [--no-git] [name...]
 #
 #   --json  (default) JSON array, one object per registered worktree
 #   --table colored column rendering for `wts ls`
+#   --wide  with --table: TOKENS, COST and MODEL too (`wts ls --wide`), read
+#           from the usage table that wts brief and the archive fill
 #   --fzf   sorted lines (stuck first) for wts-switch, fields separated by
 #           \x1f: TAB is an IFS whitespace and would collapse empty fields (an
 #           agent without a tmux pane would shift every column).
@@ -51,6 +53,7 @@ first_root=""   # repository of the first session: the slow-pass hint checks its
 
 FORMAT=json
 WITH_GIT=true
+WIDE=false
 typeset -a ONLY
 ONLY=()
 while (( $# )); do
@@ -62,7 +65,8 @@ while (( $# )); do
     # never git — it runs every status-interval.
     --line)   FORMAT=line; WITH_GIT=false ;;
     --no-git) WITH_GIT=false ;;
-    -*) print -u2 "wts-status: unknown option '$1' (--json|--table|--fzf|--line|--no-git)"; exit 2 ;;
+    --wide)   WIDE=true ;;
+    -*) print -u2 "wts-status: unknown option '$1' (--json|--table|--wide|--fzf|--line|--no-git)"; exit 2 ;;
     *)  ONLY+=("$1") ;;
   esac
   shift
@@ -443,6 +447,20 @@ if merged=$(print -r -- "$all" | jq --slurpfile reg <(print -r -- "$REGISTRY") \
   all="$merged"
 fi
 
+# Tokens and cost, from the usage table only: the transcripts are summed by wts
+# brief and at teardown, never here — a 20 MB transcript is half a second of jq,
+# and this pass runs on every switcher tick. Not for --fzf or --line either: the
+# switcher shows none of it, and one query less is one query less every 2 s.
+if [[ "$FORMAT" == json ]] || { [[ "$FORMAT" == table ]] && $WIDE; }; then
+  usage_map=$(db_ro "SELECT json_group_object(name, json($(usage_json_sql s.name s.created_at)))
+                     FROM sessions s" 2>/dev/null)
+  [[ -n "$usage_map" ]] || usage_map='{}'
+  if merged=$(print -r -- "$all" | jq --argjson u "$usage_map" \
+        'map(. + {usage: ($u[.name] // null)})' 2>/dev/null); then
+    all="$merged"
+  fi
+fi
+
 # SUBJECT: the name Claude gave the conversation, otherwise the starting phrase
 # (restored session, agent not relaunched yet), otherwise the context. `//` is
 # not enough: jq lets an empty string through.
@@ -464,6 +482,20 @@ SUBJECT='def subject: (if (.task_title // "") != "" then "@ " else "" end)
      | map(select(type == "string" and . != "")) | (.[0] // ""))
   | gsub("[\\t\\n\\r]"; " ")
   | if length > 50 then .[0:49] + "…" else . end;'
+
+# --wide: TOKENS is every token the API counted (input, output, cache writes
+# and reads: the reads dominate an agent's), COST their API list price ("~"
+# when a model has no price in wts-db.zsh, so the sum is short), MODEL the one
+# that cost the most, without "claude-" and the date. "-": never summed yet.
+USAGE_CELLS='def human: if . >= 1e9 then "\(. / 1e8 | floor / 10)G"
+                     elif . >= 1e6 then "\(. / 1e5 | floor / 10)M"
+                     elif . >= 1e3 then "\(. / 1e3 | floor)k" else tostring end;
+def usage_cells: if .usage == null then ["-", "-", "-"] else
+  [ (.usage.tokens | human),
+    ((if .usage.cost_complete then "$" else "~$" end)
+     + (.usage.cost_usd * 100 | round / 100 | tostring
+        | if test("\\.[0-9]$") then . + "0" elif test("\\.") then . else . + ".00" end)),
+    (.usage.model // "-" | sub("^claude-"; "") | sub("-[0-9]{8}$"; "")) ] end;'
 
 # --no-git: the git columns read "-" (unknown), never "+0/-0 clean" (a claim).
 case "$FORMAT" in
@@ -514,10 +546,13 @@ case "$FORMAT" in
          repos_json=$(jq -nc 'reduce range(0; $ARGS.positional | length; 2) as $i
                                 ({}; . + {($ARGS.positional[$i]): $ARGS.positional[$i + 1]})' \
                         --args "${repo_pairs[@]}")
-         print -r -- "$all" | jq -r --argjson git "$WITH_GIT" --argjson repos "${repos_json:-"{}"}" "$SUBJECT"'
+         print -r -- "$all" | jq -r --argjson git "$WITH_GIT" --argjson wide "$WIDE" \
+             --argjson repos "${repos_json:-"{}"}" "$SUBJECT$USAGE_CELLS"'
            ([$repos[]] | unique | length > 1) as $multi
            | (["SESSION"] + (if $multi then ["REPO"] else [] end)
-              + ["AGENT","BRANCH","DELTA","DIRTY","TMUX","SUBJECT"] | @tsv),
+              + ["AGENT","BRANCH","DELTA","DIRTY","TMUX"]
+              + (if $wide then ["TOKENS","COST","MODEL"] else [] end)
+              + ["SUBJECT"] | @tsv),
            (.[] | [ .name ]
                 + (if $multi then [$repos[.repo_root // ""] // "-"] else [] end)
                 + [
@@ -525,8 +560,9 @@ case "$FORMAT" in
                     .branch,
                     (if $git then "+\(.added)/-\(.removed)" + (if .ahead > 0 then " ^\(.ahead)" else "" end) else "-" end),
                     (if ($git | not) then "-" elif .dirty > 0 then "yes" else "no" end),
-                    (if .tmux_alive then "running" else "stopped" end),
-                    (subject | if . == "" then "-" else . end) ] | @tsv)' \
+                    (if .tmux_alive then "running" else "stopped" end) ]
+                + (if $wide then usage_cells else [] end)
+                + [ (subject | if . == "" then "-" else . end) ] | @tsv)' \
          | column -t -s $'\t' ;;
 esac
 

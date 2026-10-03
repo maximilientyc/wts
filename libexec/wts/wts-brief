@@ -18,6 +18,9 @@
 # as long as neither HEAD, nor the changes, nor the transcript have moved:
 # running `wts brief` again is then instant.
 #
+# Also sums each session's token usage (see usage_store in wts-db.zsh), which
+# wts ls --wide and wts log show.
+#
 # Variables: WTS_MODEL (haiku), WTS_BRIEF_TIMEOUT (45 s),
 #            WTS_BRIEF_JOBS (4 concurrent calls: each `claude` is heavy),
 #            WTS_NO_LLM=1 (facts only, no call)
@@ -293,6 +296,13 @@ fi
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/wts-brief.XXXXXX")
 trap 'rm -rf "$tmpdir"' EXIT
 db_init 2>/dev/null
+
+# Tokens per session, from the same transcripts: wts ls --wide and wts log read
+# the table this fills. Each unchanged transcript costs one stat, so a second
+# brief is not slower; nothing here needs the model, so WTS_NO_LLM=1 still runs it.
+usage_refresh "${(@f)$(print -r -- "$status_json" | jq -r --args '
+  $ARGS.positional as $want | .[] | select(.exists)
+  | select(($want | length) == 0 or (.name | IN($want[]))) | .name' "$@")}"
 
 # ─── Collection (sequential: git and jq are fast) ────────────────────────────
 

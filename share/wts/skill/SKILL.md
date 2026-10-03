@@ -16,13 +16,13 @@ never renamed.
 
 | Command | What it answers |
 |---|---|
-| `wts status --json` | every session: `name`, `branch`, `worktree`, `agent_state` (blocked working idle done failed stopped), `agent_since`, `agent_waiting_for`, `task`, git delta |
+| `wts status --json` | every session: `name`, `branch`, `worktree`, `agent_state` (blocked working idle done failed stopped), `agent_since`, `agent_waiting_for`, `task`, git delta, `usage` (tokens and cost) |
 | `wts brief --cached --json` | each session's last "done / next" summary and its age — no model call |
 | `wts task ls --all --json`, `wts task show <id> --json` | tasks, their notes, documents, live sessions and previous attempts |
 | `wts doc ls --json`, `wts doc show <slug> --json` | the context documents and which sessions they are attached to |
 | `wts db notes --all` | the notes the agents left each other |
 | `wts db sql "<SELECT …>" --json` | anything else (read-only); `wts db schema` lists the tables |
-| `wts log --since '-30 days'` | finished sessions, outcomes, retrospectives |
+| `wts log --since '-30 days'` | finished sessions, outcomes, retrospectives, tokens and cost per session and per task |
 | `wts doctor --json` | whether wts can work on this machine |
 
 ## Working next to other agents (inside a session)

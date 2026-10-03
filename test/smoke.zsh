@@ -1799,8 +1799,8 @@ check "the base it was compared against is recorded" eval '
   [[ "$(q "select base from archive where session = '"'"'gcarch'"'"'")" == main ]]'
 check "the worktree really is gone" eval '[[ ! -e "$WT/gcarch" ]]'
 
-check "the schema is at version 5" eval '
-  [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 5 ]]'
+check "the schema is at version 6" eval '
+  [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 6 ]]'
 
 # ─── Agent friendly ──────────────────────────────────────────────────────────
 # What wts is like for the Claude agent in a pane: a Bash tool with no terminal
@@ -1945,7 +1945,86 @@ check "doctor finds the skill" eval '[[ "$(CLAUDE_CONFIG_DIR="$CS" "$WTS" doctor
 print -r -- "my own skill" > "$CS/skills/wts/SKILL.md"
 CLAUDE_CONFIG_DIR="$CS" "$WTS" setup claude --install >/dev/null 2>&1
 check "a SKILL.md of your own is left alone" eval '[[ "$(<"$CS/skills/wts/SKILL.md")" == "my own skill" ]]'
+# ─── Usage: tokens and cost per session ─────────────────────────────────────
+# Claude Code repeats a message's usage on every record of it (one per content
+# block): message A appears twice, its output growing, and must count once at
+# its largest. <synthetic> is Claude Code's placeholder and costs nothing. The
+# subagent's file is a transcript of its own, under <session id>/subagents/.
+# Opus 5.5: 15 in, 300 out, 1000 written to the 1h cache (2x), 30000 read
+# (0.20) -> 0.02006; the Haiku subagent: 100 in, 1000 out -> 0.0051.
+{
+  print -r -- '{"type":"assistant","message":{"id":"msg_A","model":"claude-opus-5-5","usage":{"input_tokens":10,"output_tokens":50,"cache_creation_input_tokens":1000,"cache_creation":{"ephemeral_1h_input_tokens":1000},"cache_read_input_tokens":10000},"content":[{"type":"thinking"}]}}'
+  print -r -- '{"type":"assistant","message":{"id":"msg_A","model":"claude-opus-5-5","usage":{"input_tokens":10,"output_tokens":100,"cache_creation_input_tokens":1000,"cache_creation":{"ephemeral_1h_input_tokens":1000},"cache_read_input_tokens":10000},"content":[{"type":"text","text":"hi"}]}}'
+  print -r -- '{"type":"assistant","message":{"id":"msg_B","model":"claude-opus-5-5","usage":{"input_tokens":5,"output_tokens":200,"cache_creation_input_tokens":0,"cache_read_input_tokens":20000},"content":[{"type":"text","text":"ok"}]}}'
+  print -r -- '{"type":"assistant","message":{"id":"msg_S","model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0},"content":[{"type":"text","text":"No response requested."}]}}'
+} > "$proj_a/0123abcd-ef01-2345-6789-abcdef0000bb.jsonl"
+mkdir -p "$proj_a/0123abcd-ef01-2345-6789-abcdef0000bb/subagents"
+print -r -- '{"type":"assistant","isSidechain":true,"message":{"id":"msg_H","model":"claude-haiku-4-5-20251001","usage":{"input_tokens":100,"output_tokens":1000},"content":[{"type":"text","text":"found it"}]}}' \
+  > "$proj_a/0123abcd-ef01-2345-6789-abcdef0000bb/subagents/agent-x.jsonl"
+
+refute "ls and status never read a transcript" eval '
+  "$WTS" ls >/dev/null; "$WTS" status --json >/dev/null
+  [[ "$(q "SELECT count(*) FROM usage WHERE session = '\''agent-a'\''")" != 0 ]]'
+check "wts status --json says usage: null before any count" eval '
+  "$WTS" status --json agent-a | jq -e ".[0] | has(\"usage\") and .usage == null"'
+"$WTS" brief agent-a </dev/null >/dev/null 2>&1
+check "wts brief counts each message once, at its largest" eval '
+  [[ "$(q "SELECT sum(output) FROM usage WHERE session = '\''agent-a'\'' AND model = '\''claude-opus-5-5'\''")" == 300 ]]'
+check "the synthetic placeholder is left out" eval '
+  [[ "$(q "SELECT count(*) FROM usage WHERE model = '\''<synthetic>'\''")" == 0 ]]'
+check "a subagent transcript counts, under its own model" eval '
+  [[ "$(q "SELECT output FROM usage WHERE session = '\''agent-a'\'' AND model LIKE '\''claude-haiku-4-5%'\''")" == 1000 ]]'
+check "status --json carries tokens, cost and the main model" eval '
+  "$WTS" status --json agent-a | jq -e ".[0].usage | .output == 1300 and .cache_read == 30000
+    and .cost_usd == 0.0252 and .cost_complete and .model == \"claude-opus-5-5\"
+    and (.models | length) == 2"'
+check "ls --wide adds tokens, cost and model" eval '
+  out=$("$WTS" ls --wide)
+  [[ "$out" == *TOKENS*COST*MODEL*SUBJECT* && "$(print -r -- "$out" | grep "^agent-a ")" == *"32k"*"\$0.03"*"opus-5-5"* ]]'
+check "plain ls does not" eval '[[ "$("$WTS" ls)" != *TOKENS* ]]'
+check "status --table --wide is the same table" eval '[[ "$("$WTS" status --table --wide)" == *TOKENS* ]]'
+check "the switcher list keeps its 9 fields" eval '"$WTS" status --fzf | awk -F "\037" "NF != 9 { exit 1 }"'
+q "UPDATE usage SET input = 999 WHERE session = 'agent-a' AND model = 'claude-opus-5-5'"
+"$WTS" brief agent-a </dev/null >/dev/null 2>&1
+check "an unchanged transcript is not read again" eval '
+  [[ "$(q "SELECT input FROM usage WHERE session = '\''agent-a'\'' AND model = '\''claude-opus-5-5'\''")" == 999 ]]'
+print -r -- '{"type":"assistant","message":{"id":"msg_C","model":"claude-opus-5-5","usage":{"input_tokens":1,"output_tokens":1},"content":[]}}' \
+  >> "$proj_a/0123abcd-ef01-2345-6789-abcdef0000bb.jsonl"
+"$WTS" brief agent-a </dev/null >/dev/null 2>&1
+check "a grown one is, whole" eval '
+  [[ "$(q "SELECT input || '\'' '\'' || output FROM usage WHERE session = '\''agent-a'\'' AND model = '\''claude-opus-5-5'\''")" == "16 301" ]]'
+q "INSERT INTO usage (session, created_at, transcript, model, output)
+   SELECT name, created_at, 'x', 'claude-future-9', 5 FROM sessions WHERE name = 'agent-a'"
+check "an unpriced model makes the cost approximate, not wrong" eval '
+  "$WTS" status --json agent-a | jq -e ".[0].usage | (.cost_complete | not) and .cost_usd > 0" >/dev/null \
+  && [[ "$("$WTS" ls --wide | grep "^agent-a ")" == *"~\$0.03"* ]]'
+q "DELETE FROM usage WHERE transcript = 'x'"
+check "wts log carries the usage of a live session" eval '
+  "$WTS" log --no-things | jq -e "[.work[].sessions[] | select(.name == \"agent-a\")][0].usage.output == 1301"'
+q "INSERT OR IGNORE INTO tasks (id, source, title, status, synced_at) VALUES ('t-usage', 'local', 'usage task', 'open', 'x');
+   INSERT OR REPLACE INTO task_links VALUES ('agent-a', 't-usage', 'x')"
+check "and of the work item, added up over its sessions" eval '
+  "$WTS" log --no-things | jq -e "[.work[] | select(.id == \"t-usage\")][0].usage | .output == 1301 and .sessions == 1"'
+check "wts task show says what the task cost" eval '
+  [[ "$("$WTS" task show t-usage </dev/null)" == *"usage:  32k tokens, \$0.03 at API list prices, over 1 session(s)"* ]]'
+check "and task show --json has it" eval '
+  "$WTS" task show t-usage --json </dev/null | jq -e ".usage.sessions == 1 and .usage.tokens > 0"'
+check "the table is in the schema" eval '[[ "$("$WTS" db schema)" == *"CREATE TABLE usage"* ]]'
 "$WTS" rm agent-a -f >/dev/null
+check "the usage outlives the session, with its archive row" eval '
+  "$WTS" log --no-things --since 2020-01-01 \
+    | jq -e "[.work[].sessions[] | select(.name == \"agent-a\" and .state == \"archived\")][0].usage.output == 1301"'
+env WTS_NO_ATTACH=1 "$WTS" noarch2 smoke >/dev/null
+q "INSERT INTO usage (session, created_at, transcript, model, output)
+   SELECT name, created_at, 'y', 'claude-opus-5-5', 7 FROM sessions WHERE name = 'noarch2'"
+env WTS_NO_ARCHIVE=1 "$WTS" rm noarch2 -f >/dev/null
+check "and goes when there is no archive row to keep it" eval '
+  [[ "$(q "SELECT count(*) FROM usage WHERE session = '\''noarch2'\''")" == 0 ]]'
+# An existing database, written by a wts before the table: db_init only adds it
+# because the schema version moved.
+q "DROP TABLE usage; PRAGMA user_version = 5"
+check "a database at schema 5 gets the table on the next command" eval '
+  "$WTS" ls >/dev/null; [[ "$(q "SELECT count(*) FROM sqlite_master WHERE name = '\''usage'\''")" == 1 ]]'
 check "log, retro, doctor, keys, doc, stop and pr are info commands for wts-fresh" eval '
   line=$(grep -E "^  ls\|status\|" "$ROOT/libexec/wts/wts-fresh")
   for c in log retro doctor keys doc stop pr; do [[ "$line" == *"|$c|"* ]] || exit 1; done'

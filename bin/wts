@@ -7,7 +7,7 @@
 #        wts new [-p layout] <name|"phrase"...>
 #        wts doc add <url|path> | ls [--json] | show [--json] | sync | forget
 #        wts doc use <slug> [session] | tools
-#        wts ls | wts status [--json|--table|--fzf]
+#        wts ls [--wide] | wts status [--json|--table [--wide]|--fzf]
 #        wts brief [name...] | brief --cached [--json] [name...]
 #        wts send <session> <text...>
 #        wts wait <session>... [--until <state>,...] [--timeout <s>] [--json]
@@ -50,7 +50,9 @@
 #                JSON: name, branch, worktree, task (an array for `new`)
 #
 #   new        : create several sessions at once, then attach to the first
-#   ls         : list registered sessions and their state (agent, git delta)
+#   ls         : list registered sessions and their state (agent, git delta);
+#                --wide: tokens, API-price cost and model too (as of the last
+#                `wts brief`, or the teardown)
 #   status     : same collection, as JSON (--json), table (--table) or fzf lines (--fzf)
 #   brief      : where each session stands, "done / next", summarized by Claude;
 #                --cached: the last summaries, from the database, no model call
@@ -197,6 +199,7 @@ registry_del() {
         DELETE FROM agent_panes WHERE session IN $in;
         DELETE FROM touches WHERE session IN $in;
         COMMIT;" >/dev/null 2>&1 || true
+  db_q "$(usage_prune_sql)" >/dev/null 2>&1 || true
 }
 
 # Drop the entries whose worktree is gone. One DELETE for all of them: the
@@ -907,8 +910,14 @@ if [[ "$1" == "ls" || "$1" == "status" ]]; then
   # `wts ls --json` printed the table and exited 0: the argument was dropped
   # without a word, and a script reading JSON got a box. `ls` takes nothing;
   # `status` is the one with formats.
+  # --wide is the one option: the same table with three more columns.
+  ls_wide=()
+  if [[ "$sub" == ls && "${1:-}" == --wide ]]; then
+    ls_wide=(--wide)
+    shift
+  fi
   if [[ "$sub" == ls ]] && (( $# )); then
-    echo "wts ls takes no argument (got '$1'); for a format: wts status --json|--table|--fzf" >&2
+    echo "wts ls takes only --wide (got '$1'); for a format: wts status --json|--table|--fzf" >&2
     exit 2
   fi
 
@@ -925,7 +934,7 @@ if [[ "$1" == "ls" || "$1" == "status" ]]; then
     echo "No registered session."
     exit 0
   fi
-  exec "$WTS_LIBEXEC/wts-status" --table
+  exec "$WTS_LIBEXEC/wts-status" --table "${ls_wide[@]}"
 fi
 
 # ─── Subcommand: brief ───────────────────────────────────────────────────────
