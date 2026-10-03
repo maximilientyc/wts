@@ -1,0 +1,294 @@
+#!/usr/bin/env zsh
+# wts-doctor — what wts needs, what it can use, and whether its two
+# integrations are installed and current. `wts doctor`.
+#
+# Usage: wts-doctor <wts version>
+#
+# Why one command: every dependency used to be discovered by its absence, late.
+# tmuxinator by the `exec` at the end of a creation, after the worktree existed;
+# an old fzf by a switcher that silently lost reply mode or its footer (each
+# feature is gated on a version, see wts-switch); tmux < 3.2 by a prefix+s that
+# did nothing (display-popup); a tmux snippet or Claude hooks from an older
+# install by keys that pointed at a Cellar path `brew cleanup` had removed.
+#
+# Read-only, and cheap: no fetch, no model call, no write to the database. Two
+# exceptions to "instant", both bounded: `claude agents --json` (the collector's
+# source of agent states, 5 s cap) and `tmuxinator version` (Ruby, ~0.3 s).
+# Things is never touched: its availability is the cached verdict of
+# `wts-things available`, for the reason CLAUDE.md gives (macOS 15 asks for
+# permission on the first read, and a check must not raise that dialog).
+#
+# Exit 1 when something required is missing or broken, 0 otherwise (warnings
+# included): `wts doctor && …` in a setup script means "wts will work".
+
+set -uo pipefail
+
+WTS_BIN="${0:A:h}"
+VERSION="${1:-?}"
+source "$WTS_BIN/wts-db.zsh"
+autoload -Uz is-at-least
+
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+
+# The path `wts setup` writes into the snippets: the opt/ link rather than the
+# versioned Cellar folder (see bin/wts). An integration is "from this install"
+# when it points there.
+libexec="$WTS_BIN"
+if [[ "$libexec" =~ '^(.*)/Cellar/wts/[^/]+/(.*)$' ]]; then
+  libexec="${match[1]}/opt/wts/${match[2]}"
+fi
+
+integer errors=0 warnings=0
+ok()   { print -r -- "  ✓ $*" }
+warn() { print -r -- "  ⚠ $*"; (( warnings++ )) }
+bad()  { print -r -- "  ✗ $*"; (( errors++ )) }
+section() { print -r -- ""; print -r -- "$1" }
+
+# A command's version, by the first thing in its output that looks like one.
+version_of() {  # <command> <args...>
+  "$@" 2>/dev/null | head -1 | grep -oE '[0-9]+(\.[0-9]+)+[a-z]?' | head -1
+}
+
+# Bounded run: `perl alarm`, as everywhere in wts (always present on macOS).
+bounded() {  # <seconds> <command...>
+  perl -e 'alarm shift; exec @ARGV' "$@"
+}
+
+print -r -- "wts $VERSION — ${WTS_BIN:h:h}"
+
+# ─── Required ────────────────────────────────────────────────────────────────
+section "Required"
+
+if v=$(version_of git --version) && [[ -n "$v" ]]; then
+  ok "git $v"
+else
+  bad "git not found"
+fi
+
+if (( ${+commands[tmux]} )); then
+  # `tmux -V` says "tmux 3.5a", "tmux next-3.6" or "tmux master": a build from
+  # source is newer than any release, not older.
+  v=$(tmux -V 2>/dev/null)
+  n=$(print -r -- "$v" | grep -oE '[0-9]+\.[0-9]+' | head -1)
+  if [[ -z "$n" || "$v" == *master* ]] || is-at-least 3.2 "$n"; then
+    ok "${v:-tmux}"
+  else
+    bad "$v: 3.2 or later is needed (display-popup: the switcher, prefix+s)"
+  fi
+else
+  bad "tmux not found (brew install tmux)"
+fi
+
+if (( ${+commands[tmuxinator]} )); then
+  # Run, not just found: a version manager's shim (asdf, rbenv) is on PATH
+  # whether or not its Ruby can be found, and then exits 126 in silence — every
+  # session start fails while `command -v` is satisfied.
+  if out=$(bounded 10 tmuxinator version 2>&1); then
+    v=$(print -r -- "$out" | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)
+    ok "tmuxinator ${v:-(version unknown)}"
+  else
+    rc=$?
+    bad "tmuxinator is on PATH but does not run (exit $rc${out:+: ${${(f)out}[1]}}): no session can start"
+  fi
+else
+  bad "tmuxinator not found (brew install tmuxinator): no session can start"
+fi
+
+if (( ${+commands[sqlite3]} )); then
+  v=$(version_of sqlite3 --version)
+  # unixepoch() (gc's pruning of old pane hashes) and -safe (wts db sql).
+  if [[ -n "$v" ]] && ! is-at-least 3.38 "$v"; then
+    bad "sqlite3 $v: 3.38 or later is needed (unixepoch, -safe)"
+  else
+    ok "sqlite3 ${v:-?}"
+  fi
+else
+  bad "sqlite3 not found: no registry, no ls, no restore"
+fi
+
+if (( ${+commands[jq]} )); then
+  ok "jq $(version_of jq --version)"
+else
+  bad "jq not found (brew install jq): wts ls, the switcher and the hooks need it"
+fi
+
+(( ${+commands[perl]} )) && ok "perl $(version_of perl -e 'print $^V')" \
+                         || bad "perl not found: timeouts and names from a phrase need it"
+
+# ─── Optional ────────────────────────────────────────────────────────────────
+section "Optional"
+
+if (( ${+commands[fzf]} )); then
+  v=$(fzf --version 2>/dev/null | cut -d' ' -f1)
+  # The gates of wts-switch, each named by what it costs: below them the popup
+  # works, without the feature, and without saying so.
+  typeset -a lost
+  lost=()
+  if [[ -n "$v" ]]; then
+    is-at-least 0.36 "$v" || lost+=("instant list (0.36)")
+    is-at-least 0.45 "$v" || lost+=("reply mode, tab (0.45)")
+    is-at-least 0.46 "$v" || lost+=("preview fitted to the pane (0.46)")
+    is-at-least 0.65 "$v" || lost+=("key footer, ? (0.65)")
+  fi
+  if (( ${#lost} )); then
+    warn "fzf $v: no ${(j:, no :)lost}"
+  else
+    ok "fzf ${v:-?}"
+  fi
+else
+  warn "fzf not found: no switcher (prefix+s), no pickers"
+fi
+
+if (( ${+commands[claude]} )); then
+  ok "claude $(version_of claude --version)"
+  # The collector's source of agent states. An answer that is not a JSON array
+  # leaves every AGENT column to the hooks alone.
+  out=$(bounded 5 claude agents --json 2>/dev/null)
+  if print -r -- "$out" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    ok "claude agents --json answers ($(print -r -- "$out" | jq length) agent(s))"
+  else
+    warn "claude agents --json does not answer: agent states come from the hooks only"
+  fi
+else
+  warn "claude not found: no agent in the layouts, no naming, brief, retro or doc fetch"
+fi
+[[ -n "${WTS_NO_LLM:-}" ]] && warn "WTS_NO_LLM is set: wts never calls the model"
+
+(( ${+commands[gh]} )) && ok "gh $(version_of gh --version)" \
+                       || warn "gh not found: no wts pr, no ctrl-o"
+(( ${+commands[curl]} )) || warn "curl not found: the switcher does not refresh by itself"
+
+if [[ -n "${WTS_NOTIFIER:-}" || -n "${commands[terminal-notifier]:-}" ]]; then
+  ok "banner: terminal-notifier (a click switches to the session)"
+elif [[ "$OSTYPE" == darwin* ]]; then
+  ok "banner: macOS notification (terminal-notifier adds click-to-switch)"
+elif (( ${+commands[notify-send]} )); then
+  ok "banner: notify-send"
+else
+  warn "no banner: neither terminal-notifier nor notify-send (the bell still rings)"
+fi
+
+if [[ "$OSTYPE" == darwin* ]]; then
+  if [[ -n "${WTS_NO_THINGS:-}" ]]; then
+    ok "Things: off (WTS_NO_THINGS)"
+  elif "$WTS_BIN/wts-things" available 2>/dev/null; then
+    ok "Things: readable"
+  else
+    ok "Things: not read yet, or not available (wts task add asks; WTS_NO_THINGS=1 turns it off)"
+  fi
+fi
+
+# ─── Integration ─────────────────────────────────────────────────────────────
+section "Integration"
+
+# The tmux snippet: in the configuration file, and in the running server. Both,
+# because they drift apart: a `brew upgrade` changes the first only once the
+# file is regenerated, and the server keeps the bindings it last sourced.
+conf=""
+for f in "$HOME/.tmux.conf" "${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf"; do
+  [[ -f "$f" ]] && { conf="$f"; break }
+done
+if [[ -z "$conf" ]]; then
+  warn "tmux snippet: no tmux.conf (wts setup tmux --install)"
+else
+  blocks=$(grep -cE '^# >>> wts |generated by `wts setup tmux`' "$conf" 2>/dev/null)
+  marked=$(grep -oE '^# >>> wts [0-9][^ ]* ' "$conf" 2>/dev/null | head -1 | awk '{ print $4 }')
+  paths=("${(@u)${(f)$(grep -oE '[^ "#(]*/wts-(switch|fresh|status)' "$conf" 2>/dev/null)}:h}")
+  paths=("${(@)paths:#}")
+  if (( ${blocks:-0} == 0 )); then
+    warn "tmux snippet: not in $conf (wts setup tmux --install)"
+  elif (( blocks > 1 )); then
+    warn "tmux snippet: $blocks copies in $conf, appended by upgrades (wts setup tmux --install keeps one)"
+  elif [[ -z "$marked" ]]; then
+    warn "tmux snippet: from a wts before 1.6, without markers (wts setup tmux --install replaces it)"
+  elif [[ "$marked" != "$VERSION" ]]; then
+    warn "tmux snippet: from wts $marked, this is $VERSION (wts setup tmux --install)"
+  else
+    ok "tmux snippet: in $conf (wts $marked)"
+  fi
+  if (( ${#paths} )) && [[ "${paths[1]}" != "$libexec" || ${#paths} -gt 1 ]]; then
+    warn "tmux snippet points at ${(j:, :)paths}, not $libexec"
+  fi
+fi
+# The whole table and not `list-keys -T prefix s`: tmux 3.7 answers that one
+# with nothing, and exit 0.
+if [[ -n "${commands[tmux]:-}" ]] && bound=$(tmux list-keys -T prefix 2>/dev/null); then
+  bound=$(print -r -- "$bound" | awk '$3 == "prefix" && $4 == "s"')
+  if [[ "$bound" == *"$libexec/wts-switch"* ]]; then
+    ok "tmux server: prefix+s opens this switcher"
+  elif [[ "$bound" == *wts-switch* ]]; then
+    warn "tmux server: prefix+s opens another wts ($(print -r -- "$bound" | grep -oE '[^ "]*/wts-switch' | head -1)); tmux source-file $conf"
+  else
+    warn "tmux server: prefix+s is not the wts switcher (tmux source-file ${conf:-~/.tmux.conf})"
+  fi
+else
+  ok "tmux server: not running (the snippet is read when it starts)"
+fi
+
+# The Claude hooks: five events, all pointing at this install, and the four
+# permissions that keep the first thing an agent does from being a prompt.
+settings="$CLAUDE_DIR/settings.json"
+if [[ ! -s "$settings" ]]; then
+  warn "Claude hooks: no $settings (wts setup claude --install)"
+elif ! command -v jq >/dev/null 2>&1; then
+  warn "Claude hooks: jq needed to read $settings"
+else
+  typeset -a missing stale
+  missing=() stale=()
+  for ev cmd in SessionStart "$libexec/wts-context" UserPromptSubmit "$libexec/wts-hook prompt" \
+                Stop "$libexec/wts-hook stop" Notification "$libexec/wts-hook notification" \
+                SessionEnd "$libexec/wts-hook end"; do
+    cmds=$(jq -r --arg e "$ev" '.hooks[$e] // [] | .[] | .hooks // [] | .[] | .command // empty' \
+             "$settings" 2>/dev/null | grep -E '/wts-(context|hook)( |$)')
+    if [[ -z "$cmds" ]]; then
+      missing+=("$ev")
+    elif ! print -r -- "$cmds" | grep -qxF -- "$cmd"; then
+      stale+=("$ev")
+    fi
+  done
+  perms=$(jq -r '.permissions.allow // [] | .[]' "$settings" 2>/dev/null)
+  typeset -a noperm
+  noperm=()
+  for p in "Bash(wts db:*)" "Bash(wts task note:*)" "Bash(wts task show:*)" "Bash(wts status:*)"; do
+    print -r -- "$perms" | grep -qxF -- "$p" || noperm+=("$p")
+  done
+  if (( ${#missing} == 5 )); then
+    warn "Claude hooks: not installed (wts setup claude --install)"
+  elif (( ${#missing} + ${#stale} )); then
+    warn "Claude hooks: ${missing:+missing ${(j:, :)missing}}${missing:+${stale:+; }}${stale:+${(j:, :)stale} from another install} (wts setup claude --install)"
+  else
+    ok "Claude hooks: the five events, from this install"
+  fi
+  (( ${#noperm} && ${#missing} < 5 )) \
+    && warn "Claude permissions: ${(j:, :)noperm} missing, agents will ask (wts setup claude --install)"
+fi
+
+# ─── State ───────────────────────────────────────────────────────────────────
+section "State"
+if ! db_available; then
+  bad "no sqlite3: no state database"
+elif [[ ! -s "$WTS_DB" ]]; then
+  ok "database: none yet ($WTS_DB, created by the first session)"
+else
+  v=$(db_ro 'PRAGMA user_version' 2>/dev/null)
+  n=$(db_ro 'SELECT count(*) FROM sessions' 2>/dev/null)
+  if [[ ! -w "$WTS_DB" || ! -w "${WTS_DB:h}" ]]; then
+    bad "database: $WTS_DB is not writable"
+  elif [[ "$v" == <-> ]] && (( v < WTS_DB_SCHEMA )); then
+    ok "database: $WTS_DB (schema $v, upgraded to $WTS_DB_SCHEMA by the next command)"
+  else
+    ok "database: $WTS_DB (schema ${v:-?}, ${n:-0} session(s))"
+  fi
+fi
+
+print -r -- ""
+if (( errors )); then
+  print -r -- "→ $errors problem(s), $warnings warning(s): wts will not work until the ✗ lines are fixed"
+  exit 1
+fi
+if (( warnings )); then
+  print -r -- "→ ready, $warnings warning(s)"
+else
+  print -r -- "→ ready"
+fi
+exit 0

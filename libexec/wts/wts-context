@@ -14,7 +14,16 @@
 # start must never wait on a `git status` of every worktree; the agent can run
 # `wts status --json` itself when it wants live agent states.
 #
+# Every line printed here is re-injected at each start, /clear, /compact and
+# resume, so the output is kept to what can change what the agent does: the
+# sessions of the SAME repository (another repository's cannot collide with
+# this worktree), capped, and the directives about overlap only when such a
+# session exists. It used to list fifteen sessions of any repository, ten
+# notes, a task's notes uncapped and the MANDATORY block even under "No other
+# wts session is registered" — 1 to 2k tokens, every time.
+#
 # Usage: wts-context
+# Variables: WTS_CONTEXT_QUIET=1 — only who the agent is and its task's title
 
 set -uo pipefail
 
@@ -55,6 +64,11 @@ IFS=$'\x1f' read -r -d $'\x1e' my_branch my_worktree my_repo my_task my_task_not
                WHERE s.name = $(sql_str "$me")")
 
 print -r -- "# wts: you are in session \`$me\` (branch ${my_branch:--}, worktree $my_worktree)"
+if [[ -n "${WTS_CONTEXT_QUIET:-}" ]]; then
+  [[ -n "${my_task:-}" ]] \
+    && print -r -- "Task: **$my_task** (\`$wts task show ${my_task_id:-<id>}\`)"
+  exit 0
+fi
 print -r -- ""
 
 # The task this session serves, when there is one. Worth the lines: the notes are
@@ -68,9 +82,22 @@ print -r -- ""
 # rather than assumed to be still in the window.
 if [[ -n "${my_task:-}" ]]; then
   print -r -- "You are working on the task: **$my_task**"
+  # Capped like the wts notes below: a Things task can carry a pasted log or a
+  # meeting's minutes, and this was the one field printed whole. Lines kept as
+  # lines — the author's list stays a list — each one cut, then a pointer to
+  # the rest.
   if [[ -n "${my_task_notes:-}" ]]; then
     print -r -- "Its notes (the author's own, verbatim):"
-    print -r -- "${my_task_notes//[[:cntrl:]]/ }" | sed 's/^/  /'
+    typeset -a note_lines
+    note_lines=("${(@f)my_task_notes}")
+    note_lines=("${(@)note_lines:#}")
+    for nl in "${(@)note_lines[1,12]}"; do
+      nl="${nl//[[:cntrl:]]/ }"
+      (( ${#nl} > 200 )) && nl="${nl[1,199]}…"
+      print -r -- "  $nl"
+    done
+    (( ${#note_lines} > 12 )) \
+      && print -r -- "  (… $(( ${#note_lines} - 12 )) more line(s): \`$wts task show ${my_task_id:-<id>}\`)"
   fi
   # Notes kept on the task in wts rather than in Things. Newest last, capped like
   # everything else here: this is the one field in this file a user can grow
@@ -114,11 +141,7 @@ if [[ -n "${my_task:-}" ]]; then
   print -r -- "Add to it as you learn: \`$wts task note \"<what you found>\"\` — it outlives this session."
   print -r -- ""
 fi
-print -r -- "This machine runs several Claude Code agents in parallel, one per wts session"
-print -r -- "(a git worktree + a tmux session each). Their shared state is a SQLite"
-print -r -- "database: $WTS_DB"
-
-# Same repository first: those are the sessions whose work can collide with
+# Same repository only: those are the sessions whose work can collide with
 # yours. Not a comparison of repo_root: a session created from inside another
 # worktree records that worktree as its root, so the repository is git's
 # common directory — one rev-parse per distinct root, no status, a few ms.
@@ -132,71 +155,82 @@ common_of() {  # <repo_root>
 }
 my_common=$(common_of "$my_repo")
 
-# Capped so a machine with fifty sessions does not flood the context.
-typeset -a same_repo other_repo others
-same_repo=() other_repo=()
-while IFS=$'\x1f' read -r -d $'\x1e' name branch root prompt context brief; do
+# "2h ago": a brief is a cache of the model's summary, and one written last
+# week reads exactly like one written a minute ago.
+age_of() {  # <seconds>
+  local s="$1"
+  [[ "$s" == <-> ]] || { print -r -- "?"; return }
+  if (( s < 3600 )); then print -r -- "$(( s / 60 ))m ago"
+  elif (( s < 86400 )); then print -r -- "$(( s / 3600 ))h ago"
+  else print -r -- "$(( s / 86400 ))d ago"; fi
+}
+
+# Eight at most, newest first: a machine with fifty sessions must not flood the
+# context, and the eighth most recent sibling is rarely the one that collides.
+typeset -a siblings sibling_names
+siblings=() sibling_names=()
+while IFS=$'\x1f' read -r -d $'\x1e' name branch root prompt context brief brief_age; do
   [[ -n "$name" ]] || continue
+  [[ "$(common_of "$root")" == "$my_common" ]] || continue
+  sibling_names+=("$name")
+  (( ${#siblings} < 8 )) || continue
   line="- $name ($branch)"
   subject="$prompt"
   [[ -n "$subject" ]] || subject="$context"
   [[ -n "$subject" ]] && line+=": $(cut80 "$subject")"
-  [[ -n "$brief" ]] && line+=" — last brief: $(cut80 "$brief")"
-  if [[ "$(common_of "$root")" == "$my_common" ]]; then
-    same_repo+=("$line")
-  else
-    other_repo+=("$line [other repository]")
-  fi
+  [[ -n "$brief" ]] && line+=" — brief, $(age_of "$brief_age"): $(cut80 "$brief")"
+  siblings+=("$line")
 done < <(db_rows "SELECT s.name, s.branch, s.repo_root, s.prompt, s.context,
-                         coalesce(replace(b.body, char(10), ' / '), '')
+                         coalesce(replace(b.body, char(10), ' / '), ''),
+                         coalesce(CAST(strftime('%s', 'now') AS INTEGER) - b.updated_at, '')
                   FROM sessions s LEFT JOIN briefs b ON b.session = s.name
                   WHERE s.name != $(sql_str "$me")
                   ORDER BY s.created_at DESC")
-others=("${same_repo[@]}" "${other_repo[@]}")
-others=("${(@)others[1,15]}")
 
-print -r -- ""
-if (( ${#others} )); then
-  print -r -- "Other sessions (same repository first):"
-  print -rl -- "${others[@]}"
-else
-  print -r -- "No other wts session is registered right now."
+# Alone in this repository: nothing to collide with, so no directives either.
+# One line says the database exists, for the day a sibling appears.
+if (( ${#sibling_names} == 0 )); then
+  print -r -- "No other wts session works on this repository. Shared state, if you need it: \`$wts db help\`."
+  exit 0
 fi
 
+print -r -- "Other agents work in parallel on this repository, one per wts session (a git"
+print -r -- "worktree + a tmux session each). Their shared state is a SQLite database: $WTS_DB"
+print -r -- ""
+print -r -- "Sessions on this repository (newest first):"
+print -rl -- "${siblings[@]}"
+(( ${#sibling_names} > ${#siblings} )) \
+  && print -r -- "- (… $(( ${#sibling_names} - ${#siblings} )) more: \`$wts db sql \"select name, branch, prompt from sessions\"\`)"
+
+# The notes of those sessions only, and five: notes are what an agent leaves for
+# the others, and another repository's are about files this one does not have.
 typeset -a notes
 notes=()
 while IFS=$'\x1f' read -r -d $'\x1e' session key value at; do
   [[ -n "$session" ]] || continue
   notes+=("- $session/$key ($at): $(cut80 "$value")")
 done < <(db_rows "SELECT session, key, value, updated_at FROM notes
-                  WHERE session != $(sql_str "$me")
-                  ORDER BY updated_at DESC LIMIT 10")
+                  WHERE session IN $(sql_list "${sibling_names[@]}")
+                  ORDER BY updated_at DESC LIMIT 5")
 if (( ${#notes} )); then
   print -r -- ""
-  print -r -- "Latest notes left by the other agents:"
+  print -r -- "Latest notes they left:"
   print -rl -- "${notes[@]}"
 fi
 
 cat <<EOF
 
-Query it when your work may overlap another session's (same files, same API,
-a shared migration), or when the user asks what the others are doing:
-  $wts db sql "select name, branch, prompt from sessions" --json
+Query it when your work may overlap theirs (same files, same API, a shared
+migration), or when the user asks what the others are doing:
   $wts db notes --all        # every note the agents left
   $wts status --json         # live agent states (working, blocked, idle...)
-  $wts db schema             # all tables; everything is readable
-Leave a short note when you change something another session may depend on,
-or to record a decision; it is keyed by your session:
-  $wts db set <key> "<one line>"     # also: $wts db get <key>, $wts db del <key>
+  $wts db sql "<SELECT ...>" # anything else; $wts db schema lists the tables
 
-MANDATORY — act on the above, do not just read it:
-- Before touching any file, migration, schema, or API: scan the sibling sessions
-  listed above for overlap. If a session's branch or prompt suggests shared ground,
-  run \`$wts db notes --all\` first to check for blocking notes.
-- After making a change another session may depend on (migration, shared model,
-  API contract, queue name, etc.): immediately run \`$wts db set <key> "<one line>"\`
-  to leave a note so the other agents are not blindsided.
-- If you are unsure whether overlap exists, leave a note anyway — it costs nothing
-  and prevents silent conflicts.
+Before you change a file, a migration, a schema or an API that one of the
+sessions above may also touch, read their notes. After a change another session
+depends on (a migration, a shared model, an API contract), leave one line, keyed
+by your session:
+  $wts db set <key> "<one line>"     # also: $wts db get <key>, $wts db del <key>
+Only then: a note nobody needs is one more line every other agent reads.
 EOF
 exit 0

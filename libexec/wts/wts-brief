@@ -310,7 +310,11 @@ total=$i
 # would spike memory without gaining anything on the API side.
 
 if $use_llm && (( ${#pending} )); then
-  print -u2 -r -- "→ summarizing ${#pending} session(s) with Claude…"
+  # The cost, in the one line printed before it is paid: how many calls, which
+  # model, how many at once, and what the rest cost (nothing: the cache).
+  cached=""
+  (( total > ${#pending} )) && cached=", $(( total - ${#pending} )) from the cache"
+  print -u2 -r -- "→ ${#pending} $MODEL call(s), $JOBS at a time$cached (WTS_NO_LLM=1: none)"
   integer n=0
   for idx in "${pending[@]}"; do
     summarize "$idx" &

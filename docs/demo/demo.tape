@@ -117,7 +117,7 @@ Ctrl+U
 Type "name"
 Sleep 1s
 Ctrl+X
-Wait+Screen@10s /Kill tmux session/
+Wait+Screen@10s /Stop session/
 Sleep 2s
 Type "y"
 Sleep 3s

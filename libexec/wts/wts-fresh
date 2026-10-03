@@ -11,7 +11,8 @@
 # Usage: wts-fresh <name> ["<phrase>"] [layout] [context...]
 #        wts-fresh "<phrase>" [layout] [context...]
 #        wts-fresh new [-p layout] <name|"phrase"...>
-#        wts-fresh ls | status | brief | restore | layouts | setup | help | version ...
+#        wts-fresh ls | status | brief | restore | stop | pr | doc | db | log | retro
+#                  | task | layouts | keys | doctor | setup | help | version ...
 #                                                   (passed through, no fetch)
 #        wts-fresh gc | rm ...                      (passed through from the main worktree)
 #
@@ -32,7 +33,7 @@ WTS_PREFIX="${0:A:h:h:h}"
 
 # A tmux window closes as soon as its command exits: without this, error
 # messages and the output of passthrough commands vanish before they can be
-# read. The nominal path ends with an `exec` and never gets here.
+# read. A success never waits here: the client switches to the new session.
 pause() {
   [[ -t 0 ]] || return 0
   print -r -- ""
@@ -91,9 +92,11 @@ unset _arg
 # These subcommands read the registry or print information, not the repository:
 # subjecting them to the git check would be a regression compared to typing
 # `wts ls` in a shell. log and retro belong here too: they read the archive,
-# which outlives the checkout the work was done in, and so does task.
+# which outlives the checkout the work was done in, and so does task. keys,
+# doctor, doc, stop and pr were missing: they waited for a fetch of origin, then
+# the window closed before their output could be read.
 case "$1" in
-  ls|status|brief|restore|db|log|retro|task|layouts|setup|help|-h|--help|version|-V|--version)
+  ls|status|brief|restore|stop|pr|doc|db|log|retro|task|layouts|keys|doctor|setup|help|-h|--help|version|-V|--version)
     passthrough "$@" ;;
 esac
 
@@ -307,8 +310,16 @@ fi
 # The window does not see the calling pane's environment and sources no shell:
 # without this, a WTS_SUBDIR set by direnv (the monorepo setup in the README)
 # would be invisible and panes would start at the worktree root.
+#
+# Not `exec`: a failure of wts (a typo it refuses, a layout it cannot find)
+# printed its reason into a window that closed the same instant. Run it, and
+# hold the window on a non-zero status only — a success switches the client to
+# the new session, and nobody is left looking at this window.
 if [[ -f "$main_root/.envrc" ]] && command -v direnv >/dev/null 2>&1; then
-  exec direnv exec "$main_root" env WTS_BASE_BRANCH="origin/$base" "${hint_env[@]}" "$WTS_CMD" "$@"
+  direnv exec "$main_root" env WTS_BASE_BRANCH="origin/$base" "${hint_env[@]}" "$WTS_CMD" "$@"
+else
+  env WTS_BASE_BRANCH="origin/$base" "${hint_env[@]}" "$WTS_CMD" "$@"
 fi
-
-exec env WTS_BASE_BRANCH="origin/$base" "${hint_env[@]}" "$WTS_CMD" "$@"
+rc=$?
+(( rc )) && pause
+exit $rc

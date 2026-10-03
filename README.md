@@ -50,6 +50,13 @@ one person's workflow. It is shared in case that workflow is also yours.
 - Optional: [gh](https://cli.github.com), for `ctrl-o` in the switcher and `wts pr`
   (open the session's pull request). Without it the key is not offered.
 
+`wts doctor` checks all of it: what is missing, which switcher features an older
+fzf turns off (reply mode below 0.45, the fitted preview below 0.46, the key
+footer below 0.65), whether `claude agents --json` answers, and whether the tmux
+snippet and the Claude hooks are installed and come from this wts. It exits 1
+when something required is missing. A creation also checks for tmux and
+tmuxinator itself, before it makes a branch or a worktree.
+
 ## Install
 
 **Homebrew** (dependencies and zsh completion included). Recent Homebrew versions
@@ -80,8 +87,14 @@ fpath=(~/.local/share/zsh/site-functions $fpath)
 
 ```sh
 wts setup tmux              # read it first
-wts setup tmux >> ~/.tmux.conf && tmux source-file ~/.tmux.conf
+wts setup tmux --install && tmux source-file ~/.tmux.conf
 ```
+
+`--install` writes the block between `# >>> wts` and `# <<< wts <<<` markers in
+`~/.tmux.conf` (backup kept), and replaces it on the next upgrade instead of
+adding a second one; a block appended by an older wts, without markers, is
+replaced too. Run it again after `brew upgrade wts` when `wts doctor` says the
+snippet is older than wts.
 
 | Key                          | Action                                                  |
 |------------------------------|---------------------------------------------------------|
@@ -92,7 +105,9 @@ wts setup tmux >> ~/.tmux.conf && tmux source-file ~/.tmux.conf
 
 The snippet also appends a segment to `status-right` — `wts: 2 blocked · 1
 idle`, nothing when nobody needs you — so keep it after the lines that set
-`status-right` (a theme's), or they overwrite it. It uses absolute paths: tmux
+`status-right` (a theme's), or they overwrite it. Move that line out of the
+block, below your theme, and `--install` leaves it there and does not add a
+second one. It uses absolute paths: tmux
 runs `command-alias` programs directly, without a shell, so neither `~` nor
 `PATH` lookups are reliable there. Homebrew paths point to the stable `opt/wts`
 location and survive `brew upgrade`.
@@ -123,10 +138,10 @@ wts rm auth-form -f                    # session + worktree + branch + registry 
 ## Usage
 
 ```
-wts <name> ["<phrase>"] [layout] [context...]
-wts "<phrase>" [layout] [context...]
-wts new [-p layout] <name|"phrase">...
-wts doc add <url|path> | ls | show | sync | rm | use <slug> [name]
+wts <name> ["<phrase>"] [layout] [context...] [--doc <d>] [--task [<id>]]
+wts "<phrase>" [layout] [context...] [--doc <d>] [--task [<id>]]
+wts new [-p layout] [--doc <d>] [--task [<id>]] <name|"phrase">...
+wts doc add <url|path> | ls | show | sync | forget | use <slug> [name] | tools
 wts ls
 wts status [--json|--table|--fzf]
 wts brief [name...]
@@ -134,18 +149,31 @@ wts restore [name...]
 wts stop <name>
 wts pr [name]
 wts rm <name> [-f]
-wts gc [--all] [--apply] [--no-fetch] [--no-retro]
-wts log [--since <when>] [--until <when>] [--task <id>] [--brief] [--no-notes]
-wts retro [name...] [--force]
-wts task ls | show <id> | link [<id>] [name] | unlink [name] | new "<title>"
-wts task add [<id>] | note [<id>] "<text>" | edit [<id>] | doc [<id>] [<url|slug>]
-wts task done [<id>]
+wts gc [--all] [--all-branches] [--apply] [--no-fetch] [--no-retro]
+wts log [--since <when>] [--until <when>] [--task <id>] [--brief] [--no-notes] [--no-things]
+wts retro [name...] [--force] [--jobs <n>]
+wts task ls [--all] | show <id> | link [<id>] [name] | unlink [name] | new "<title>"
+wts task add [<id>] | note [<id>] "<text>" | note [<id>] --clear | edit [<id>]
+wts task doc [<id>] [<url|slug>] | doc [<id>] --rm <slug> | done [<id>]
 wts layouts
 wts keys
+wts doctor
 wts db path | schema | sql "<SELECT ...>" | notes [--all] | get | set | del
-wts setup tmux | git | claude [--install]
-wts help | wts version
+wts setup tmux [--install] | git | claude [--install]
+wts help [<command>] | wts <command> --help | wts version
 ```
+
+Every command answers `--help` with its own usage, and does nothing else: `wts
+new --help` used to start a session named `--help`. `wts ls` takes no argument
+(`wts status --json` is the one with formats), and a command that did not do
+what was asked exits non-zero: `wts restore` when a session could not come back,
+`wts task unlink` on a name that is no session.
+
+**A typo is not a session.** `wts lsit` alone, when no session and no branch has
+that name, prints "did you mean `wts ls`?", exits 2 and creates nothing. A word
+counts as a typo within one edit of a command (two from five letters on; a swap
+of two letters is one edit), never under three letters. To create a session by
+that name anyway, give a second word — a layout: `wts lsit default`.
 
 ```sh
 wts auth-form feature                  # your "feature" layout: branch feature/auth-form
@@ -201,7 +229,9 @@ SUBJECT column until Claude names the conversation.
 
 **Without a name**, `wts-name` asks Claude Haiku for a 2–4 word kebab-case slug
 (3 to 15 s). The call is isolated: `--safe-mode`, hooks disabled, no MCP server, no
-tool, no transcript, run outside any worktree. Past `WTS_NAME_TIMEOUT`, without
+tool, no transcript, run outside any worktree. **Ctrl-C** while it runs does not
+abort the creation: it takes the name derived from the phrase, and says after
+how long. Past `WTS_NAME_TIMEOUT`, without
 `claude`, with `WTS_NO_LLM=1`, or when the answer is not a name, the name is derived
 locally from the phrase and a warning on stderr says which of those happened — an
 unrecognized `WTS_MODEL` included, which `claude` answers in prose rather than with
@@ -292,7 +322,9 @@ facts without calling anything: git (commits unique to the branch, excluding bot
 `<base>` and `origin/<base>`; delta; uncommitted changes), the agent state, and the
 worktree's Claude transcript (title, PR link, your last message, the tail of the
 agent's messages, the starting task). Claude Haiku turns them into two lines, with
-the same isolation as naming, `WTS_BRIEF_JOBS` calls at a time.
+the same isolation as naming, `WTS_BRIEF_JOBS` calls at a time. Before it starts,
+one line says what it is about to cost: `→ 3 haiku call(s), 4 at a time, 2 from
+the cache`.
 
 Each summary is **cached** in the state database (table `briefs`), keyed on HEAD,
 uncommitted changes and the transcript's size and date: while nothing moved,
@@ -315,9 +347,9 @@ branch, git delta and a live preview of the agent's pane. **The keys are written
 under the list**, so there is nothing to remember: one line by default, and `?`
 unfolds the whole table — the tmux bindings included, since those are the ones
 you cannot press from inside the popup. `enter` switches, `ctrl-x`
-kills the selected tmux session (`wts stop`, after a y/N prompt: the worktree, the
-branch and the registry entry stay, the popup stays open and the row reads
-`stopped`), `ctrl-d` removes it entirely (`wts rm`, after a y/N prompt that names
+stops the selected session (`wts stop`, after a y/N prompt: its tmux session
+closes, the worktree, the branch and the registry entry stay, the popup stays
+open and the row reads `stopped`), `ctrl-d` removes it entirely (`wts rm`, after a y/N prompt that names
 the session and its agent state), `ctrl-o` opens the branch's
 pull request on GitHub (`wts pr`, through `gh pr view --web`: without a PR the popup
 says so and stays open; without `gh` the key is neither bound nor listed),
@@ -325,7 +357,7 @@ says so and stays open; without `gh` the key is neither bound nor listed),
 and tells its agent (`wts doc use`, picker included), `ctrl-t` pulls a
 [task](#the-work-you-have-not-started-yet) in from Things,
 `ctrl-f` / `ctrl-b` scroll the preview by half a page, `ctrl-r` reloads. The
-current session is never killed from the popup, which it would close. tmux
+current session is never stopped from the popup, which it would close. tmux
 sessions unknown to wts are listed after, and `ctrl-x` works on them too.
 
 The footer is sized to the list: a narrow popup keeps the keys you press most
@@ -339,7 +371,9 @@ and `wts keys`.
 The list is a table **sized to the popup**: the session and branch columns take
 the width of their longest value, capped so that every column stays visible, and
 a cell too long for its column is cut with `…` rather than pushing its row out
-of line. `*` after a name marks the session you came from. The preview takes the
+of line. `*` after a name marks the session you came from, as tmux marks its
+current window; `@` at the start of SUBJECT marks a session that serves a
+[task](#the-work-you-have-not-started-yet). The preview takes the
 right half; its first line is the agent's state, for how long, and the question
 it waits on when there is one (`blocked 4m: Bash: rm -rf dist`). Under it, dimmed,
 what the session already said about itself: the cached `done:` / `next:` of
@@ -444,9 +478,10 @@ pulls one in from Things instead (`wts task add`), where Things is installed. Th
 switcher itself only ever reads its own database — one query, no Things, no git,
 no model, because it runs every 2 s.
 
-A task already being worked on is not listed twice: it is already on screen as
-its session's row, with the `*` in SUBJECT. Ten tasks at most, most recently
-touched first (`WTS_SWITCH_TASKS=<n>`, `0` to hide them).
+A task already being worked on stays listed, after the ones still to start, with
+`N session(s)` in SUBJECT — `enter` on it is how a second session starts — and
+its sessions carry the `@` in theirs. Ten tasks at most, most recently touched
+first (`WTS_SWITCH_TASKS=<n>`, `0` to hide them).
 
 `prefix+a` jumps straight to the agent that needs you (`stuck?`, `blocked`,
 `failed`, `idle`) and has waited longest, without a popup, and says why in the
@@ -493,8 +528,10 @@ environment: when the repository has an `.envrc` and direnv is installed, `wts`
 runs through `direnv exec`. A phrase without a name is named in the background
 while the fetch runs.
 
-`ls`, `status`, `brief`, `restore`, `layouts`, `setup`, `help` and `version` are
-passed through without fetching; `gc` and `rm` run from the main repository.
+`ls`, `status`, `brief`, `restore`, `stop`, `pr`, `doc`, `db`, `log`, `retro`,
+`task`, `layouts`, `keys`, `doctor`, `setup`, `help` and `version` are passed
+through without fetching; `gc` and `rm` run from the main repository. When `wts`
+fails, the window stays open on its message until a key is pressed.
 
 ## Batch creation
 
@@ -589,7 +626,7 @@ wts doc add <url|path> [--name <slug>] [--force]   add a document
 wts doc ls                                         the library
 wts doc show <slug>                                what will be injected
 wts doc sync [<slug>...] [--force]                 fetch again
-wts doc rm <slug>                                  forget it
+wts doc forget <slug>                              remove it from the library
 wts doc use <slug> [<session>]                     attach to a running session
 wts doc tools [--refresh]                          what the fetch may use
 ```
@@ -610,11 +647,27 @@ wts gc              # dry run: lists, deletes nothing
 wts gc --apply      # does it
 wts gc --no-fetch   # without contacting the remote (offline)
 wts gc --all        # every repository that has a session, from anywhere
+wts gc --all-branches   # every local branch, not only those of wts sessions
 ```
+
+**Only what wts made.** A branch is looked at when a session of this repository
+had it — a live one, or a finished one in the archive — and a husk folder when it
+bears such a session's name. A local `develop` you merged by hand, a worktree you
+made yourself, a folder someone else keeps under a shared `WTS_WORKTREES_BASE`:
+the dry run counts them ("not made by a wts session, not looked at: 3") and
+leaves them alone. `--all-branches` is the scope before 1.6, every local branch
+and every folder without `.git`, for a repository where all of them are
+disposable.
+
+**What `--apply` costs is said before it.** Each session it archives gets a
+retrospective, one model call each (`WTS_MODEL`, `WTS_RETRO_JOBS` at a time,
+after every deletion): the dry run says how many, and `--no-retro` skips them
+(`wts retro` writes them later).
 
 **The remote is the source of truth.** `wts gc` starts with
 `git fetch --all --prune`, then compares against `origin/<base>` rather than a local
-base that may lag behind. Six categories, limited to the current repository —
+base that may lag behind. Six categories, limited to the current repository and
+to what wts made —
 `--all` runs the same collection once per repository in the registry, each from
 its main worktree:
 
@@ -859,17 +912,48 @@ again after `/clear`, `/compact` and a resume:
 
 ```
 # wts: you are in session `auth-form` (branch feature/auth-form, worktree …)
-Other sessions (same repository first):
-- rate-limit (feature/rate-limit): rate-limit the public API per key — last brief: done: … / next: …
+
+You are working on the task: **Validate the signup form**
+Its notes (the author's own, verbatim):
+  https://notion.so/Signup-spec-…
+Previous attempts (newest first):
+  - auth-form-try1 (abandoned, 2026-09-20)
+    resisted: the email check raced the CSRF token refresh
+Other sessions may serve the same task: `wts task show <id>` lists them.
+Add to it as you learn: `wts task note "<what you found>"` — it outlives this session.
+
+Other agents work in parallel on this repository, one per wts session (a git
+worktree + a tmux session each). Their shared state is a SQLite database: …/wts.db
+
+Sessions on this repository (newest first):
+- rate-limit (feature/rate-limit): rate-limit the public API per key — brief, 2h ago: done: … / next: …
 - csv-export (feature/csv-export): export users as csv
-Latest notes left by the other agents:
+
+Latest notes they left:
 - rate-limit/api-contract (2026-09-28T09:12:03Z): /login now answers 429 with Retry-After
-Query it when your work may overlap another session's …
-  wts db sql "select name, branch, prompt from sessions" --json
-  wts db notes --all
-Leave a short note when you change something another session may depend on …
-  wts db set <key> "<one line>"
+
+Query it when your work may overlap theirs (same files, same API, a shared
+migration), or when the user asks what the others are doing:
+  wts db notes --all        # every note the agents left
+  wts status --json         # live agent states (working, blocked, idle...)
+  wts db sql "<SELECT ...>" # anything else; wts db schema lists the tables
+
+Before you change a file, a migration, a schema or an API that one of the
+sessions above may also touch, read their notes. After a change another session
+depends on (a migration, a shared model, an API contract), leave one line, keyed
+by your session:
+  wts db set <key> "<one line>"     # also: wts db get <key>, wts db del <key>
+Only then: a note nobody needs is one more line every other agent reads.
 ```
+
+The task section is there when the session serves a [task](#a-task-is-where-the-context-lives).
+The rest is about the sessions **of the same repository** — another repository's
+cannot collide with this worktree, so they are not listed — eight at most, with
+their five latest notes. An agent alone on its repository gets one line instead
+of the sibling list and the directives. The task's own notes are cut at twelve
+lines. All of this is re-read at every start, `/clear`, `/compact` and resume,
+so it is kept to what can change what the agent does; `WTS_CONTEXT_QUIET=1` in
+the agent's environment keeps only the first line and the task's title.
 
 Anywhere else — a Claude started outside wts — the hook prints nothing. It reads
 the database only: no `git status`, no model call, about 0.1 s.
@@ -985,11 +1069,19 @@ locale (`LANG=C`), Ruby refuses to read them ("invalid byte sequence in US-ASCII
 | `WTS_LAYOUTS_PATH`      | `~/.config/wts/layouts`       | user layouts, searched before the built-in ones        |
 | `WTS_SUBDIR`            | (none)                        | subdirectory of the worktree where panes start         |
 | `WTS_BRANCH_PREFIX`     | from the layout               | branch prefix override, even empty                     |
-| `WTS_MODEL`             | `haiku`                       | model used for naming and `wts brief`                  |
+| `WTS_MODEL`             | `haiku`                       | model used for naming, `wts brief` and the retrospectives |
 | `WTS_NO_LLM`            | (none)                        | `1`: never call the model                              |
 | `WTS_NAME_TIMEOUT`      | `30`                          | naming timeout, seconds                                |
 | `WTS_BRIEF_TIMEOUT`     | `45`                          | timeout of one summary, seconds                        |
 | `WTS_BRIEF_JOBS`        | `4`                           | concurrent summaries                                   |
+| `WTS_RETRO_TIMEOUT`     | `60`                          | timeout of one retrospective, seconds                  |
+| `WTS_RETRO_JOBS`        | `3`                           | concurrent retrospectives (`wts retro --jobs`)         |
+| `WTS_NO_ARCHIVE`        | (none)                        | `1`: `wts rm` and `wts gc` archive nothing for `wts log` |
+| `WTS_ARCHIVE_TRANSCRIPT`| `1`                           | `0`: the archive points at the transcript without copying it |
+| `WTS_NO_THINGS`         | (none)                        | `1`: never read Things (a machine without it, or to keep the macOS prompt away) |
+| `WTS_THINGS_DB`         | found in Things' container    | path of the Things database to read instead            |
+| `WTS_TASK_MAX_CHARS`    | `16000`                       | cap on a task's section of the context file            |
+| `WTS_CONTEXT_QUIET`     | (none)                        | `1`: the SessionStart hook says only who the agent is and its task |
 | `WTS_DOCS_PATH`         | `~/.config/wts/docs.json`     | the context document library                           |
 | `WTS_DOC_TTL`           | `86400`                       | seconds before an attached URL document is fetched again |
 | `WTS_DOC_TIMEOUT`       | `90`                          | fetch timeout, seconds (MCP handshakes are slow)       |
@@ -1003,7 +1095,10 @@ locale (`LANG=C`), Ruby refuses to read them ("invalid byte sequence in US-ASCII
 | `WTS_NOTIFY_TERMINALS`  | iTerm2, Terminal, Ghostty, …  | bundle ids counted as "a terminal in front" (macOS), space-separated |
 | `WTS_SWITCH_REFRESH`    | `2`                           | switcher refresh interval, `0` for a static list       |
 | `WTS_SWITCH_SCROLLBACK` | `2000`                        | lines of tmux history reachable in the preview         |
+| `WTS_SWITCH_TASKS`      | `10`                          | tasks listed in the switcher, `0` to hide them         |
 | `WTS_LOCK_STALE_AFTER`  | `300`                         | seconds before `wts gc` calls an `index.lock` stale    |
+| `WTS_STATE_DIR`         | `$XDG_STATE_HOME/wts`         | where the state database lives                         |
+| `WTS_DB`                | `$WTS_STATE_DIR/wts.db`       | the state database itself                              |
 | `CLAUDE_CONFIG_DIR`     | `~/.claude`                   | where Claude Code keeps sessions and transcripts       |
 
 `XDG_STATE_HOME` and `XDG_CONFIG_HOME` are honored.

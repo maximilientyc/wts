@@ -9,71 +9,13 @@ the switcher or a hook; `wts status --json` and `wts log` are contracts.
 
 Item 1, *read the data wts already writes* (previous attempts in the task's
 context, briefs and notes in the switcher preview, `gc --all` and a REPO
-column), shipped after 1.5.2.
+column), shipped after 1.5.2. Item 2, *the command surface* (`wts doctor`, the
+typo guard, `--help` per command and exit codes, failures that say why, Ctrl-C
+while naming, a shorter SessionStart hook, one word per action, the cost said
+once, docs and completion, and gc scoped to what wts made, `--all-branches`
+for the rest), shipped with it.
 
-## 1. The command surface
-
-- **`wts doctor`. [S–M]** tmuxinator is discovered missing after the worktree
-  exists (`bin/wts` execs it unchecked). Nothing verifies tmux ≥ 3.2
-  (`display-popup`), the fzf 0.45 / 0.46 / 0.65 gates (the switcher degrades
-  silently), that `claude agents --json` answers, or that the tmux snippet and
-  the Claude hooks are installed and from this version. One command that
-  checks all of it, and checks tmuxinator before `worktree add`.
-- **A typo must not create a worktree. [S]** `wts lsit` creates a branch, a
-  worktree and a session; nineteen subcommands shadow session names. A single
-  word within edit distance 2 of a subcommand, with no such session or branch,
-  gets "did you mean `wts ls`?" and exit 2 (`registry_resolve_name` already
-  has the distance function).
-- **`--help` per subcommand, and exit codes. [S]** `wts new --help` starts a
-  session named `--help`; `wts rm --help` tries to remove one. `wts restore`
-  with every session failed, `wts task unlink notasession` and `wts ls --json`
-  (arguments dropped) exit 0. One `--help` guard in the dispatcher; non-zero
-  when nothing matched.
-- **Failures that hide their reason. [S]** `restore` and `new` send
-  tmuxinator's stderr to `/dev/null` and print "tmuxinator failed to start";
-  "not archived" and "registry not updated" drop it too. Print its first line.
-- **Naming, while you wait. [S]** `wts "<phrase>"` from a shell blocks up to
-  `WTS_NAME_TIMEOUT` (30 s) behind "→ naming…", and Ctrl-C aborts the whole
-  creation. Trap INT to fall back to the local slug, show the elapsed time and
-  the fallback name. (Through `wts-fresh` the wait already overlaps the fetch.)
-- **The hook's MANDATORY block. [S]** `wts-context` prints its directives even
-  under "No other wts session is registered"; "leave a note anyway — it costs
-  nothing" invites notes every sibling then reads (ten are injected); Things
-  notes are printed uncapped while wts notes are cut at 80; up to fifteen
-  sessions are listed, other repositories included, which cannot collide; the
-  "last brief" carries no age. Directives only when same-repository siblings
-  exist, drop "anyway", cap, same repository only, brief age,
-  `WTS_CONTEXT_QUIET=1`. About 1–2k tokens are re-injected at every start,
-  `/clear`, `/compact` and resume.
-- **One word per action. [S]** `rm` is teardown for a session and "forget" for
-  a document; `ctrl-x` is "kill" in the README and its prompt, "stop" in the CLI
-  and the footer; `*` after NAME is the current session, `*` before SUBJECT a
-  session that serves a task.
-- **Cost, said once. [S]** The gc dry run says "To archive: N session(s)" but
-  not that `--apply` will ask Claude for N retrospectives; `brief` fans out four
-  calls at a time. One line in the dry run, `--no-retro` named.
-- **Docs and completion drift. [S]** The config table misses
-  `WTS_RETRO_TIMEOUT`, `WTS_RETRO_JOBS`, `WTS_NO_THINGS` (the opt-out for a
-  machine without Things, documented nowhere), `WTS_THINGS_DB`,
-  `WTS_TASK_MAX_CHARS`, `WTS_DB`, `WTS_STATE_DIR`; `WTS_SWITCH_TASKS`,
-  `WTS_ARCHIVE_TRANSCRIPT` and `WTS_NO_ARCHIVE` are prose-only; `WTS_MODEL` also
-  drives retro. `wts help` and the README usage lack `--task` beside `--doc`,
-  `log --task/--no-things`, `task ls --all`, `task note --clear`,
-  `task doc --rm`, `retro --jobs`, `doc tools`. The README's hook example lacks
-  the task section and the MANDATORY tail; its pass-through list for
-  `C-b : wts` is stale. Completion: `wts task doc <TAB>` offers nothing
-  (`_wts_docs` never calls `_describe`), `--task` is never offered, `new` lacks
-  `--doc`, `task unlink` offers tasks but takes a session. `setup tmux >>
-  ~/.tmux.conf` has no begin/end markers, so upgrades append a second block.
-- **gc's scope: a decision.** gc classifies every local branch, not only wts's:
-  a local `develop` fully contained in `main` is `branch -D`'d, a hand-made
-  worktree on a merged branch is removed, and every `.git`-less folder under a
-  shared `WTS_WORKTREES_BASE` is offered for `rm -rf`. The dry run lists it all
-  and the README documents the categories, so this is a choice, not a bug: the
-  recommendation is to default to branches wts knows (registry + archive) with
-  `--all-branches` as the opt-in.
-
-## 2. Then, by what you feel first
+## 1. Then, by what you feel first
 
 - **PR, CI and review state per session. [M]** No PR column; `merged` is in the
   JSON but hidden, and ancestry-only (a squash merge reads `false`, while gc has
@@ -89,8 +31,8 @@ column), shipped after 1.5.2.
   at teardown only (`wts-retro collect`). A `PostToolUse` hook on
   `Edit|Write|MultiEdit` inserting `(session, path, at)` into a `touches` table
   gives exact overlap cheaply: the hook names the siblings on the same paths,
-  the switcher marks them. This is what would make the MANDATORY block
-  unnecessary.
+  the switcher marks them. This is what would make the hook's directives
+  about overlap unnecessary.
 - **Tokens and cost per session and per task. [M]** Nothing reads
   `message.usage` or the model from transcripts, although `wts-retro`'s header
   promises "what it cost". `wts-brief` and `wts-retro collect` already read the
@@ -123,9 +65,6 @@ you can hit.
   when the agent pane is unknown (AGENT `-`); in the default layout that pane is
   the editor. Refuse without a known agent pane, or target the pane whose
   `pane_current_command` is `claude`.
-- Under `C-b : wts`, `keys`, `doc`, `stop` and `pr` are not on `wts-fresh`'s
-  pass-through list: they wait for a fetch, then the window closes before their
-  output can be read. Any failure of `wts` under `wts-fresh` vanishes the same way.
 - The task screen's branch hint strips and promises `feature/`; the built-in
   layout has no prefix, so `feature/foo` typed there yields branch `foo`.
   Read the prefix with `branch_prefix_of`.

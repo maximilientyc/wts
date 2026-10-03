@@ -5,7 +5,7 @@
 #        wts-doc ls
 #        wts-doc show [<slug>]
 #        wts-doc sync [<slug>...] [--force]
-#        wts-doc rm <slug>
+#        wts-doc forget <slug>                             (`rm` still works)
 #        wts-doc use <slug> <session> [<worktree>]
 #        wts-doc tools [--refresh]
 #        wts-doc pick                                      (internal, fzf)
@@ -905,9 +905,13 @@ case "$cmd" in
     exit $failed
     ;;
 
-  rm)
+  # `forget`, not `rm`: in wts, `rm` is the teardown of a session — worktree,
+  # branch and all — and the same verb here only drops a library entry. Two
+  # meanings for one word is how a `wts rm` gets typed for a `wts doc rm`. `rm`
+  # stays accepted, so nothing anyone scripted breaks.
+  forget|rm)
     slug="${1:-}"
-    [[ -n "$slug" ]] || die "usage: wts doc rm <slug>"
+    [[ -n "$slug" ]] || die "usage: wts doc forget <slug>"
     doc_exists "$slug" || die "wts doc: '$slug' is not in the library (wts doc ls)"
     # The library is the user's: warn about the sessions still pointing at it,
     # remove anyway. A missing slug is skipped on the next materialize.
@@ -961,6 +965,6 @@ case "$cmd" in
     ;;
 
   *)
-    die "wts doc: unknown command '$cmd' (add, ls, show, sync, rm, use, tools)"
+    die "wts doc: unknown command '$cmd' (add, ls, show, sync, forget, use, tools)"
     ;;
 esac

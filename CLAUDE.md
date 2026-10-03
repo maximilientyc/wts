@@ -13,6 +13,8 @@ libexec/wts/wts-gc         squash-aware cleanup, dry run by default
 libexec/wts/wts-fresh      tmux `command-alias` entry: fetch origin/<default>, then wts
 libexec/wts/wts-name       slug from a phrase (Claude Haiku, local fallback)
 libexec/wts/wts-keys       the key table: switcher footer and `wts keys`
+libexec/wts/wts-doctor     `wts doctor`: dependencies, fzf gates, tmux snippet and
+                           Claude hooks installed and current; read-only
 libexec/wts/wts-brief      done/next per session (Claude Haiku, cached)
 libexec/wts/wts-doc        context document library: fetch (any MCP), cache, materialize
 libexec/wts/wts-retro      capture at teardown: collect/store facts, write the retro (Haiku)
@@ -170,6 +172,15 @@ straight from the checkout. Scripts locate each other from their own path
   command runs against `/tmp`, the real server. Create the folder before any
   `tmux kill-server` in a sandbox, or name the socket with `-S`. Same trap with
   `$TMUX` set: unset it first.
+- tmuxinator prints its own errors ("Failed to parse config file…") on
+  **stdout**, not stderr: to report why a start failed, capture both
+  (`start_detached` in `bin/wts`).
+- `tmux list-keys -T prefix s` prints nothing and exits 0 on tmux 3.7: list the
+  whole table and filter (`wts-doctor`).
+- A non-interactive `sh -c` dies of a Ctrl-C typed into its pane even when the
+  child it waits on traps it, and the pane closes under that child. A test that
+  sends `C-c` types the command into an interactive shell (`zsh -f -i`), and
+  keeps the typed line short: the tty truncates one past its line limit.
 - tmuxinator waits for Enter after warning about a tmux release newer than its
   hard-coded list: always pass `--suppress-tmux-version-warning`, and `</dev/null`
   when its output is hidden.
@@ -181,6 +192,10 @@ straight from the checkout. Scripts locate each other from their own path
   session read `worktree` and `repo_root` from the registry rather than deriving
   them. This is how `wts rm` once dropped a registry row while the worktree it
   described stayed on disk.
+- Every subcommand is listed once, in `WTS_COMMANDS` (`bin/wts`): the `--help`
+  guard, the typo guard of the normal flow and the dispatch must agree on what
+  is a command. A new subcommand goes there, and gets a usage line and a
+  paragraph in the header, which `wts <command> --help` cuts from.
 - Names typed by a human go through `registry_resolve_name`, which matches
   substrings **both ways**: `api-v2` resolves to `api`. Fine for `stop` and
   `brief`; a destructive verb must confirm a non-exact match, and refuse it when

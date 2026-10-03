@@ -44,6 +44,7 @@ export WTS_SMOKE_AGENTS="$SANDBOX/agents.json"
 cat > "$SANDBOX/bin/claude" <<'EOF'
 #!/bin/sh
 [ "$1" = agents ] && { cat "$WTS_SMOKE_AGENTS" 2>/dev/null || echo '[]'; exit 0; }
+[ "$1" = --version ] && { echo "0.0.0 (smoke stand-in)"; exit 0; }
 exec sleep 3600
 EOF
 chmod +x "$SANDBOX/bin/claude"
@@ -72,10 +73,13 @@ refute() {
   if "$@" >/dev/null 2>&1; then fail "$desc"; else ok "$desc"; fi
 }
 has_session() { tmux has-session -t "=$1" }
-# A line sent to a shell pane takes a moment to run and print: poll up to 3 s.
+# A line sent to a shell pane takes a moment to run and print: poll up to 10 s.
+# The pane runs your interactive zsh, rc files and all: 0.3 s alone, and past
+# the 3 s this used to allow on a machine busy with other agents, which failed
+# `restore pre-fills the conversation` now and then. Only a failure waits longer.
 pane_shows() { # <session> <line>
   local i
-  for i in {1..30}; do
+  for i in {1..100}; do
     tmux capture-pane -p -t "=$1:" 2>/dev/null | grep -qx -- "$2" && return 0
     sleep 0.1
   done
@@ -102,7 +106,18 @@ doc_cached() { [[ -n "$(q "SELECT 1 FROM doc_cache WHERE slug = '$1' AND length(
 check "version" eval '[[ "$("$WTS" --version)" == "wts "[0-9]* ]]'
 check "help exits 0" "$WTS" --help
 refute "unknown option fails" "$WTS" --bogus
-check "setup tmux prints absolute helper paths" eval '"$WTS" setup tmux | grep -qF "$ROOT/libexec/wts/wts-fresh"'
+
+# One usage per command, cut from the header `wts help` prints: `wts new --help`
+# used to start a session named `--help`.
+check "help <command> prints that command's usage" eval '
+  out=$("$WTS" help rm); [[ "$out" == "usage: wts rm <name> [-f]"* && "$out" == *"-f       : force"* ]]'
+check "<command> --help prints the same, exit 0" eval '[[ "$("$WTS" rm --help)" == "$("$WTS" help rm)" ]]'
+check "--help after other arguments too" eval '[[ "$("$WTS" gc --apply --help)" == "usage: wts gc "* ]]'
+check "a usage spread over two lines is kept whole" eval '
+  out=$("$WTS" log --help); [[ "$out" == *"[--no-notes] [--no-things]"* ]]'
+check "ls refuses an argument instead of dropping it" eval '"$WTS" ls --json 2>/dev/null; (( $? == 2 ))'
+check "setup tmux prints absolute helper paths" \
+  eval 'out=$("$WTS" setup tmux); [[ "$out" == *"$ROOT/libexec/wts/wts-fresh"* ]]'
 check "layouts lists the user layout" eval '"$WTS" layouts | grep -q "^smoke	"'
 check "layouts lists the built-in default" eval '"$WTS" layouts | grep -qF "default	$ROOT/share/wts/layouts/default.yml"'
 
@@ -135,6 +150,20 @@ cd "$REPO"
 
 "$WTS" --help >/dev/null
 refute "help creates no worktree" test -e "$WT/--help"
+"$WTS" new --help >/dev/null
+refute "new --help creates no worktree" test -e "$WT/--help"
+check "a name followed by --help prints the usage" eval '[[ "$("$WTS" auth-form --help)" == *"Usage: wts "* ]]'
+refute "and creates nothing" test -e "$WT/auth-form"
+
+# A typo of a command is not a new piece of work.
+check "a typo of a command is refused, exit 2" eval '"$WTS" lsit 2>/dev/null; (( $? == 2 ))'
+check "it names the command" eval '[[ "$("$WTS" statsu 2>&1)" == *"did you mean '\''wts status'\''"* ]]'
+refute "and creates no worktree or branch" eval '
+  test -e "$WT/lsit" || git show-ref --quiet refs/heads/lsit || git show-ref --quiet refs/heads/feature/lsit'
+check "a word that is no near-command stays a session name" eval '
+  out=$(cd / && "$WTS" lint 2>&1); [[ "$out" == *"not a git repository"* ]]'
+check "a second word says it is meant" eval '
+  out=$(cd / && "$WTS" lsit smoke 2>&1); [[ "$out" == *"not a git repository"* ]]'
 
 # ─── Create ──────────────────────────────────────────────────────────────────
 
@@ -151,6 +180,36 @@ check "phrase stored in the registry" \
 
 refute "missing layout fails" env WTS_NO_ATTACH=1 "$WTS" other nope
 refute "missing layout creates nothing" test -e "$WT/other"
+
+# tmuxinator's own reason, not "failed to start" alone.
+print -r -- $'name: <%= ENV[\'WTS_NAME\'] %>\nroot: <%= ENV[\'WTS_WORKDIR\'] %>\nwindows: [unclosed' \
+  > "$XDG_CONFIG_HOME/wts/layouts/broken.yml"
+check "a layout tmuxinator rejects is reported with its reason" eval '
+  out=$(WTS_NO_ATTACH=1 "$WTS" brokenl broken 2>&1 >/dev/null)
+  [[ "$out" == *"tmuxinator failed to start — "?* ]]'
+"$WTS" rm brokenl -f >/dev/null 2>&1 || true
+rm -f "$XDG_CONFIG_HOME/wts/layouts/broken.yml"
+
+# Without tmuxinator nothing is created: it was found missing by the last line,
+# after the worktree and the registry row existed.
+nomux="$SANDBOX/nomux"
+mkdir -p "$nomux"
+for t in git tmux sqlite3 jq perl zsh awk sed grep head cut tr wc mktemp dirname basename date; do
+  p=$(command -v $t) && ln -sf "$p" "$nomux/$t"
+done
+check "without tmuxinator, wts says so and creates nothing" eval '
+  out=$(env PATH="$nomux" WTS_NO_ATTACH=1 "$WTS" nomuxsess smoke 2>&1)
+  [[ "$out" == *"tmuxinator not found — nothing was created"* ]] && [[ ! -e "$WT/nomuxsess" ]]'
+# A version manager's shim whose Ruby is missing: on PATH, exits 126, says
+# nothing. Found while recording this: "failed to start" with no reason at all.
+badmux="$SANDBOX/badmux"
+mkdir -p "$badmux"
+print -r -- $'#!/bin/sh\nexit 126' > "$badmux/tmuxinator"
+chmod +x "$badmux/tmuxinator"
+check "a tmuxinator that fails in silence is reported by its status" eval '
+  out=$(env PATH="$badmux:$PATH" WTS_NO_ATTACH=1 "$WTS" silentmux smoke 2>&1)
+  [[ "$out" == *"tmuxinator failed to start — exit status 126"* ]]'
+"$WTS" rm silentmux -f >/dev/null 2>&1 || true
 
 # ─── Naming ────────────────────────────────────────────────────────────────────
 # Every way the call can fail used to read "Claude unavailable or no answer",
@@ -188,6 +247,28 @@ check "without claude the warning says so" eval '
      == *"claude not found in PATH"* ]]'
 check "WTS_NO_LLM stays silent" eval '
   [[ "$("$NAME" "export users as csv" 2>&1)" == "export-users-csv" ]]'
+
+# Ctrl-C while the model names the session: the name comes from the phrase and
+# the creation goes on. It used to abort everything. A real Ctrl-C, typed into a
+# pane at an interactive shell, so it reaches the whole foreground process group
+# as the terminal sends it; the stand-in claude never answers.
+print -r -- $'#!/bin/sh\ncat >/dev/null\nexec sleep 60' > "$STUBS/claude"
+chmod +x "$STUBS/claude"
+# A script, and only its path typed: the command with this PATH spelled out is
+# longer than a terminal line accepts, and the tty cut it.
+print -r -- "#!/bin/sh
+export PATH='$STUBS:$PATH' WTS_NO_LLM= WTS_NO_ATTACH=1
+exec '$WTS' 'archive old invoices' smoke" > "$SANDBOX/namer.sh"
+chmod +x "$SANDBOX/namer.sh"
+tmux new-session -d -s namer -x 160 -y 20 -c "$REPO" "zsh -f -i"
+tmux send-keys -t "=namer:" "$SANDBOX/namer.sh; echo rc=\$?" Enter
+check "naming says Ctrl-C cuts it short" pane_contains namer "Ctrl-C: derive it from the phrase now"
+tmux send-keys -t "=namer:" C-c
+check "Ctrl-C while naming takes the local name" pane_contains namer "naming interrupted after"
+check "and the creation goes on" pane_contains namer "rc=0"
+check "under the name from the phrase" has_session archive-old-invoices
+tmux kill-session -t "=namer" 2>/dev/null || true
+"$WTS" rm archive-old-invoices -f >/dev/null
 
 # ─── Inspect ─────────────────────────────────────────────────────────────────
 
@@ -589,15 +670,15 @@ check "the picker shows the whole title, not its first two words" \
 check "the picker shows the kind and age columns too" \
   pane_contains pickprobe "file"
 tmux kill-session -t "=pickprobe" 2>/dev/null || true
-"$WTS" doc rm contract >/dev/null
+"$WTS" doc forget contract >/dev/null
 
 "$WTS" rm docsess -f >/dev/null
 refute "rm leaves no husk behind .wts/" test -d "$WT/docsess"
-"$WTS" doc rm spec >/dev/null
-refute "doc rm drops the cached body" doc_cached spec
-refute "doc rm drops the library entry" \
+"$WTS" doc forget spec >/dev/null
+refute "doc forget drops the cached body" doc_cached spec
+refute "doc forget drops the library entry" \
   jq -e '.docs | has("spec")' "$XDG_CONFIG_HOME/wts/docs.json"
-"$WTS" doc rm ptr >/dev/null
+check "doc rm still forgets, for what was scripted before forget" "$WTS" doc rm ptr
 
 # ─── Stop and restore ────────────────────────────────────────────────────────
 # `wts stop` leaves exactly the state `wts restore` replays: tmux session gone,
@@ -616,8 +697,10 @@ check "switcher list keeps 3 fields with a stopped session" \
   eval '"$SWITCH" --list | awk -F "\t" "NF != 3 { exit 1 }"'
 refute "stop of an unknown session fails" "$WTS" stop nope
 refute "stop of a stopped session fails" "$WTS" stop auth-form
+refute "restore of a name no session has fails" "$WTS" restore zzqqx
 "$WTS" restore auth-form >/dev/null
 check "restore restarts a stopped session" has_session auth-form
+check "restore of a running session is no failure" "$WTS" restore auth-form
 
 # No git call in `stop`: the switcher popup runs it from wherever tmux started.
 check "stop needs no git repository" eval '(cd / && "$WTS" stop auth-form >/dev/null)'
@@ -632,7 +715,26 @@ git -C "$WT/auth-form" add change.txt
 git -C "$WT/auth-form" commit -qm change
 git -C "$REPO" merge -q --ff-only feature/auth-form
 
+# A branch made by hand, worked on and merged: gc's to take only when asked.
+git -C "$REPO" switch -q -c develop
+print dev > "$REPO/dev.txt"
+git -C "$REPO" add dev.txt
+git -C "$REPO" commit -qm dev
+git -C "$REPO" switch -q main
+git -C "$REPO" merge -q --ff-only develop
+
+# The cost is said in the dry run, where it can still be declined.
+check "the dry run says --apply will ask Claude for the retrospectives" eval '
+  out=$(WTS_NO_LLM= "$WTS" gc --no-fetch); [[ "$out" == *"asks Claude for 1 retrospective(s)"*"--no-retro"* ]]'
+refute "and not under --no-retro" eval '
+  out=$(WTS_NO_LLM= "$WTS" gc --no-fetch --no-retro); [[ "$out" == *"asks Claude"* ]]'
+
 "$WTS" gc --no-fetch --apply >/dev/null
+check "gc leaves a merged branch no wts session had" git show-ref --verify --quiet refs/heads/develop
+check "and says how many it did not look at" eval '
+  out=$("$WTS" gc --no-fetch); [[ "$out" == *"not made by a wts session, not looked at: 1 "* ]]'
+"$WTS" gc --no-fetch --all-branches --apply >/dev/null
+refute "gc --all-branches takes it" git show-ref --verify --quiet refs/heads/develop
 refute "gc tears down the merged session" has_session auth-form
 refute "gc removes the merged worktree" test -d "$WT/auth-form"
 refute "gc deletes the merged branch" git show-ref --verify --quiet refs/heads/feature/auth-form
@@ -660,10 +762,22 @@ check "gc --all collects every repository with a session, from outside any" eval
 check "and starts each from its main worktree, even from inside another" eval '
   out=$(cd "$WT/export-users-csv" && "$WTS" gc --all --no-fetch)
   [[ "$out" == *"Garbage collection — demo "* && "$out" != *"— export-users-csv "* ]]'
+# The hook lists the sessions that can collide: another repository's cannot.
+check "alone in its repository, an agent gets no directives and no sibling list" eval '
+  out=$(cd "$SANDBOX/code/other-worktrees/elsewhere" && env -u TMUX -u TMUX_PANE "$ROOT/libexec/wts/wts-context")
+  [[ "$out" == *"No other wts session works on this repository"* && "$out" != *export-users-csv* \
+     && "$out" != *"db set"* ]]'
+check "and the other repository does not list it" eval '
+  out=$(cd "$WT/export-users-csv" && env -u TMUX -u TMUX_PANE "$ROOT/libexec/wts/wts-context")
+  [[ "$out" != *elsewhere* ]]'
 mkdir -p "$SANDBOX/code/other-worktrees/husk"
-check "its dry run names --all in the command to run next" eval '
+# A folder no wts session was named after is out of the default scope.
+check "gc leaves a folder no session was named after, and says so" eval '
   out=$(cd "$SANDBOX" && "$WTS" gc --all --no-fetch)
-  [[ "$out" == *"Run again with: wts gc --all --apply"* ]]'
+  [[ "$out" != *"/other-worktrees/husk"* && "$out" == *"1 other folder(s) without .git"* ]]'
+check "its dry run names --all in the command to run next" eval '
+  out=$(cd "$SANDBOX" && "$WTS" gc --all --all-branches --no-fetch)
+  [[ "$out" == *"/other-worktrees/husk"* && "$out" == *"Run again with: wts gc --all --apply"* ]]'
 rmdir "$SANDBOX/code/other-worktrees/husk"
 "$WTS" rm elsewhere -f >/dev/null
 
@@ -776,6 +890,11 @@ hook_in_session() {
      && "$out" != *"dbsess/api"* ]]
 }
 check "the hook describes the other sessions and their notes" hook_in_session
+check "it dates their brief" eval '
+  q "INSERT OR REPLACE INTO briefs VALUES ('\''dbpeer'\'', '\''k'\'', '\''done: login fixed'\'', strftime('\''%s'\'', '\''now'\'') - 7200)"
+  out=$(cd "$WT/dbsess" && env -u TMUX -u TMUX_PANE "$CONTEXT")
+  q "DELETE FROM briefs WHERE session = '\''dbpeer'\''"
+  [[ "$out" == *"brief, 2h ago: done: login fixed"* ]]'
 
 settings="$CLAUDE_CONFIG_DIR/settings.json"
 print -r -- '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo mine"}]}]}}' > "$settings"
@@ -801,7 +920,53 @@ check "setup claude --install adds each event hook once" \
            .hooks.Notification[].hooks[], .hooks.SessionEnd[].hooks[]
          | select(.command | test("/wts-hook ")) ] | length == 4' "$settings"
 check "setup tmux adds the status line segment" \
-  eval '"$WTS" setup tmux | grep -qF "wts-status --line"'
+  eval 'out=$("$WTS" setup tmux); [[ "$out" == *"wts-status --line"* ]]'
+
+# --install: one block, between markers, whatever was there. A block from before
+# the markers is replaced; a status line the user moved below a theme is kept
+# where it is and not added a second time.
+TH="$SANDBOX/home"
+mkdir -p "$TH"
+cat > "$TH/.tmux.conf" <<'EOF'
+set -g mouse on
+
+# ─── wts (generated by `wts setup tmux`, wts 0.1.1) ───────────────────
+bind s display-popup -E -w 85% -h 70% "/old/libexec/wts/wts-switch"
+bind a run-shell "/old/libexec/wts/wts-switch --next"
+
+set -g status-right "theme"
+set -ag status-right " #(/old/libexec/wts/wts-status --line)"
+EOF
+HOME="$TH" "$WTS" setup tmux --install >/dev/null
+HOME="$TH" "$WTS" setup tmux --install >/dev/null
+check "setup tmux --install replaces a block from before the markers" eval '
+  c=$(<"$TH/.tmux.conf")
+  [[ "$c" != *"wts 0.1.1"* && "$c" != *"/old/libexec/wts/wts-switch"* \
+     && "$c" == *"$ROOT/libexec/wts/wts-switch"* && "$c" == *"set -g mouse on"* ]]'
+check "and run twice, it keeps one block" eval '[[ $(grep -c "^# >>> wts " "$TH/.tmux.conf") == 1 ]]'
+check "a status line moved out of the block is kept, not doubled" eval '
+  [[ $(grep -c "wts-status --line" "$TH/.tmux.conf") == 1 ]] \
+  && grep -qF "#(/old/libexec/wts/wts-status --line)" "$TH/.tmux.conf"'
+check "a fresh tmux.conf gets the block, status line included" eval '
+  H2="$SANDBOX/home2"; mkdir -p "$H2"
+  HOME="$H2" "$WTS" setup tmux --install >/dev/null
+  grep -q "^# <<< wts <<<" "$H2/.tmux.conf" && grep -qF "wts-status --line" "$H2/.tmux.conf"'
+
+# wts doctor: everything the sandbox has, and a failure when a requirement is
+# not there. Read-only: the database is not created by it.
+check "doctor passes with what the test itself needs" eval '
+  out=$("$WTS" doctor)
+  [[ "$out" == *"✓ tmuxinator"* && "$out" == *"Integration"* && "$out" == *"→ ready"* ]]'
+check "doctor names a missing requirement and fails" eval '
+  out=$(env PATH="$nomux" "$WTS" doctor); (( $? == 1 )) && [[ "$out" == *"✗ tmuxinator not found"* ]]'
+check "doctor runs tmuxinator, and fails on one that does not run" eval '
+  out=$(env PATH="$badmux:$PATH" "$WTS" doctor); (( $? == 1 )) \
+  && [[ "$out" == *"✗ tmuxinator is on PATH but does not run (exit 126)"* ]]'
+check "doctor sees a tmux snippet from an older wts" eval '
+  cp "$TH/.tmux.conf" "$TH/conf.keep"
+  sed -i.x "s/^# >>> wts [^ ]* >>>/# >>> wts 0.9.0 >>>/" "$TH/.tmux.conf"
+  out=$(HOME="$TH" "$WTS" doctor); mv "$TH/conf.keep" "$TH/.tmux.conf"
+  [[ "$out" == *"tmux snippet: from wts 0.9.0"* ]]'
 
 "$WTS" rm dbsess -f >/dev/null
 no_notes_left() { [[ "$(q "SELECT count(*) FROM notes WHERE session = 'dbsess'")" == 0 ]] }
@@ -1066,7 +1231,7 @@ check "the session records them in its own document list" eval '
 "$WTS" rm docfromtask -f >/dev/null
 
 check "the session carries the marker in ls" eval '
-  "$WTS" ls | grep -q "^tsess .*\* "'
+  out=$("$WTS" ls); [[ "$out" == *$'\''\n'\''"tsess "*"@ "* ]]'
 check "status --json exposes task and task_title" eval '
   "$WTS" status --json --no-git tsess \
     | jq -e ".[0].task == \"$TASK\" and .[0].task_title == \"Ship the audit trail\"" >/dev/null'
@@ -1091,6 +1256,7 @@ check "unlink detaches without removing the session" eval '
   env WTS_NO_THINGS=1 "$WTS" task unlink tsess2 >/dev/null
   [[ "$(q "select count(*) from task_links where session = '\''tsess2'\''")" == 0 \
   && "$(q "select count(*) from sessions where name = '\''tsess2'\''")" == 1 ]]'
+refute "unlink of a name that is no session fails" env WTS_NO_THINGS=1 "$WTS" task unlink zzqqx
 "$WTS" rm tsess2 -f >/dev/null
 
 # ─── Context kept ON the task ────────────────────────────────────────────────
@@ -1186,6 +1352,21 @@ check "the documents attached to the task are in it" eval '
 check "the SessionStart hook repeats the task context" eval '
   out=$(cd "$WT/tctx" && "$ROOT/libexec/wts/wts-context" </dev/null)
   [[ "$out" == *"Ship the audit trail"* && "$out" == *"CSV export"* ]]'
+# A Things task can carry a pasted log: its notes were the one field the hook
+# printed whole, at every start, /clear and /compact.
+long_task_notes_capped() {
+  local out
+  q "INSERT OR REPLACE INTO kv VALUES ('smoke.notes', (SELECT notes FROM tasks WHERE id = '$TASK'))"
+  q "UPDATE tasks SET notes = '$(printf 'line %d\n' {1..20})' WHERE id = '$TASK'"
+  out=$(cd "$WT/tctx" && "$ROOT/libexec/wts/wts-context" </dev/null)
+  q "UPDATE tasks SET notes = (SELECT value FROM kv WHERE key = 'smoke.notes') WHERE id = '$TASK'"
+  [[ "$out" == *"line 12"* && "$out" != *"line 13"* && "$out" == *"8 more line(s)"* ]]
+}
+check "the hook caps the task's own notes" long_task_notes_capped
+check "WTS_CONTEXT_QUIET keeps who and which task, nothing else" eval '
+  out=$(cd "$WT/tctx" && WTS_CONTEXT_QUIET=1 "$ROOT/libexec/wts/wts-context" </dev/null)
+  [[ "$out" == *"session \`tctx\`"* && "$out" == *"Task: **Ship the audit trail**"* \
+     && "$out" != *"CSV export"* && "$out" != *"db set"* ]]'
 check "a task with notes but no document still gets a context file" eval '
   T2=$(tt new "Rate-limit the public API")
   tt note "$T2" "per key, not per IP" >/dev/null
@@ -1610,7 +1791,8 @@ check "the worktree really is gone" eval '[[ ! -e "$WT/gcarch" ]]'
 
 check "the schema is at version 4" eval '
   [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 4 ]]'
-check "log and retro are info commands for wts-fresh" eval '
-  grep -qE "ls\|status\|brief\|restore\|db\|log\|retro\|" "$ROOT/libexec/wts/wts-fresh"'
+check "log, retro, doctor, keys, doc, stop and pr are info commands for wts-fresh" eval '
+  line=$(grep -E "^  ls\|status\|" "$ROOT/libexec/wts/wts-fresh")
+  for c in log retro doctor keys doc stop pr; do [[ "$line" == *"|$c|"* ]] || exit 1; done'
 
 print -r -- "── $passed checks passed"
