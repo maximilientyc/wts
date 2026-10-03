@@ -47,7 +47,7 @@ one person's workflow. It is shared in case that workflow is also yours.
   state columns, naming from a phrase, `wts brief`, resume on restore. Without it
   everything else works and the agent columns show `-`.
 - Optional: [direnv](https://direnv.net), for a per-repository `WTS_SUBDIR`
-- Optional: [gh](https://cli.github.com), for `ctrl-o` in the switcher and `wts pr`
+- Optional: [gh](https://cli.github.com), for `ctrl-o` in the switcher, its PR column and `wts pr`
   (open the session's pull request). Without it the key is not offered.
 
 `wts doctor` checks all of it: what is missing, which switcher features an older
@@ -155,7 +155,7 @@ wts wait <name>... [--until <state>,...] [--timeout <s>] [--json]
 wts tail <name> [-n <k>] [--json]
 wts restore [name...]
 wts stop <name>
-wts pr [name]
+wts pr [name] | pr --refresh [--json] [name...]
 wts rm <name> [-f]
 wts gc [--all] [--all-branches] [--apply] [--no-fetch] [--no-retro] | gc [...] --json
 wts log [--since <when>] [--until <when>] [--task <id>] [--brief] [--no-notes] [--no-things]
@@ -276,11 +276,39 @@ The **stale guard** hashes the agent's pane on every refresh: an agent reported 
 `stuck?`. Without it, a `Ctrl-C` leaves a session "working" forever.
 
 Sessions are sorted by what needs a human first: `stuck?`, `blocked`, `failed`,
-`idle`, `working`, then the rest — and among equals, the one waiting longest.
-`wts status --json` exposes the same data (`agent_state`, `stale`, git
-counters, tmux state) for scripts, plus `agent_since` (the epoch of the event
-that put the agent in its state), `agent_waiting_for` (the permission or the
-question) and `agent_source` (`agents` or `events`, see below).
+`idle`, `working`, then the rest — and among equals, the one waiting longest. A
+merged session goes last, whatever its agent says. `wts status --json` exposes
+the same data (`agent_state`, `stale`, git counters, tmux state) for scripts,
+plus `agent_since` (the epoch of the event that put the agent in its state),
+`agent_waiting_for` (the permission or the question), `agent_source` (`agents`
+or `events`, see below) and `pr` (see [Pull requests](#pull-requests)).
+`merged` is true once every commit of the branch is in the base, squash and
+rebase included — the test `wts gc` uses — and false for a branch nothing was
+committed to yet.
+
+## Pull requests
+
+`wts pr --refresh` asks `gh` about each session's pull request — number, state,
+review decision, checks — and caches the answer. The switcher shows it in a PR
+column: `#42 ✓` (open, checks passing), `#42 ✗ci` (a check failed), `#42 chg`
+(changes requested), `#42 ...` (checks running), `closed`, or `merged`, which
+the branch's own content can also say before anyone refreshed. The preview
+spells it out (`PR #42 open · checks failing · approved (3m ago)`), and on a
+merged session says what `ctrl-d` does. `wts status --json` carries the same
+cache under `pr` (`number`, `state`, `review`, `checks`, `merged_at`, `url`,
+`refreshed_at`), `null` when there is none.
+
+`gh` is a network call per session, so neither `wts ls`, the collector nor the
+switcher's 2-second refresh ever make it: only `wts pr --refresh`, and the
+switcher's slow timer, which runs it in the background when the popup opens and
+then every `WTS_PR_REFRESH` seconds (300; `0` turns it off), once for all open
+popups. Which PR: the one Claude Code linked in the session's transcript when
+its head is the session's branch (a reused session name would otherwise find the
+previous incarnation's PR), else whatever `gh` finds for the branch. A failed
+call (not logged in, offline) keeps the last answer and records why.
+
+`wts rm` without `-f` now deletes a branch merged by squash or rebase, which
+`git branch -d` refuses, and archives the session as `squashed` or `merged`.
 
 **The agent's own events.** `claude agents` says what state an agent is in, not
 since when nor what it is waiting on. The agent knows, and Claude Code says it
@@ -384,7 +412,7 @@ you cannot press from inside the popup. `enter` switches, `ctrl-x`
 stops the selected session (`wts stop`, after a y/N prompt: its tmux session
 closes, the worktree, the branch and the registry entry stay, the popup stays
 open and the row reads `stopped`), `ctrl-d` removes it entirely (`wts rm`, after a y/N prompt that names
-the session and its agent state), `ctrl-o` opens the branch's
+the session, its agent state and whether it is merged), `ctrl-o` opens the branch's
 pull request on GitHub (`wts pr`, through `gh pr view --web`: without a PR the popup
 says so and stays open; without `gh` the key is neither bound nor listed),
 `ctrl-e` attaches a [context document](#context-documents-wts-doc) to the session
@@ -1195,6 +1223,7 @@ locale (`LANG=C`), Ruby refuses to read them ("invalid byte sequence in US-ASCII
 | `WTS_NOTIFIER`          | `terminal-notifier` on PATH   | a terminal-notifier binary for the banner (click switches to the session) |
 | `WTS_NOTIFY_TERMINALS`  | iTerm2, Terminal, Ghostty, …  | bundle ids counted as "a terminal in front" (macOS), space-separated |
 | `WTS_SWITCH_REFRESH`    | `2`                           | switcher refresh interval, `0` for a static list       |
+| `WTS_PR_REFRESH`        | `300`                         | seconds between the switcher's background `wts pr --refresh`, `0` for never |
 | `WTS_SWITCH_SCROLLBACK` | `2000`                        | lines of tmux history reachable in the preview         |
 | `WTS_SWITCH_TASKS`      | `10`                          | tasks listed in the switcher, `0` to hide them         |
 | `WTS_LOCK_STALE_AFTER`  | `300`                         | seconds before `wts gc` calls an `index.lock` stale    |

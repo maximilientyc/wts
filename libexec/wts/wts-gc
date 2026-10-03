@@ -53,9 +53,8 @@
 # Why `git branch --merged` is not enough: it only recognizes merges by
 # ancestry. PRs merged by squash or rebase rewrite SHAs, so the branch is never
 # an ancestor of the base and `--merged` does not see it. So we also compare by
-# patch-id, the test behind `git cherry`, hashed once for all branches: a
-# branch whose every commit has an equivalent in the base is entirely present
-# in it, whatever the merge mode.
+# patch-id, the test behind `git cherry`: merge_scope, merge_content and
+# merge_is_new in wts-db.zsh, which the collector and `wts rm` share.
 #
 # Caution:
 #   - only <repo>-worktrees/ is scanned for husks, and a folder that has a
@@ -346,120 +345,9 @@ human() {
   else printf '%dK' "$kb"; fi
 }
 
-# Tracking state of each local branch. `track` is "[gone]" when an upstream is
-# configured but its tracking ref no longer exists (branch deleted on the
-# remote, revealed by the --prune above).
-# The `--format` of for-each-ref does not interpret \t (it would print the two
-# literal characters); %1f does produce the 0x1f byte.
-typeset -A track_of
-while IFS=$'\x1f' read -r b tr; do
-  [[ -n "$b" ]] && track_of[$b]="$tr"
-done < <(git -C "$repo_root" for-each-ref \
-  --format='%(refname:short)%1f%(upstream:track)' refs/heads/ 2>/dev/null)
-
-# Branches merged by ancestry (fast-forward or merge commit).
-typeset -A ancestry_merged
-if [[ -n "$base" ]]; then
-  for b in "${(@f)$(git -C "$repo_root" branch --merged "$base_ref" --format '%(refname:short)' 2>/dev/null)}"; do
-    [[ -n "$b" ]] && ancestry_merged[$b]=1
-  done
-fi
-
-# Patch-ids, computed once for every branch.
-#
-# This used to be `git cherry <base> <branch>` per branch, which computes a
-# patch-id for every base commit since the merge-base again for each branch:
-# 0.3 s per branch, 15 minutes for 3000 local branches on the repository
-# measured in docs/big-repo-analysis.md. Two passes now hash everything once:
-# the base's recent commits, and the own commits of every branch that is not an
-# ancestor of the base (one `git log -p` fed by --stdin). Each branch then
-# costs one `rev-list` and a few lookups.
-#
-# The base range: commits since the oldest tip among those branches, minus a
-# day of slack. A squash or a rebase lands on the base after the commits it
-# replaces were made (that is when the merge happened), so nothing older can be
-# their equivalent. Each base entry keeps its commit date, so a branch's commits
-# are only matched by base commits at least as new as the branch's tip: a change
-# re-applied years after a base commit with the same diff stays unmerged, as
-# `git cherry` bounded by the merge-base would have said.
-typeset -A base_pid_date tip_date own_pid
-patch_ids_loaded=false
-load_patch_ids() {
-  local b d oldest="" pid cid
-  local -a candidates
-  $patch_ids_loaded && return
-  patch_ids_loaded=true
-  [[ -n "$base_ref" ]] || return
-  while IFS=$'\x1f' read -r b d; do
-    [[ -n "$b" ]] || continue
-    tip_date[$b]="$d"
-    [[ "$b" != "$base" && -z "${ancestry_merged[$b]:-}" ]] || continue
-    candidates+=("$b")
-    [[ -z "$oldest" ]] || (( d < oldest )) && oldest="$d"
-  done < <(git -C "$repo_root" for-each-ref \
-    --format='%(refname:short)%1f%(committerdate:unix)' refs/heads/ 2>/dev/null)
-  (( ${#candidates} )) || return
-  (( oldest -= 86400 ))
-  local -A cdate
-  while IFS=$'\x1f' read -r cid d; do
-    [[ -n "$cid" ]] && cdate[$cid]="$d"
-  done < <(git -C "$repo_root" rev-list --since="@$oldest" --format='%H%x1f%ct' "$base_ref" 2>/dev/null \
-           | grep -v '^commit ')
-  while read -r pid cid; do
-    [[ -n "$pid" ]] && base_pid_date[$pid]="${cdate[$cid]:-0}"
-  done < <(git -C "$repo_root" rev-list --since="@$oldest" "$base_ref" 2>/dev/null \
-           | git -C "$repo_root" diff-tree --stdin -p 2>/dev/null \
-           | git -C "$repo_root" patch-id --stable 2>/dev/null)
-  while read -r pid cid; do
-    [[ -n "$pid" ]] && own_pid[$cid]="$pid"
-  done < <(print -rl -- "${candidates[@]}" "^$base_ref" \
-           | git -C "$repo_root" log --stdin -p --no-merges --format='commit %H' 2>/dev/null \
-           | git -C "$repo_root" patch-id --stable 2>/dev/null)
-}
-
-# True if every commit of <branch> has an equivalent (patch-id) in the base:
-# content entirely present, squash and rebase included. A commit with an empty
-# diff has no patch-id and nothing to be missing.
-content_merged() {
-  local b="$1" cid pid
-  [[ -n "$base_ref" ]] || return 1
-  [[ -n "${ancestry_merged[$b]:-}" ]] && return 0
-  load_patch_ids
-  for cid in "${(@f)$(git -C "$repo_root" rev-list --no-merges "$b" "^$base_ref" 2>/dev/null)}"; do
-    [[ -n "$cid" ]] || continue
-    pid="${own_pid[$cid]:-}"
-    [[ -n "$pid" ]] || continue
-    (( ${+base_pid_date[$pid]} )) || return 1
-    (( base_pid_date[$pid] + 86400 >= ${tip_date[$b]:-0} )) || return 1
-  done
-  return 0
-}
-
-# True if <branch> was created and never received a commit. With zero commits
-# of its own, a fresh branch is an ancestor of the base — exactly like a branch
-# merged by fast-forward — and `git cherry` prints nothing for it: both would
-# be classified as merged. `wts <name>` creates such a branch, and its agent
-# may well be thinking without having written anything yet.
-#
-# The reflog tells them apart: `git worktree add -b` (and `git branch`) write a
-# single "branch: Created from <base>" entry, and every commit, merge, rebase or
-# reset adds another. A branch whose remote is `[gone]` was pushed, hence
-# worked on: it is not new. An empty reflog (expired, or disabled with
-# core.logAllRefUpdates) proves nothing, so the branch is judged as before.
-is_new_branch() {
-  local b="$1" ahead line
-  local -a entries
-  [[ "${track_of[$b]:-}" == "[gone]" ]] && return 1
-  ahead=$(git -C "$repo_root" rev-list --count "$base_ref..$b" 2>/dev/null) || return 1
-  (( ${ahead:-1} == 0 )) || return 1
-  entries=("${(@f)$(git -C "$repo_root" reflog show --format=%gs "refs/heads/$b" 2>/dev/null)}")
-  entries=("${(@)entries:#}")
-  (( ${#entries} )) || return 1
-  for line in "${entries[@]}"; do
-    [[ "$line" == "branch: Created from"* ]] || return 1
-  done
-  return 0
-}
+# Tracking state and ancestry of every local branch, for the patch-id test
+# (merge_scope in wts-db.zsh, the same one wts-status and `wts rm` use).
+merge_scope "$repo_root" "$base" "$base_ref"
 
 # Registered session for a given worktree (empty if unknown).
 session_for_worktree() {
@@ -603,14 +491,14 @@ if [[ -n "$base" ]]; then
       continue
     fi
 
-    if content_merged "$b"; then
-      if is_new_branch "$b"; then
+    if merge_content "$b"; then
+      if merge_is_new "$b"; then
         new_branches+=("$b")
         continue
       fi
 
-      if [[ -n "${ancestry_merged[$b]:-}" ]]; then why="merged"; else why="squashed/rebased"; fi
-      [[ "${track_of[$b]:-}" == "[gone]" ]] && why="$why, remote deleted"
+      if [[ -n "${MERGE_ANCESTRY[$b]:-}" ]]; then why="merged"; else why="squashed/rebased"; fi
+      [[ "${MERGE_TRACK[$b]:-}" == "[gone]" ]] && why="$why, remote deleted"
 
       wt="${branch_wt[$b]:-}"
       if [[ -z "$wt" ]]; then
@@ -632,7 +520,7 @@ if [[ -n "$base" ]]; then
         fi
       fi
 
-    elif [[ "${track_of[$b]:-}" == "[gone]" ]]; then
+    elif [[ "${MERGE_TRACK[$b]:-}" == "[gone]" ]]; then
       gone_branches+=("$b")
     fi
   done
@@ -905,7 +793,7 @@ for rec in "${teardown[@]}"; do
       if store_err=$("$WTS_BIN/wts-retro" store "$sess" < "$retro_tmp/$sess.facts" 2>&1 >/dev/null); then
         archived+=("$sess")
       else
-        print -u2 -r -- "⚠ $sess: not archived${store_err:+: ${${(f)store_err}[1]}}"
+        print -u2 -r -- "⚠ $sess: not archived${store_err:+: ${store_err%%$'\n'*}}"
       fi
     fi
     [[ -n "$sess" ]] && purge+=("$sess")
@@ -963,6 +851,8 @@ if db_available && [[ -s "$WTS_DB" ]]; then
            DELETE FROM agent_events WHERE session NOT IN (SELECT name FROM sessions);
            DELETE FROM agent_panes WHERE session NOT IN (SELECT name FROM sessions);
            DELETE FROM touches WHERE session NOT IN (SELECT name FROM sessions);
+           DELETE FROM pr_state WHERE session NOT IN (SELECT name FROM sessions);
+           DELETE FROM merge_checks WHERE session NOT IN (SELECT name FROM sessions);
            DELETE FROM pane_hashes WHERE since < unixepoch() - 7 * 86400;
            COMMIT;" 2>&1 >/dev/null); then
     db_q "$(usage_prune_sql)" >/dev/null 2>&1
@@ -970,7 +860,7 @@ if db_available && [[ -s "$WTS_DB" ]]; then
   else
     # sqlite3's reason: "database is locked" and "no such function: unixepoch"
     # (SQLite before 3.38) call for different fixes.
-    print -u2 -r -- "⚠ registry not updated${db_err:+: ${${(f)db_err}[1]}}"
+    print -u2 -r -- "⚠ registry not updated${db_err:+: ${db_err%%$'\n'*}}"
   fi
 fi
 

@@ -62,11 +62,6 @@ fi
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
-# Same rule as `claude_project_dir` in wts: every non-alphanumeric -> "-".
-claude_project_dir() {
-  print -r -- "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/${1//[^a-zA-Z0-9]/-}"
-}
-
 # Headless call: same options, for the same reasons, as wts-name.
 # ask_claude <errfile> — stderr goes to that file rather than /dev/null: a
 # rejected model id and a timeout used to leave the same silence, impossible to
@@ -128,27 +123,9 @@ collect() {
 
   # --- Claude transcript ----------------------------------------------------
   # The live agent's one if there is one, otherwise the most recent one of the
-  # worktree or its subdirectory — exact paths, never a prefix (fix-login must
-  # not read fix-login-2).
-  local -a dirs
-  local d f tr="" m best=0
-  dirs=("$(claude_project_dir "$worktree")")
-  [[ -n "$subdir" ]] && dirs+=("$(claude_project_dir "$worktree/$subdir")")
-  if [[ -n "$sid" ]]; then
-    for d in "${dirs[@]}"; do
-      [[ -f "$d/$sid.jsonl" ]] && { tr="$d/$sid.jsonl"; break }
-    done
-  fi
-  if [[ -z "$tr" ]]; then
-    for d in "${dirs[@]}"; do
-      for f in "$d"/*.jsonl(N); do
-        m=$(zstat +mtime "$f" 2>/dev/null) || continue
-        # Older than the session: a previous incarnation of the same name
-        # (wts rm, then wts <name>), whose work is unrelated.
-        (( m >= created && m > best )) && { best=$m; tr="$f" }
-      done
-    done
-  fi
+  # worktree (db_session_transcript in wts-db.zsh).
+  local tr
+  tr=$(db_session_transcript "$worktree" "$subdir" "$created" "$sid") || tr=""
 
   local title="" pr="" last_prompt="" texts=""
   if [[ -n "$tr" ]]; then

@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-Schema 6: one new table, `usage`, created on the first command.
+Schema 7: three new tables (`usage`, `pr_state`, `merge_checks`), created on
+the first command.
 
 - **Tokens and cost per session and per task.** `wts brief` and the teardown
   (`wts rm`, `wts gc --apply`) sum `message.usage` from every transcript of a
@@ -37,6 +38,34 @@ Schema 6: one new table, `usage`, created on the first command.
   layout.** `EDITOR=true` (or `yes`, `on`, a number) was written bare into the
   YAML, read as a boolean, and tmuxinator failed with "undefined method
   shellescape for true". The editor is now always a quoted string.
+- **PR, CI and review state per session.** `wts pr --refresh [--json]
+  [name...]` asks `gh` for each session's pull request (number, state, review
+  decision, checks) and caches it in a `pr_state` table. The switcher shows a PR
+  column — `#42 ✓`, `#42 ✗ci`, `#42 chg`, `#42 ...`, `closed`, `merged` — sorts
+  merged sessions last, and its preview spells the PR out and, on a merged
+  session, says what `ctrl-d` does. `gh` never runs from `wts ls`, the
+  collector or the 2-second tick: only on `wts pr --refresh` and on the
+  switcher's slow timer, every `WTS_PR_REFRESH` seconds (300, `0` for never),
+  in the background and once for all open popups. The PR is the one Claude
+  Code linked in the session's transcript when its head is the session's
+  branch, else what `gh` finds for the branch.
+- **`wts status --json` gains `pr`**: `null`, or `{number, state, review,
+  checks, merged_at, url, refreshed_at}` (`state` is `open`, `closed` or
+  `merged`; `review` `approved`, `changes_requested`, `review_required` or
+  `null`; `checks` `pass`, `fail`, `pending` or `null`). The array is now also
+  sorted with merged sessions last.
+- **`merged` is right about squash merges, and about new branches.** It was
+  `git branch --merged` alone: a PR merged by squash or rebase read `false` for
+  good, and a session nothing was committed to yet read `true`. It is now the
+  patch-id test `wts gc` tears down on, moved into `wts-db.zsh` and shared,
+  with its verdict cached per pair of tips so that the 2-second tick stays a
+  `rev-parse` per session.
+- **`wts rm` deletes a squash-merged branch without `-f`**, which
+  `git branch -d` refuses — `ctrl-d` on a merged row ended on "not merged (use
+  -f)" with the branch left for gc — and archives the session as `squashed` or
+  `merged` instead of `removed`.
+- A one-line error from sqlite3 or tmuxinator was cut to its first character in
+  three messages of `wts gc` and `wts doctor` (`⚠ registry not updated: d`).
 
 ## 1.6.0 — 2026-10-03
 

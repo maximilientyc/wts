@@ -8,7 +8,7 @@
 #   --wide  with --table: TOKENS, COST and MODEL too (`wts ls --wide`), read
 #           from the usage table that wts brief and the archive fill. --json
 #           carries the same as `usage`, except with --no-git (null there)
-#   --fzf   sorted lines (stuck first) for wts-switch, fields separated by
+#   --fzf   sorted lines (stuck first, merged last) for wts-switch, fields separated by
 #           \x1f: TAB is an IFS whitespace and would collapse empty fields (an
 #           agent without a tmux pane would shift every column).
 #   --no-git  agents and tmux only: the git columns are 0 in --json and "-" in
@@ -157,9 +157,10 @@ needs_human() { # <notification_type>
 # The three helpers below memoize per repository. They hand their result back
 # in REPLY rather than on stdout: called as `$(detect_base …)`, the memo was
 # written in the command substitution's subshell and lost, so `branch --merged`
-# (0.15 s warm, 0.7 s cold over 3000 refs) ran once per session instead of
-# once per pass, a third of the tick on a large repository.
-typeset -A base_cache base_ref_cache merged_cache
+# (0.15 s warm, 0.7 s cold over 3000 refs), which the merged test used to be,
+# ran once per session instead of once per pass, a third of the tick on a
+# large repository.
+typeset -A base_cache base_ref_cache base_tip_cache
 
 # Base branch of a repository (same priority order as `wts`). -> REPLY
 detect_base() {
@@ -213,16 +214,56 @@ base_ref_for() { # -> REPLY
   REPLY="${base_ref_cache[$key]}"
 }
 
-# Branches merged into the base, one per line, cached per repository. -> REPLY
-merged_branches() {
-  local root="$1" base="$2"
-  local key="$root::$base"
-  if (( ! ${+merged_cache[$key]} )); then
-    merged_cache[$key]=$'\n'$(git -C "$root" branch --merged "$base" \
-      --format '%(refname:short)' 2>/dev/null)$'\n'
+# Tip of the base, cached per repository. -> REPLY
+base_tip_of() {
+  local root="$1" ref="$2"
+  local key="$root::$ref"
+  if (( ! ${+base_tip_cache[$key]} )); then
+    base_tip_cache[$key]=$(git -C "$root" rev-parse --verify --quiet "$ref^{commit}" 2>/dev/null)
   fi
-  REPLY="${merged_cache[$key]}"
+  REPLY="${base_tip_cache[$key]}"
 }
+
+# Whether the branch landed in the base, squash included: merge_verdict in
+# wts-db.zsh, the test gc tears down on. It reads diffs, so its answer is kept
+# in merge_checks against the two tips it was computed for and only computed
+# again when one of them moves — on a tick, that is one rev-parse per session.
+# `branch --merged` alone, which this was, read false for every squash merge
+# and true for a session created a second ago (no commit yet: an ancestor).
+typeset -A mc_tip mc_base mc_merged
+if [[ -s "$WTS_DB" ]]; then
+  for mc_row in "${(@ps:\x1e:)$(db_rows "SELECT session, tip, base_tip, merged FROM merge_checks" 2>/dev/null)}"; do
+    mc_f=("${(@ps:\x1f:)mc_row}")
+    [[ -n "${mc_f[1]:-}" ]] || continue
+    mc_tip[${mc_f[1]}]="${mc_f[2]:-}" mc_base[${mc_f[1]}]="${mc_f[3]:-}" mc_merged[${mc_f[1]}]="${mc_f[4]:-}"
+  done
+fi
+merged_verdict() { # <session> <repo_root> <branch> <base> <base_ref> -> REPLY
+  local name="$1" root="$2" branch="$3" base="$4" ref="$5" tip btip
+  tip=$(git -C "$root" rev-parse --verify --quiet "refs/heads/$branch" 2>/dev/null)
+  base_tip_of "$root" "$ref"; btip="$REPLY"
+  REPLY=""
+  [[ -n "$tip" && -n "$btip" ]] || return 0
+  if [[ "${mc_tip[$name]:-}" == "$tip" && "${mc_base[$name]:-}" == "$btip" ]]; then
+    REPLY="${mc_merged[$name]:-}"
+    return 0
+  fi
+  merge_check "$name" "$root" "$branch" "$base" "$ref" "$tip" "$btip"
+  mc_tip[$name]="$tip" mc_base[$name]="$btip" mc_merged[$name]="$REPLY"
+  return 0
+}
+
+# The pull request of each session, as wts-pr last cached it: a database read,
+# never gh, so it costs the tick nothing. Rows where gh found no PR stay out:
+# `pr` is null for them, as for a session never refreshed.
+typeset -A pr_json
+if [[ -s "$WTS_DB" ]]; then
+  for pr_row in "${(@ps:\x1e:)$(db_rows "SELECT p.session, $WTS_PR_JSON FROM pr_state p
+                                        WHERE p.number IS NOT NULL" 2>/dev/null)}"; do
+    pr_f=("${(@ps:\x1f:)pr_row}")
+    [[ -n "${pr_f[1]:-}" && -n "${pr_f[2]:-}" ]] && pr_json[${pr_f[1]}]="${pr_f[2]}"
+  done
+fi
 
 # ─── Main pass ───────────────────────────────────────────────────────────────
 
@@ -260,9 +301,14 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
       shortstat=$(git -C "$worktree" diff --shortstat "$base_ref...HEAD" 2>/dev/null)
       [[ "$shortstat" =~ '([0-9]+) insertion' ]] && added="${match[1]}"
       [[ "$shortstat" =~ '([0-9]+) deletion' ]] && removed="${match[1]}"
-      merged_branches "$repo_root" "$base_ref"
-      [[ "$REPLY" == *$'\n'"$branch"$'\n'* ]] && merged=true
+      merged_verdict "$name" "$repo_root" "$branch" "$base" "$base_ref"
+      [[ -n "$REPLY" ]] && merged=true
     fi
+  elif $exists; then
+    # --no-git: the last verdict, whatever the tips are now. Not a count that
+    # would read as a claim, and without it the first fill of the switcher
+    # sorted a merged session among the live ones until the full pass.
+    [[ -n "${mc_merged[$name]:-}" ]] && merged=true
   fi
 
   # --- Claude agent ---------------------------------------------------------
@@ -399,6 +445,7 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
     --argjson agent_state "$agent_state" --argjson agent_waiting_for "$agent_waiting" \
     --argjson agent_name "$agent_name" --argjson agent_session "$agent_session" \
     --argjson agent_pane "$agent_pane" --argjson stale "$stale" \
+    --argjson pr "${pr_json[$name]:-null}" \
     '{name:$name, profile:$profile, branch:$branch, base:$base,
       repo_root:$repo_root, worktree:$worktree, subdir:$subdir,
       context:$context, created_at:$created_at,
@@ -408,7 +455,7 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
       agent_state:$agent_state, agent_waiting_for:$agent_waiting_for,
       agent_name:$agent_name, agent_session:$agent_session,
       agent_pane:$agent_pane, stale:$stale,
-      agent_since:$agent_since, agent_source:$agent_source}')")
+      agent_since:$agent_since, agent_source:$agent_source, pr:$pr}')")
 
 done < <(jq -r '$ARGS.positional as $only
   | to_entries | sort_by(.key)[]
@@ -425,8 +472,11 @@ if (( ${#objects} == 0 )); then
 fi
 
 # Sort: whatever needs a human first, and among equals the one waiting longest.
+# A merged session last, whatever its agent says: the work landed, and what is
+# left is a ctrl-d.
 SORT_KEY='def rank:
-  if .stale then 0
+  if .merged or .pr.state == "merged" then 6
+  elif .stale then 0
   elif .agent_state == "blocked" then 1
   elif .agent_state == "failed" then 2
   elif .agent_state == "idle" then 3
@@ -508,7 +558,17 @@ case "$FORMAT" in
   # cwd is that worktree, which would show a ghost "working". --json keeps the
   # raw facts.
   # Fields 7 and 8, since (epoch) and waiting-for, feed the preview's header.
-  fzf)   print -r -- "$all" | jq -r --argjson git "$WITH_GIT" "$SUBJECT"'.[]
+  # Field 9 is the PR column (db_pr_labels in wts-db.zsh, which the switcher's
+  # skeleton reads too), and the subject stays last.
+  fzf)   typeset -a label_pairs=()
+         for pr_row in "${(@ps:\x1e:)$(db_pr_labels)}"; do
+           pr_f=("${(@ps:\x1f:)pr_row}")
+           [[ -n "${pr_f[1]:-}" && -n "${pr_f[2]:-}" ]] && label_pairs+=("${pr_f[1]}" "${pr_f[2]}")
+         done
+         labels_json=$(jq -nc 'reduce range(0; $ARGS.positional | length; 2) as $i
+                                 ({}; . + {($ARGS.positional[$i]): $ARGS.positional[$i + 1]})' \
+                         --args "${label_pairs[@]}")
+         print -r -- "$all" | jq -r --argjson git "$WITH_GIT" --argjson labels "${labels_json:-"{}"}" "$SUBJECT"'.[]
            | [ .name,
                (if (.tmux_alive | not) then "stopped"
                 elif .stale then "stuck?" else (.agent_state // "-") end),
@@ -519,6 +579,7 @@ case "$FORMAT" in
                (.agent_since // "" | tostring),
                (.agent_waiting_for | if type == "string" then . elif . == null then "" else tojson end
                 | gsub("[\\t\\n\\r\u001f\u001e]"; " ")),
+               ($labels[.name] // ""),
                subject ]
            | join("")' ;;
   # One line for a status bar, empty when nobody needs you: dead tmux sessions
