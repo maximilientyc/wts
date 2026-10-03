@@ -274,7 +274,7 @@ tmux kill-session -t "=namer" 2>/dev/null || true
 
 check "ls shows the session" eval '"$WTS" ls | grep -q "^auth-form "'
 check "status --json" eval '"$WTS" status --json | jq -e "length == 2 and all(.[]; .exists and .tmux_alive)"'
-check "status --fzf has 9 fields" eval '"$WTS" status --fzf | awk -F "\037" "NF != 9 { exit 1 }"'
+check "status --fzf has 10 fields" eval '"$WTS" status --fzf | awk -F "\037" "NF != 10 { exit 1 }"'
 
 # An interactive agent waiting for an answer needs a human: blocked, sorted first.
 jq -n --arg cwd "$WT/export-users-csv" \
@@ -540,7 +540,7 @@ cat > "$SANDBOX/shim/git" <<'EOF'
 for a in "$@"; do
   case "$a" in
     --no-optional-locks) nolocks=1 ;;
-    branch)              echo "$*" >> "$WTS_SMOKE_BRANCHLOG" ;;
+    branch|for-each-ref|patch-id) echo "$*" >> "$WTS_SMOKE_BRANCHLOG" ;;
     status|diff)         sub="$a"; break ;;
   esac
 done
@@ -565,17 +565,18 @@ else
   ok "no collector git call may take index.lock"
 fi
 
-# The per-repository memo of `branch --merged` used to be lost in a subshell,
-# so the call ran once per session: with two sessions in one repository, one
-# pass must run it exactly once.
+# Whether a branch landed is the patch-id test now, and it reads diffs: the
+# collector keeps its verdict per pair of tips (merge_checks), so a pass over
+# tips that did not move asks git for no ancestry and hashes nothing.
+"$WTS" status --json >/dev/null 2>&1 || true
 : > "$WTS_SMOKE_BRANCHLOG"
 PATH="$SANDBOX/shim:$PATH" "$WTS" status --json >/dev/null 2>&1 || true
-check "one pass runs branch --merged once per repository" \
-  eval '[[ "$(grep -c -- "--merged" "$WTS_SMOKE_BRANCHLOG")" == 1 ]]'
+check "a pass over unchanged tips reads the merge verdict from its cache" \
+  eval '! grep -qE -- "--merged|patch-id" "$WTS_SMOKE_BRANCHLOG"'
 
 # --no-git: agent and tmux columns only, git columns "-", same field count.
-check "status --fzf --no-git keeps 9 fields" \
-  eval '"$ROOT/libexec/wts/wts-status" --fzf --no-git | awk -F "\037" "NF != 9 { exit 1 }"'
+check "status --fzf --no-git keeps 10 fields" \
+  eval '"$ROOT/libexec/wts/wts-status" --fzf --no-git | awk -F "\037" "NF != 10 { exit 1 }"'
 check "status --fzf --no-git shows - for delta and dirty" \
   eval '"$ROOT/libexec/wts/wts-status" --fzf --no-git | awk -F "\037" "\$4 != \"-\" || \$5 != \"-\" { exit 1 }"'
 check "status --json --no-git lists every session with zeroed git columns" \
@@ -1053,13 +1054,16 @@ git -C "$REPO" reset -q --hard "$lagging"   # local main now trails origin/main
 WTS_NO_ATTACH=1 WTS_BASE_BRANCH=origin/main "$WTS" fresh-cut smoke >/dev/null
 check "session cut from origin/<base>" in_registry fresh-cut
 
-# The branch is origin/main itself, so every counter is zero and it is merged.
-# Against the local base it used to report ahead=1 and added=1.
+# The branch is origin/main itself, so every counter is zero. Against the local
+# base it used to report ahead=1 and added=1.
 check "delta measured against origin/<base>" \
   eval '"$WTS" status --json | jq -e ".[] | select(.name == \"fresh-cut\")
         | .ahead == 0 and .behind == 0 and .added == 0 and .removed == 0"'
-check "merged seen through origin/<base>" \
-  eval '"$WTS" status --json | jq -e ".[] | select(.name == \"fresh-cut\") | .merged"'
+# An ancestor of the base, but only because nothing was committed yet: it used
+# to read merged, and a switcher that sorts merged last and offers ctrl-d on
+# them must not say so of a session created a second ago.
+check "a branch with no commit yet is not merged" \
+  eval '"$WTS" status --json | jq -e ".[] | select(.name == \"fresh-cut\") | .merged == false"'
 # Pins the contract: wts-brief reads .base and derives "origin/$base" itself, so
 # it must stay the short name.
 check "base still reports the short name" \
@@ -1799,8 +1803,174 @@ check "the base it was compared against is recorded" eval '
   [[ "$(q "select base from archive where session = '"'"'gcarch'"'"'")" == main ]]'
 check "the worktree really is gone" eval '[[ ! -e "$WT/gcarch" ]]'
 
-check "the schema is at version 5" eval '
-  [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 5 ]]'
+check "the schema is at version 7" eval '
+  [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 7 ]]'
+
+# ─── PR, CI and review state ─────────────────────────────────────────────────
+# gh is a stand-in: it answers from fixtures keyed by what it was asked (a
+# branch or a URL), and logs every call, so the test can pin that only
+# `wts pr --refresh` ever runs it — never the collector, `wts ls` or the
+# switcher's list.
+export WTS_SMOKE_GHLOG="$SANDBOX/gh.log" WTS_SMOKE_GHDIR="$SANDBOX/ghfix"
+mkdir -p "$SANDBOX/ghbin" "$WTS_SMOKE_GHDIR"
+cat > "$SANDBOX/ghbin/gh" <<'EOF'
+#!/bin/sh
+echo "$*" >> "$WTS_SMOKE_GHLOG"
+[ "$1 $2" = "pr view" ] || exit 1
+if [ -n "$WTS_SMOKE_GH_FAIL" ]; then
+  [ "$WTS_SMOKE_GH_FAIL" = 1 ] && WTS_SMOKE_GH_FAIL="error connecting to api.github.com"
+  echo "$WTS_SMOKE_GH_FAIL" >&2
+  exit 1
+fi
+f="$WTS_SMOKE_GHDIR/$(printf %s "$3" | tr -c 'A-Za-z0-9' '_').json"
+[ -f "$f" ] && { cat "$f"; exit 0; }
+echo "no pull requests found for branch \"$3\"" >&2
+exit 1
+EOF
+chmod +x "$SANDBOX/ghbin/gh"
+GHPATH="$SANDBOX/ghbin:$PATH"
+fixture() { # <ident> <json>
+  print -r -- "$2" > "$WTS_SMOKE_GHDIR/${1//[^A-Za-z0-9]/_}.json"
+}
+# Cut from origin/main, as wts-fresh does: the sandbox's local main carries
+# commits that earlier sections squash-landed upstream, and a branch cut from
+# it is, by gc's own test, already squashed.
+for s in pr-ok pr-ci pr-chg pr-none pr-link; do
+  WTS_NO_ATTACH=1 WTS_BASE_BRANCH=origin/main "$WTS" "$s" smoke >/dev/null 2>&1
+done
+check "PR sessions created" eval 'in_registry pr-ok && in_registry pr-link'
+fixture "$(reg_field pr-ok branch)" '{"number":41,"state":"OPEN","reviewDecision":"APPROVED",
+  "statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}],
+  "mergedAt":null,"url":"https://github.com/o/r/pull/41","headRefName":"'"$(reg_field pr-ok branch)"'"}'
+fixture "$(reg_field pr-ci branch)" '{"number":42,"state":"OPEN","reviewDecision":"",
+  "statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"},
+                       {"__typename":"StatusContext","state":"FAILURE"}],
+  "mergedAt":null,"url":"https://github.com/o/r/pull/42","headRefName":"'"$(reg_field pr-ci branch)"'"}'
+fixture "$(reg_field pr-chg branch)" '{"number":43,"state":"OPEN","reviewDecision":"CHANGES_REQUESTED",
+  "statusCheckRollup":[{"__typename":"CheckRun","status":"IN_PROGRESS","conclusion":""}],
+  "mergedAt":null,"url":"https://github.com/o/r/pull/43","headRefName":"'"$(reg_field pr-chg branch)"'"}'
+# pr-link: the transcript links two PRs, the last one on another repository's
+# branch. By branch, gh would answer #45, an old PR of a previous incarnation;
+# the link with this branch as its head is #46 — but the LAST link is #47,
+# whose head is not this branch, so it is checked and dropped for the branch.
+link_branch=$(reg_field pr-link branch)
+fixture "$link_branch" '{"number":45,"state":"MERGED","reviewDecision":"","statusCheckRollup":[],
+  "mergedAt":"2026-01-01T00:00:00Z","url":"https://github.com/o/r/pull/45","headRefName":"'"$link_branch"'"}'
+fixture "https://github.com/o/tap/pull/47" '{"number":47,"state":"OPEN","reviewDecision":"",
+  "statusCheckRollup":[],"mergedAt":null,"url":"https://github.com/o/tap/pull/47","headRefName":"bump"}'
+link_dir="$CLAUDE_CONFIG_DIR/projects/${$(reg_field pr-link worktree)//[^a-zA-Z0-9]/-}"
+mkdir -p "$link_dir"
+print -r -- '{"type":"pr-link","prNumber":47,"prUrl":"https://github.com/o/tap/pull/47"}' > "$link_dir/t.jsonl"
+
+: > "$WTS_SMOKE_GHLOG"
+"$WTS" ls >/dev/null 2>&1
+"$WTS" status --json >/dev/null 2>&1
+PATH="$GHPATH" "$SWITCH" --list >/dev/null 2>&1
+check "ls, status and the switcher's list never call gh" eval '[[ ! -s "$WTS_SMOKE_GHLOG" ]]'
+
+# gh lives in a Homebrew prefix, never in /usr/bin: a PATH of the system
+# directories alone is a machine without it.
+check "pr --refresh exits 3 without gh" eval '
+  PATH=/usr/bin:/bin "$WTS" pr --refresh >/dev/null 2>&1; (( $? == 3 ))'
+out=$(PATH="$GHPATH" "$WTS" pr --refresh pr-ok pr-ci pr-chg pr-none pr-link 2>&1) || true
+check "pr --refresh prints one line per session" eval '
+  [[ "$out" == *"pr-ok"*"#41 ✓"* && "$out" == *"pr-ci"*"#42 ✗ci"* && "$out" == *"pr-chg"*"#43 chg"*
+     && "$out" == *"pr-none"*"no pull request"* ]]'
+check "gh is asked once per session, plus the linked PR" eval '
+  (( $(grep -c "^pr view" "$WTS_SMOKE_GHLOG") == 6 ))'
+check "a linked PR on another branch is not taken for the session's" eval '
+  [[ "$(q "select number from pr_state where session = '"'"'pr-link'"'"'")" == 45 ]]'
+check "no PR is an answer, cached as none" eval '
+  [[ "$(q "select state || coalesce(number, '"'"'-'"'"') from pr_state where session = '"'"'pr-none'"'"'")" == "none-" ]]'
+check "checks and review are normalized" eval '
+  [[ "$(q "select checks || '"'"'/'"'"' || review from pr_state where session = '"'"'pr-chg'"'"'")" == "pending/changes_requested" ]]'
+
+# The contract: `pr` is an object or null, `merged` says the gh-merged PR too
+# only through the sort and the label, never by rewriting the git fact.
+check "status --json carries pr" eval '"$WTS" status --json | jq -e "
+  (.[] | select(.name == \"pr-ci\") | .pr | .number == 42 and .state == \"open\"
+     and .checks == \"fail\" and .review == null and (.refreshed_at | type) == \"number\")
+  and (.[] | select(.name == \"pr-none\") | .pr == null)"'
+check "pr --refresh --json is versioned" eval '
+  PATH="$GHPATH" "$WTS" pr --refresh --json pr-ci | jq -e ".version == 1
+    and .sessions[0].name == \"pr-ci\" and .sessions[0].pr.number == 42 and .sessions[0].error == null"'
+check "status --fzf field 9 is the PR label" eval '
+  "$WTS" status --fzf | awk -F "\037" "\$1 == \"pr-chg\" { print \$9 }" | grep -qx "#43 chg"'
+check "a PR gh saw merged reads merged and sorts last" eval '
+  "$WTS" status --json | jq -e "last | .name == \"pr-link\" and .pr.state == \"merged\""'
+check "the switcher has a PR column" eval '
+  l=$("$SWITCH" --list); [[ "$(print -r -- "$l" | head -1)" == *" PR "* ]] \
+    && print -r -- "$l" | grep -q "#42 ✗ci"'
+check "the PR column is in the skeleton too, same layout" \
+  eval 'diff <("$SWITCH" --list-fast | head -1) <("$SWITCH" --list | head -1)'
+check "rows with a PR column are padded to the list width" \
+  eval 'WTS_SWITCH_COLS=70 "$SWITCH" --list | same_width 70 \
+        && WTS_SWITCH_COLS=70 "$SWITCH" --list-fast | same_width 70'
+# Captured, not piped into grep -q: the preview goes on printing the pane after
+# the match, and under pipefail the closed pipe is the pipeline's status.
+check "the preview spells the PR out" eval '
+  out=$("$SWITCH" --preview pr-ci pr-ci); [[ "$out" == *"PR #42 open · checks failing"* ]]'
+check "a merged session's preview offers ctrl-d" eval '
+  out=$("$SWITCH" --preview pr-link pr-link); [[ "$out" == *"merged #45 · ctrl-d to remove"* ]]'
+
+# A repository without a GitHub remote has no PR, it is not failing: as an
+# error, gh's reason sat above every preview of the README demo.
+check "no GitHub remote reads as no PR, not as an error" eval '
+  PATH="$GHPATH" WTS_SMOKE_GH_FAIL="none of the git remotes configured for this repository point to a known GitHub host" \
+    "$WTS" pr --refresh pr-none >/dev/null 2>&1 \
+  && [[ "$(q "select state || '"'"'|'"'"' || error from pr_state where session = '"'"'pr-none'"'"'")" == "none|" ]]'
+
+# The slow timer: a refresh younger than --if-older is not repeated.
+: > "$WTS_SMOKE_GHLOG"
+PATH="$GHPATH" "$ROOT/libexec/wts/wts-pr" --refresh --if-older 300 --quiet
+check "the timer does not repeat a fresh refresh" eval '[[ ! -s "$WTS_SMOKE_GHLOG" ]]'
+q "UPDATE kv SET value = '0' WHERE key = 'pr.refresh_at'"
+PATH="$GHPATH" "$ROOT/libexec/wts/wts-pr" --refresh --if-older 300 --quiet
+check "the timer refreshes an old one" eval '[[ -s "$WTS_SMOKE_GHLOG" ]]'
+
+# A failure keeps the last good answer and says why, with a non-zero exit.
+check "a failing gh exits 1" eval '
+  PATH="$GHPATH" WTS_SMOKE_GH_FAIL=1 "$WTS" pr --refresh pr-ci >/dev/null 2>&1; (( $? == 1 ))'
+check "and keeps the last answer, with the reason" eval '
+  [[ "$(q "select number || '"'"'|'"'"' || error from pr_state where session = '"'"'pr-ci'"'"'")" == "42|error connecting"* ]]'
+
+# Squash merged: the branch's commit lands on origin/main as a different commit
+# with the same diff. Ancestry says no; the patch-id test says yes.
+SQ_WT=$(reg_field pr-ok worktree)
+print squash > "$SQ_WT/SQUASHED"
+git -C "$SQ_WT" add SQUASHED
+git -C "$SQ_WT" commit -qm "squash me"
+sq_clone="$SANDBOX/sq-clone"
+git clone -q "$ORIGIN" "$sq_clone"
+print squash > "$sq_clone/SQUASHED"
+git -C "$sq_clone" add SQUASHED
+git -C "$sq_clone" commit -qm "Squash me (#41)"
+git -C "$sq_clone" push -q origin HEAD:main
+git -C "$REPO" fetch -q origin
+check "pr --refresh alone says merged, before any collector pass" eval '
+  out=$(PATH="$GHPATH" "$WTS" pr --refresh pr-ok 2>&1); [[ "$out" == "pr-ok  merged  "* ]]'
+check "a squash-merged branch reads merged" eval '
+  "$WTS" status --json | jq -e ".[] | select(.name == \"pr-ok\") | .merged"'
+check "it is labelled merged even though gh said open" eval '
+  "$WTS" status --fzf | awk -F "\037" "\$1 == \"pr-ok\" { print \$9 }" | grep -qx merged'
+check "merged sessions sort after every live one" eval '
+  "$WTS" status --json | jq -e "(map(.merged or .pr.state == \"merged\") | . == sort)"'
+check "a commit on top is not merged any more" eval '
+  print more >> "$SQ_WT/SQUASHED" && git -C "$SQ_WT" commit -qam more \
+  && "$WTS" status --json | jq -e ".[] | select(.name == \"pr-ok\") | .merged == false"'
+git -C "$SQ_WT" reset -q --hard HEAD~1
+
+# rm deletes a squash-merged branch without -f, and archives it as squashed.
+sq_branch=$(reg_field pr-ok branch)
+out=$("$WTS" rm pr-ok </dev/null 2>&1)
+check "rm deletes a squash-merged branch without -f" eval '
+  [[ "$out" == *"branch $sq_branch deleted (squashed)"* ]] \
+  && ! git -C "$REPO" show-ref --verify --quiet "refs/heads/$sq_branch"'
+check "and archives it as squashed" eval '
+  [[ "$(q "select outcome from archive where session = '"'"'pr-ok'"'"' order by id desc limit 1")" == squashed ]]'
+check "the PR rows go with the session" eval '
+  [[ "$(q "select count(*) from pr_state where session = '"'"'pr-ok'"'"'")$(q "select count(*) from merge_checks where session = '"'"'pr-ok'"'"'")" == 00 ]]'
+for s in pr-ci pr-chg pr-none pr-link; do "$WTS" rm "$s" -f </dev/null >/dev/null 2>&1; done
 
 # ─── Agent friendly ──────────────────────────────────────────────────────────
 # What wts is like for the Claude agent in a pane: a Bash tool with no terminal

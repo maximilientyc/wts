@@ -14,6 +14,8 @@
 #   archive      finished work: what `wts log` reports and nothing ever deletes
 #   agent_panes  the tmux pane each agent reported from its own hooks
 #   touches      the files each agent edited, relative to its worktree
+#   pr_state     each session's pull request, CI and review, as gh last saw it
+#   merge_checks whether each session's branch landed in the base, per tip
 #
 # Why a database: the registry used to be one JSON file rewritten whole with
 # `jq … > tmp && mv` by bin/wts, wts-gc and wts-doc. Two writers at once lost one
@@ -26,7 +28,7 @@
 
 WTS_STATE_DIR="${WTS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wts}"
 WTS_DB="${WTS_DB:-$WTS_STATE_DIR/wts.db}"
-WTS_DB_SCHEMA=5
+WTS_DB_SCHEMA=7
 # Where the helpers are, for the few functions below that call one. Top level:
 # when this file is sourced, $0 is this file.
 WTS_DB_HOME="${0:A:h}"
@@ -375,6 +377,40 @@ CREATE TABLE IF NOT EXISTS touches (
   PRIMARY KEY (session, path)
 );
 CREATE INDEX IF NOT EXISTS touches_by_path ON touches(path);
+-- The pull request of each session as gh last reported it: written by wts-pr
+-- only, on wts pr --refresh or the switcher's slow timer, never on the
+-- 2-second tick (one network round trip per session). state is open, closed,
+-- merged, or none when gh found no PR for the branch; review and checks are
+-- normalized (approved, changes_requested, review_required; pass, fail,
+-- pending), empty when there is nothing to report. A failed call keeps the last
+-- good values and only sets error and checked_at: an expired gh login must not
+-- erase what the list showed. Dropped with its session.
+CREATE TABLE IF NOT EXISTS pr_state (
+  session    TEXT PRIMARY KEY,
+  branch     TEXT NOT NULL DEFAULT '',
+  number     INTEGER,
+  state      TEXT NOT NULL DEFAULT '',
+  review     TEXT NOT NULL DEFAULT '',
+  checks     TEXT NOT NULL DEFAULT '',
+  merged_at  TEXT NOT NULL DEFAULT '',
+  url        TEXT NOT NULL DEFAULT '',
+  error      TEXT NOT NULL DEFAULT '',
+  fetched_at INTEGER NOT NULL DEFAULT 0,
+  checked_at INTEGER NOT NULL DEFAULT 0
+);
+-- Whether a session's branch is in its base, squash and rebase included
+-- (merge_verdict below), for one pair of tips. The patch-id test reads the
+-- branch's diffs and the base's recent ones, too slow for every tick of the
+-- switcher, and its answer only changes when one of the two tips moves: the
+-- collector recomputes on a new pair and reads this row otherwise. Dropped with
+-- its session.
+CREATE TABLE IF NOT EXISTS merge_checks (
+  session  TEXT PRIMARY KEY,
+  tip      TEXT NOT NULL,
+  base_tip TEXT NOT NULL,
+  merged   TEXT NOT NULL DEFAULT '',
+  at       INTEGER NOT NULL
+);
 $imports
 PRAGMA user_version = $WTS_DB_SCHEMA;
 COMMIT;"
@@ -663,4 +699,278 @@ db_current_session() {
     fi
   done
   return 1
+}
+
+# ─── Merged, squash included ─────────────────────────────────────────────────
+# Shared by wts-gc (what to tear down), wts-status (the `merged` of the JSON and
+# the switcher's `merged` label) and `wts rm` (whether the branch may go without
+# -f). Until these moved here, only gc had them, and the collector's `merged`
+# was `git branch --merged` alone: a squash-merged PR read `false` for good,
+# while a session created a second ago read `true`.
+#
+# Why `git branch --merged` is not enough: it only recognizes merges by
+# ancestry. PRs merged by squash or rebase rewrite SHAs, so the branch is never
+# an ancestor of the base and `--merged` does not see it. So we also compare by
+# patch-id, the test behind `git cherry`, hashed once for all branches: a
+# branch whose every commit has an equivalent in the base is entirely present
+# in it, whatever the merge mode.
+#
+# The caller picks a repository with merge_scope, then asks per branch. The
+# results live in globals, not on stdout: called as `$(…)`, the per-repository
+# hashes would be computed again for every branch (see CLAUDE.md).
+typeset -gA MERGE_ANCESTRY MERGE_TRACK _MERGE_BASE_PID _MERGE_TIP_DATE _MERGE_OWN_PID
+typeset -g MERGE_ROOT="" MERGE_BASE="" MERGE_BASE_REF=""
+typeset -gi _MERGE_LOADED=0
+typeset -ga _MERGE_ONLY
+
+# The base of a repository, as wts-status and wts-gc detect it: WTS_BASE_BRANCH,
+# else origin/HEAD, else main or master. -> MERGE_BASE (the short name) and
+# MERGE_BASE_REF (origin/<base> when it exists: the local copy lags behind).
+merge_base_of() {  # <repo_root>
+  local root="$1" b="${WTS_BASE_BRANCH:-}" h c
+  if [[ -z "$b" ]]; then
+    # `|| h=""`: bin/wts sources this under `set -e`, and a repository without
+    # origin/HEAD is normal.
+    h=$(git -C "$root" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) || h=""
+    if [[ -n "$h" ]]; then
+      b="${h#origin/}"
+    else
+      for c in main master; do
+        if git -C "$root" show-ref --verify --quiet "refs/heads/$c"; then
+          b="$c"
+          break
+        fi
+      done
+    fi
+  fi
+  MERGE_BASE="$b" MERGE_BASE_REF="$b"
+  if [[ -n "$b" ]] && git -C "$root" show-ref --verify --quiet "refs/remotes/origin/$b"; then
+    MERGE_BASE_REF="origin/$b"
+  fi
+  return 0
+}
+
+# Select a repository and read its branches' ancestry and tracking state: every
+# local branch, or only the ones named (the collector asks about one at a time).
+# `track` is "[gone]" when an upstream is configured but its tracking ref no
+# longer exists (branch deleted on the remote, revealed by a fetch --prune).
+# The `--format` of for-each-ref does not interpret \t (it would print the two
+# literal characters); %1f does produce the 0x1f byte.
+merge_scope() {  # <repo_root> <base> <base_ref> [branch...]
+  MERGE_ROOT="$1" MERGE_BASE="$2" MERGE_BASE_REF="$3"
+  shift 3
+  _MERGE_ONLY=("$@")
+  _MERGE_LOADED=0
+  MERGE_ANCESTRY=() MERGE_TRACK=() _MERGE_BASE_PID=() _MERGE_TIP_DATE=() _MERGE_OWN_PID=()
+  local b tr
+  local -a refs
+  if (( $# )); then refs=("${@/#/refs/heads/}"); else refs=(refs/heads/); fi
+  while IFS=$'\x1f' read -r b tr; do
+    [[ -n "$b" ]] && MERGE_TRACK[$b]="$tr"
+  done < <(git -C "$MERGE_ROOT" for-each-ref \
+    --format='%(refname:short)%1f%(upstream:track)' "${refs[@]}" 2>/dev/null)
+  # Merged by ancestry (fast-forward or merge commit).
+  if [[ -n "$MERGE_BASE" && -n "$MERGE_BASE_REF" ]]; then
+    for b in "${(@f)$(git -C "$MERGE_ROOT" for-each-ref --merged "$MERGE_BASE_REF" \
+                        --format='%(refname:short)' "${refs[@]}" 2>/dev/null)}"; do
+      [[ -n "$b" ]] && MERGE_ANCESTRY[$b]=1
+    done
+  fi
+  return 0
+}
+
+# Patch-ids, computed once for every branch in scope.
+#
+# This used to be `git cherry <base> <branch>` per branch, which computes a
+# patch-id for every base commit since the merge-base again for each branch:
+# 0.3 s per branch, 15 minutes for 3000 local branches on the repository
+# measured in docs/big-repo-analysis.md. Two passes now hash everything once:
+# the base's recent commits, and the own commits of every branch that is not an
+# ancestor of the base (one `git log -p` fed by --stdin). Each branch then
+# costs one `rev-list` and a few lookups.
+#
+# The base range: commits since the oldest tip among those branches, minus a
+# day of slack. A squash or a rebase lands on the base after the commits it
+# replaces were made (that is when the merge happened), so nothing older can be
+# their equivalent. Each base entry keeps its commit date, so a branch's commits
+# are only matched by base commits at least as new as the branch's tip: a change
+# re-applied years after a base commit with the same diff stays unmerged, as
+# `git cherry` bounded by the merge-base would have said.
+merge_load() {
+  (( _MERGE_LOADED )) && return 0
+  _MERGE_LOADED=1
+  [[ -n "$MERGE_BASE_REF" ]] || return 0
+  local b d oldest="" pid cid
+  local -a candidates refs
+  local -A cdate
+  if (( ${#_MERGE_ONLY} )); then refs=("${_MERGE_ONLY[@]/#/refs/heads/}"); else refs=(refs/heads/); fi
+  while IFS=$'\x1f' read -r b d; do
+    [[ -n "$b" ]] || continue
+    _MERGE_TIP_DATE[$b]="$d"
+    [[ "$b" != "$MERGE_BASE" && -z "${MERGE_ANCESTRY[$b]:-}" ]] || continue
+    candidates+=("$b")
+    if [[ -z "$oldest" ]] || (( d < oldest )); then oldest="$d"; fi
+  done < <(git -C "$MERGE_ROOT" for-each-ref \
+    --format='%(refname:short)%1f%(committerdate:unix)' "${refs[@]}" 2>/dev/null)
+  (( ${#candidates} )) || return 0
+  (( oldest -= 86400 ))
+  while IFS=$'\x1f' read -r cid d; do
+    [[ -n "$cid" ]] && cdate[$cid]="$d"
+  done < <(git -C "$MERGE_ROOT" rev-list --since="@$oldest" --format='%H%x1f%ct' "$MERGE_BASE_REF" 2>/dev/null \
+           | grep -v '^commit ')
+  while read -r pid cid; do
+    [[ -n "$pid" ]] && _MERGE_BASE_PID[$pid]="${cdate[$cid]:-0}"
+  done < <(git -C "$MERGE_ROOT" rev-list --since="@$oldest" "$MERGE_BASE_REF" 2>/dev/null \
+           | git -C "$MERGE_ROOT" diff-tree --stdin -p 2>/dev/null \
+           | git -C "$MERGE_ROOT" patch-id --stable 2>/dev/null)
+  while read -r pid cid; do
+    [[ -n "$pid" ]] && _MERGE_OWN_PID[$cid]="$pid"
+  done < <(print -rl -- "${candidates[@]}" "^$MERGE_BASE_REF" \
+           | git -C "$MERGE_ROOT" log --stdin -p --no-merges --format='commit %H' 2>/dev/null \
+           | git -C "$MERGE_ROOT" patch-id --stable 2>/dev/null)
+  return 0
+}
+
+# True if every commit of <branch> has an equivalent (patch-id) in the base:
+# content entirely present, squash and rebase included. A commit with an empty
+# diff has no patch-id and nothing to be missing.
+merge_content() {  # <branch>
+  local b="$1" cid pid
+  [[ -n "$MERGE_BASE_REF" ]] || return 1
+  [[ -n "${MERGE_ANCESTRY[$b]:-}" ]] && return 0
+  merge_load
+  for cid in "${(@f)$(git -C "$MERGE_ROOT" rev-list --no-merges "$b" "^$MERGE_BASE_REF" 2>/dev/null)}"; do
+    [[ -n "$cid" ]] || continue
+    pid="${_MERGE_OWN_PID[$cid]:-}"
+    [[ -n "$pid" ]] || continue
+    (( ${+_MERGE_BASE_PID[$pid]} )) || return 1
+    (( _MERGE_BASE_PID[$pid] + 86400 >= ${_MERGE_TIP_DATE[$b]:-0} )) || return 1
+  done
+  return 0
+}
+
+# True if <branch> was created and never received a commit. With zero commits
+# of its own, a fresh branch is an ancestor of the base — exactly like a branch
+# merged by fast-forward — and `git cherry` prints nothing for it: both would
+# be classified as merged. `wts <name>` creates such a branch, and its agent
+# may well be thinking without having written anything yet.
+#
+# The reflog tells them apart: `git worktree add -b` (and `git branch`) write a
+# single "branch: Created from <base>" entry, and every commit, merge, rebase or
+# reset adds another. A branch whose remote is `[gone]` was pushed, hence
+# worked on: it is not new. An empty reflog (expired, or disabled with
+# core.logAllRefUpdates) proves nothing, so the branch is judged as before.
+merge_is_new() {  # <branch>
+  local b="$1" ahead line
+  local -a entries
+  [[ "${MERGE_TRACK[$b]:-}" == "[gone]" ]] && return 1
+  ahead=$(git -C "$MERGE_ROOT" rev-list --count "$MERGE_BASE_REF..$b" 2>/dev/null) || return 1
+  (( ${ahead:-1} == 0 )) || return 1
+  entries=("${(@f)$(git -C "$MERGE_ROOT" reflog show --format=%gs "refs/heads/$b" 2>/dev/null)}")
+  entries=("${(@)entries:#}")
+  (( ${#entries} )) || return 1
+  for line in "${entries[@]}"; do
+    [[ "$line" == "branch: Created from"* ]] || return 1
+  done
+  return 0
+}
+
+# The whole verdict, in the merge_scope'd repository: true when <branch> landed
+# and is not merely new, with REPLY set to `merged` (ancestry) or `squashed`
+# (patch-id) — the archive's own outcome words.
+merge_verdict() {  # <branch>
+  REPLY=""
+  merge_content "$1" || return 1
+  merge_is_new "$1" && return 1
+  if [[ -n "${MERGE_ANCESTRY[$1]:-}" ]]; then REPLY=merged; else REPLY=squashed; fi
+  return 0
+}
+
+# The verdict for one session at one pair of tips, computed and kept in
+# merge_checks, where the collector reads it until a tip moves. -> REPLY
+merge_check() {  # <session> <repo_root> <branch> <base> <base_ref> <tip> <base tip>
+  local v
+  merge_scope "$2" "$4" "$5" "$3"
+  merge_verdict "$3" || REPLY=""
+  v="$REPLY"
+  db_q "INSERT OR REPLACE INTO merge_checks VALUES ($(sql_str "$1"), $(sql_str "$6"),
+        $(sql_str "$7"), $(sql_str "$v"), ${EPOCHSECONDS:-$(date +%s)})" >/dev/null 2>&1
+  REPLY="$v"
+  return 0
+}
+
+# ─── Pull requests ───────────────────────────────────────────────────────────
+# A pr_state row as the JSON object `wts status --json` and `wts pr --refresh
+# --json` both carry under `pr` (the row aliased `p`). One definition, so the
+# two contracts cannot drift apart.
+WTS_PR_JSON="json_object('number', p.number, 'state', p.state,
+  'review', nullif(p.review, ''), 'checks', nullif(p.checks, ''),
+  'merged_at', nullif(p.merged_at, ''), 'url', nullif(p.url, ''),
+  'refreshed_at', nullif(p.fetched_at, 0))"
+
+# What the switcher's PR column says, per registered session: `#42 ✓`,
+# `#42 ✗ci`, `#42 chg`, `#42 ...` (checks running), `closed`, `merged`, or
+# nothing. Merged wins whoever says it, gh or the branch's own content: a squash
+# merge reads merged before the next refresh, and a PR gh saw merged reads so
+# before anyone fetched the base. The skeleton and the collected list both read
+# this one query, so the column is the same width before and after the swap.
+# ✓ and ✗ are East Asian Neutral, one column wide everywhere, so `emit` may pad
+# them; the ellipsis is Ambiguous, hence the three dots.
+db_pr_labels() {
+  db_rows "SELECT s.name, CASE
+      WHEN m.merged != '' OR p.state = 'merged' THEN 'merged'
+      WHEN p.number IS NULL THEN ''
+      WHEN p.state = 'closed' THEN 'closed'
+      WHEN p.checks = 'fail' THEN '#' || p.number || ' ✗ci'
+      WHEN p.review = 'changes_requested' THEN '#' || p.number || ' chg'
+      WHEN p.checks = 'pending' THEN '#' || p.number || ' ...'
+      ELSE '#' || p.number || ' ✓' END
+    FROM sessions s
+    LEFT JOIN pr_state p ON p.session = s.name
+    LEFT JOIN merge_checks m ON m.session = s.name" 2>/dev/null
+}
+
+# ─── Claude transcripts ──────────────────────────────────────────────────────
+# Same rule as `claude_project_dir` in wts: every non-alphanumeric -> "-".
+db_claude_project_dir() {  # <dir>
+  print -r -- "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/${1//[^a-zA-Z0-9]/-}"
+}
+
+# The transcript of a session: the live agent's one when its id is known,
+# otherwise the most recent one of the worktree or its subdirectory — exact
+# paths, never a prefix (fix-login must not read fix-login-2), and never older
+# than the session: an older file belongs to a previous incarnation of the same
+# name (wts rm, then wts <name> again), whose work is unrelated.
+# wts-brief, wts-retro and wts-pr read the same file this way.
+db_session_transcript() {  # <worktree> <subdir> <created epoch> [<claude session id>]
+  local worktree="$1" subdir="$2" created="${3:-0}" sid="${4:-}" d f tr=""
+  integer m best=0
+  local -a dirs
+  dirs=("$(db_claude_project_dir "$worktree")")
+  [[ -n "$subdir" ]] && dirs+=("$(db_claude_project_dir "$worktree/$subdir")")
+  if [[ -n "$sid" ]]; then
+    for d in "${dirs[@]}"; do
+      if [[ -f "$d/$sid.jsonl" ]]; then
+        print -r -- "$d/$sid.jsonl"
+        return 0
+      fi
+    done
+  fi
+  zmodload -F zsh/stat b:zstat 2>/dev/null
+  for d in "${dirs[@]}"; do
+    for f in "$d"/*.jsonl(N); do
+      m=$(zstat +mtime "$f" 2>/dev/null) || continue
+      if (( m >= created && m > best )); then best=$m; tr="$f"; fi
+    done
+  done
+  [[ -n "$tr" ]] || return 1
+  print -r -- "$tr"
+}
+
+# The last pull request Claude Code linked in a transcript (its `pr-link`
+# record), or nothing.
+db_transcript_pr_url() {  # <transcript>
+  [[ -f "$1" ]] || return 0
+  grep -F '"type":"pr-link"' "$1" 2>/dev/null | tail -n 1 | jq -r '.prUrl // empty' 2>/dev/null
+  return 0
 }

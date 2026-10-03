@@ -16,18 +16,12 @@ once, docs and completion, and gc scoped to what wts made, `--all-branches`
 for the rest), shipped with it. Then *agent friendly*: no Things read, picker or
 attach without a terminal, `--json` on every listing, `wts send`, `wait` and
 `tail`, notes at each turn, real file overlap from a `PostToolUse` hook, a task
-link the agent can judge, and the wts skill.
+link the agent can judge, and the wts skill. After 1.6.0, *PR, CI and review state per
+session*: `wts pr --refresh` and a `pr_state` cache, the switcher's PR column,
+merged last, and `merged` by patch-id rather than ancestry.
 
 ## 1. Then, by what you feel first
 
-- **PR, CI and review state per session. [M]** No PR column; `merged` is in the
-  JSON but hidden, and ancestry-only (a squash merge reads `false`, while gc has
-  the right patch-id test); `wts pr` only opens a browser. `wts pr --refresh`,
-  explicit or on a slow timer and never the 2 s tick, caches
-  `gh pr view --json number,state,reviewDecision,statusCheckRollup,mergedAt`
-  in a `pr_state` table; the switcher shows `#42 ✓` / `#42 ✗ci` / `#42 chg` /
-  `merged`, sorts merged last and offers `ctrl-d` there. Reuses the `gh`
-  detection in `wts-keys` and the transcript `pr-link` parsing in `wts-brief`.
 - **Tokens and cost per session and per task. [M]** Nothing reads
   `message.usage` or the model from transcripts, although `wts-retro`'s header
   promises "what it cost". `wts-brief` and `wts-retro collect` already read the
@@ -67,6 +61,11 @@ you can hit.
   "=…"` never matches, and the idempotent re-run starts a duplicate.
 - One agent per worktree, picked with `first`: a `blocked` agent can hide
   behind a `done` one, which also weakens gc's busy check.
+- A branch cut from a local base that carries commits already squash-landed
+  upstream reads merged (gc: dead) before its agent commits anything: the
+  new-branch test in `merge_is_new` requires zero commits ahead of
+  `origin/<base>`. The reflog alone ("Created from", nothing since) would say
+  new, except for a branch tracking its own remote, which may hold real work.
 - A multi-line `context` shifts the collector's line-per-field stream; two
   simultaneous phrase creations can share a slug; a stale
   `~/.claude/sessions/<pid>.json` is not checked for pid liveness and can point

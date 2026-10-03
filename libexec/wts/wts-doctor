@@ -102,7 +102,7 @@ if (( ${+commands[tmuxinator]} )); then
     ok "tmuxinator ${v:-(version unknown)}"
   else
     rc=$?
-    bad "tmuxinator is on PATH but does not run (exit $rc${out:+: ${${(f)out}[1]}}): no session can start"
+    bad "tmuxinator is on PATH but does not run (exit $rc${out:+: ${out%%$'\n'*}}): no session can start"
   fi
 else
   bad "tmuxinator not found (brew install tmuxinator): no session can start"
@@ -169,7 +169,7 @@ fi
 [[ -n "${WTS_NO_LLM:-}" ]] && warn "WTS_NO_LLM is set: wts never calls the model"
 
 (( ${+commands[gh]} )) && ok "gh $(version_of gh --version)" \
-                       || warn "gh not found: no wts pr, no ctrl-o"
+                       || warn "gh not found: no wts pr, no ctrl-o, no PR column"
 (( ${+commands[curl]} )) || warn "curl not found: the switcher does not refresh by itself"
 
 if [[ -n "${WTS_NOTIFIER:-}" || -n "${commands[terminal-notifier]:-}" ]]; then

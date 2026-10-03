@@ -81,8 +81,8 @@ typeset -ga rows
 rows=()
 SEP=$'\x1f'
 
-add_row() { # <name> <agent> <branch> <delta> <subject> <preview-target> [<kind>]
-  rows+=("$1$SEP$2$SEP$3$SEP$4$SEP${5:-}$SEP$6$SEP${7:-}")
+add_row() { # <name> <agent> <branch> <delta> <subject> <preview-target> [<kind>] [<pr>]
+  rows+=("$1$SEP$2$SEP$3$SEP$4$SEP${5:-}$SEP$6$SEP${7:-}$SEP${8:-}")
 }
 
 # Cut to <width> characters, the last one an ellipsis, into REPLY. zsh counts
@@ -99,20 +99,26 @@ DELTA_W=10
 emit() {
   (( ${#rows} )) || return 0
   local width="${WTS_SWITCH_COLS:-120}"
-  # Four single-space gaps between five columns.
-  local rest=$(( width - AGENT_W - DELTA_W - 4 ))
-  (( rest < 24 )) && rest=24
 
   # Like `column -t`, but capped: a 60-character slug must not eat the subject.
   # The current session's `*` counts as part of its name.
+  # The PR column only exists while some row has something to say in it: on a
+  # machine without gh, or before the first refresh, it would be a blank column
+  # taking ten characters from the subject.
   local -a f
-  local raw mark name_w=7 branch_w=6
+  local raw mark name_w=7 branch_w=6 pr_w=0
   for raw in "${rows[@]}"; do
     f=("${(@ps:\x1f:)raw}")
     mark=""; [[ -z "${f[7]:-}" && "$f[1]" == "$current" ]] && mark="*"
     (( ${#f[1]} + ${#mark} > name_w )) && name_w=$(( ${#f[1]} + ${#mark} ))
     (( ${#f[3]} > branch_w )) && branch_w=${#f[3]}
+    (( ${#${f[8]:-}} > pr_w )) && pr_w=${#${f[8]:-}}
   done
+  (( pr_w > 0 && pr_w < 2 )) && pr_w=2
+  # Four single-space gaps between five columns, five between six.
+  local rest=$(( width - AGENT_W - DELTA_W - 4 ))
+  (( pr_w )) && rest=$(( rest - pr_w - 1 ))
+  (( rest < 24 )) && rest=24
   local cap=$(( rest * 45 / 100 ))
   (( cap < 12 )) && cap=12
   (( name_w > cap )) && name_w=$cap
@@ -123,8 +129,8 @@ emit() {
 
   # The header first, with an empty field 6 so that it has 3 TAB fields too. The
   # `*` is appended after the cut, so a name too long for its column keeps it.
-  local name agent branch delta subject sess
-  for raw in "SESSION${SEP}AGENT${SEP}BRANCH${SEP}DELTA${SEP}SUBJECT${SEP}${SEP}" "${rows[@]}"; do
+  local name agent branch delta subject sess pr
+  for raw in "SESSION${SEP}AGENT${SEP}BRANCH${SEP}DELTA${SEP}SUBJECT${SEP}${SEP}${SEP}PR" "${rows[@]}"; do
     f=("${(@ps:\x1f:)raw}")
     # Field 3 is the session name, and only a session has one: a task row and
     # the header both leave it empty. This is what makes `enter` on a task go to
@@ -137,9 +143,16 @@ emit() {
     fit "$f[3]" $branch_w;   branch=$REPLY
     fit "$f[4]" $DELTA_W;    delta=$REPLY
     fit "$f[5]" $subject_w;  subject=$REPLY
-    printf '%-*s %-*s %-*s %-*s %-*s\t%s\t%s\n' \
-      $name_w "$name" $AGENT_W "$agent" $branch_w "$branch" \
-      $DELTA_W "$delta" $subject_w "$subject" "$f[6]" "$sess"
+    if (( pr_w )); then
+      fit "${f[8]:-}" $pr_w; pr=$REPLY
+      printf '%-*s %-*s %-*s %-*s %-*s %-*s\t%s\t%s\n' \
+        $name_w "$name" $AGENT_W "$agent" $branch_w "$branch" \
+        $DELTA_W "$delta" $pr_w "$pr" $subject_w "$subject" "$f[6]" "$sess"
+    else
+      printf '%-*s %-*s %-*s %-*s %-*s\t%s\t%s\n' \
+        $name_w "$name" $AGENT_W "$agent" $branch_w "$branch" \
+        $DELTA_W "$delta" $subject_w "$subject" "$f[6]" "$sess"
+    fi
   done
 }
 
@@ -227,13 +240,13 @@ build_list() {
   extra=("$@")
   current=$(tmux display-message -p '#S' 2>/dev/null)
 
-  local since waiting meta=""
+  local since waiting pr meta=""
   if [[ -x "$WTS_BIN/wts-status" ]] && command -v jq >/dev/null 2>&1; then
     # \x1f (not whitespace): keeps empty fields, unlike TAB.
-    while IFS=$'\x1f' read -r name agent branch delta dirty pane since waiting subject; do
+    while IFS=$'\x1f' read -r name agent branch delta dirty pane since waiting pr subject; do
       [[ -n "$name" ]] || continue
       known+="$name"$'\n'
-      add_row "$name" "$agent" "$branch" "$delta" "${subject:-}" "${pane:-$name}"
+      add_row "$name" "$agent" "$branch" "$delta" "${subject:-}" "${pane:-$name}" "" "${pr:-}"
       meta+="$name"$'\x1f'"$agent"$'\x1f'"${since:-}"$'\x1f'"${waiting:-}"$'\x1e'
     done < <("$WTS_BIN/wts-status" --fzf "${extra[@]}" 2>/dev/null)
   fi
@@ -263,8 +276,20 @@ build_list() {
 # a skeleton row, because a session name is a valid capture-pane target — the
 # same fallback build_list uses when an agent has no pane.
 build_skeleton() {
-  local known="" name branch subject
+  local known="" name branch subject row
+  local -a f
+  local -A pr_label
   current=$(tmux display-message -p '#S' 2>/dev/null)
+
+  # The PR column from the same query as the collector's (db_pr_labels): it is
+  # cached state, not a volatile one, and a column that only appeared at the
+  # swap would shift every row.
+  if db_available; then
+    for row in "${(@ps:\x1e:)$(db_pr_labels)}"; do
+      f=("${(@ps:\x1f:)row}")
+      [[ -n "${f[1]:-}" ]] && pr_label[${f[1]}]="${f[2]:-}"
+    done
+  fi
 
   if db_available && command -v jq >/dev/null 2>&1; then
     # Same SUBJECT rule as wts-status, minus the agent's conversation title,
@@ -273,7 +298,7 @@ build_skeleton() {
     while IFS=$'\x1f' read -r name branch subject; do
       [[ -n "$name" ]] || continue
       known+="$name"$'\n'
-      add_row "$name" "-" "${branch:--}" "-" "$subject" "$name"
+      add_row "$name" "-" "${branch:--}" "-" "$subject" "$name" "" "${pr_label[$name]:-}"
     done < <(jq -r 'to_entries | sort_by(.key)[]
       | [ .key,
           (.value.branch // "-"),
@@ -754,6 +779,51 @@ preview_header() { # <session name>
   return 1
 }
 
+# The pull request under the state line: number, state, checks and review as
+# wts-pr last cached them, with their age — or, once the branch landed, that it
+# did and what ctrl-d does about it. The list only has room for `#42 ✗ci`; this
+# is where it is spelled out. A database read, never gh.
+preview_pr() { # <session name>
+  local name="$1" out
+  local -a f
+  [[ -n "$name" ]] && db_available || return 1
+  out=$(db_rows "SELECT coalesce(p.number, ''), coalesce(p.state, ''), coalesce(p.review, ''),
+                        coalesce(p.checks, ''), coalesce(p.fetched_at, 0),
+                        coalesce(p.error, ''), coalesce(m.merged, '')
+                   FROM sessions s
+                   LEFT JOIN pr_state p ON p.session = s.name
+                   LEFT JOIN merge_checks m ON m.session = s.name
+                  WHERE s.name = $(sql_str "$name")" 2>/dev/null)
+  f=("${(@ps:\x1f:)${out%$'\x1e'}}")
+  local num="${f[1]:-}" st="${f[2]:-}" review="${f[3]:-}" checks="${f[4]:-}"
+  local at="${f[5]:-0}" err="${f[6]:-}" landed="${f[7]:-}" line
+  if [[ -n "$landed" || "$st" == merged ]]; then
+    line="merged${num:+ #$num}${${landed:#merged}:+ ($landed)} · ctrl-d to remove"
+    print -r -- $'\e[32m'"$line"$'\e[0m'
+    return 0
+  fi
+  if [[ -n "$num" ]]; then
+    line="PR #$num $st"
+    case "$checks" in
+      fail)    line+=" · checks failing" ;;
+      pending) line+=" · checks running" ;;
+      pass)    line+=" · checks pass" ;;
+    esac
+    case "$review" in
+      approved)          line+=" · approved" ;;
+      changes_requested) line+=" · changes requested" ;;
+      review_required)   line+=" · review required" ;;
+    esac
+    [[ "$at" == <-> ]] && (( at > 0 )) && line+=" ($(age_of "$at") ago)"
+  elif [[ -n "$err" ]]; then
+    line="PR: ${err//[[:cntrl:]]/ }"
+  else
+    return 1
+  fi
+  (( ${#line} > ${FZF_PREVIEW_COLUMNS:-80} )) && line="${line[1,${FZF_PREVIEW_COLUMNS:-80}-1]}…"
+  print -r -- $'\e[2m'"$line"$'\e[0m'
+}
+
 # What the session already said about itself, under the state line: the cached
 # `done:` / `next:` of `wts brief` and the last two notes its agent left with
 # `wts db set`. Both were written at every brief and every note and read by no
@@ -800,13 +870,14 @@ preview_memo() { # <session name>
 }
 
 preview() { # $1 = cursor target, $2 = cursor name
-  local target capture header="" memo=""
+  local target capture header="" prline="" memo=""
   target=$(resolve_target "${1:-}" "${2:-}")
   if [[ "$target" == task:* ]]; then
     capture=$(task_preview "${target#task:}")
   else
     capture=$(tmux capture-pane -p -e -S "-$SCROLLBACK" -t "$target" 2>/dev/null)
     header=$(preview_header "${2:-}") || header=""
+    prline=$(preview_pr "${2:-}") || prline=""
     memo=$(preview_memo "${2:-}") || memo=""
   fi
   # The header takes the first line and is never scrolled away: it is printed
@@ -816,6 +887,10 @@ preview() { # $1 = cursor target, $2 = cursor name
   local height="${FZF_PREVIEW_LINES:-20}"
   if [[ -n "$header" ]]; then
     print -r -- "$header"
+    (( height-- ))
+  fi
+  if [[ -n "$prline" ]]; then
+    print -r -- "$prline"
     (( height-- ))
   fi
   # Pinned like the header, and only while the pane keeps most of the window:
@@ -1025,7 +1100,17 @@ remove_session() { # $1 = session name, $2 = preview target, $3 = display line
   case "${cols[2]:-}" in
     blocked|working|idle|done|failed|stopped|stuck\?|-) agent="${cols[2]}" ;;
   esac
-  if ! read -q "?Remove session '$name'${agent:+ (agent: $agent)}? Worktree, branch and registry entry go too. [y/N] "; then
+  # Merged is worth saying here: it is the one case where the answer is
+  # obviously yes, and `wts rm` deletes a squash-merged branch without -f.
+  local landed
+  landed=$(db_ro "SELECT 1 FROM sessions s
+                    LEFT JOIN pr_state p ON p.session = s.name
+                    LEFT JOIN merge_checks m ON m.session = s.name
+                   WHERE s.name = $(sql_str "$name")
+                     AND (m.merged != '' OR p.state = 'merged')" 2>/dev/null)
+  local about="${agent:+agent: $agent}"
+  [[ "$landed" == 1 ]] && about+="${about:+, }merged"
+  if ! read -q "?Remove session '$name'${about:+ ($about)}? Worktree, branch and registry entry go too. [y/N] "; then
     print
     return 0
   fi
@@ -1592,6 +1677,22 @@ if [[ -n "$WTS_CMD" ]] && command -v gh >/dev/null 2>&1; then
   pr_bind=(--bind="ctrl-o:execute('$self' --pr {3})")
 fi
 
+# The PR column's slow timer. gh is a network round trip per session, so it
+# never runs on the 2-second tick: at most every $WTS_PR_REFRESH seconds (300 by
+# default, 0 for never), in the background, when the popup opens and then from
+# the poller. wts-pr --if-older claims the slot in the database, so several
+# popups, or a popup and a `wts pr --refresh` typed meanwhile, do not all call
+# gh; the list picks the new rows up on its next tick.
+PR_EVERY="${WTS_PR_REFRESH:-300}"
+[[ "$PR_EVERY" == <-> ]] || PR_EVERY=300
+pr_refresh() {
+  (( PR_EVERY > 0 )) || return 0
+  [[ "${WTS_SWITCH_PR:-}" == 1 && -x "$WTS_BIN/wts-pr" ]] || return 0
+  "$WTS_BIN/wts-pr" --refresh --if-older "$PR_EVERY" --quiet </dev/null >/dev/null 2>&1 &!
+  return 0
+}
+pr_refresh
+
 # ctrl-e: `wts doc use` on the selected row. Bound only when the helper is
 # there, and wts-keys reads WTS_SWITCH_DOC so the footer lists exactly the keys
 # that work. No reload: the list has nothing new to show, but the preview does.
@@ -1700,8 +1801,13 @@ if [[ -n "$sock" ]]; then
     n=0
     while [[ ! -S "$sock" ]] && (( n < 100 )); do sleep 0.1; (( n++ )); done
     delay="$REFRESH"
+    pr_next=$(( SECONDS + PR_EVERY ))
     while [[ -S "$sock" ]]; do
       sleep "$delay"
+      if (( PR_EVERY > 0 && SECONDS >= pr_next )); then
+        pr_refresh
+        pr_next=$(( SECONDS + PR_EVERY ))
+      fi
       if [[ -s "$WTS_SWITCH_BUSY" ]] && kill -0 "$(<"$WTS_SWITCH_BUSY")" 2>/dev/null; then
         curl -s -m 2 --unix-socket "$sock" -XPOST http://localhost/ \
           -d "refresh-preview" >/dev/null 2>&1 || break

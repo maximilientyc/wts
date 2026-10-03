@@ -16,7 +16,7 @@ never renamed.
 
 | Command | What it answers |
 |---|---|
-| `wts status --json` | every session: `name`, `branch`, `worktree`, `agent_state` (blocked working idle done failed stopped), `agent_since`, `agent_waiting_for`, `task`, git delta |
+| `wts status --json` | every session: `name`, `branch`, `worktree`, `agent_state` (blocked working idle done failed stopped), `agent_since`, `agent_waiting_for`, `task`, git delta, `merged` (squash included), `pr` (number, state, checks, review, as `wts pr --refresh` last cached them) |
 | `wts brief --cached --json` | each session's last "done / next" summary and its age — no model call |
 | `wts task ls --all --json`, `wts task show <id> --json` | tasks, their notes, documents, live sessions and previous attempts |
 | `wts doc ls --json`, `wts doc show <slug> --json` | the context documents and which sessions they are attached to |

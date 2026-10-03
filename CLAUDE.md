@@ -17,6 +17,8 @@ libexec/wts/wts-doctor     `wts doctor`: dependencies, fzf gates, tmux snippet,
                            Claude hooks and skill installed and current; read-only
 libexec/wts/wts-agent      `wts send | wait | tail`: drive another session's agent
 libexec/wts/wts-brief      done/next per session (Claude Haiku, cached)
+libexec/wts/wts-pr         `wts pr --refresh`: PR, checks and review per session, from gh,
+                           cached in pr_state for the switcher and `status --json`
 libexec/wts/wts-doc        context document library: fetch (any MCP), cache, materialize
 libexec/wts/wts-retro      capture at teardown: collect/store facts, write the retro (Haiku)
 libexec/wts/wts-log        the work journal as one JSON document (archive + Things)
@@ -24,7 +26,9 @@ libexec/wts/wts-task       tasks: local ones and Things snapshots, the notes and
                            documents kept on them, link/unlink to sessions
 libexec/wts/wts-things     Things 3 reader, read-only: tasks, their notes and links
 libexec/wts/wts-db.zsh     the state database (SQLite): schema, import, helpers; sourced by all
-                           also the one renderer for a task's context (task_context_md)
+                           also the one renderer for a task's context (task_context_md),
+                           the merged test gc, status and rm share (merge_*), the PR
+                           label (db_pr_labels) and a session's transcript
 libexec/wts/wts-context    Claude Code SessionStart hook: tells an agent about the other sessions
 libexec/wts/wts-hook       Claude Code UserPromptSubmit/Stop/Notification/SessionEnd hooks:
                            records agent_events, rings the bell, posts the banner
@@ -85,6 +89,10 @@ straight from the checkout. Scripts locate each other from their own path
   `wts-doc` is the one exception and says why in its header — fetching a page is
   precisely a job for the machine's own connectors, whose names differ from one
   machine to the next, so the allow list is enumerated, never hardcoded.
+- `gh` is a network round trip per session: like the model, never from `ls`,
+  the collector or the switcher's 2-second tick. Only `wts pr --refresh`, and
+  the switcher's slow timer (`wts-pr --if-older`, which claims its slot in `kv`
+  so several popups make one call). Everything else reads `pr_state`.
 - **Another app's data is privileged on macOS 15+** (`~/Library/Containers`,
   `~/Library/Group Containers`): the first touch raises "iTerm would like to
   access data from other apps" — the *glob* raises it, before any open, and a
@@ -225,6 +233,9 @@ straight from the checkout. Scripts locate each other from their own path
 - `cmd | grep -q` under `pipefail` (the smoke test) fails when `cmd` prints
   more after the first match: grep quits, the rest hits a closed pipe, and the
   pipeline's status is that of `cmd`. Capture with `out=$(cmd)` and test `$out`.
+- `${${(f)text}[1]}` is the first line only when there are several: a one-line
+  text is not split, so `[1]` indexes the string and gives its first character
+  (`⚠ registry not updated: d`). The first line is `${text%%$'\n'*}`.
 - The status of a `while` loop is that of the last body command: a loop ending
   on `[[ cond ]] && print …` returns 1 whenever the condition was false on the
   last row, and a function ending on that loop returns it. `wts task show`

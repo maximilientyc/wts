@@ -65,12 +65,6 @@ what resisted."
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
-# Same rule as `claude_project_dir` in wts and wts-brief: every non-alphanumeric
-# becomes "-".
-claude_project_dir() {
-  print -r -- "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/${1//[^a-zA-Z0-9]/-}"
-}
-
 # oneline <text> — on one line, whitespace squeezed.
 oneline() {
   print -r -- "$1" | tr -s '\n\t\r ' ' ' | sed -E 's/^ //; s/ $//'
@@ -180,25 +174,15 @@ cmd_collect() {
 
   # --- transcript -----------------------------------------------------------
   # The most recent one of the worktree or its subdirectory, never older than
-  # the session: an older file belongs to a previous incarnation of the same
-  # name (wts rm, then wts <name> again), whose work is unrelated.
-  local -a dirs
-  local d f tr="" sid="" bytes=0 mtime=0
-  integer m best=0
-  dirs=("$(claude_project_dir "$worktree")")
-  [[ -n "$subdir" ]] && dirs+=("$(claude_project_dir "$worktree/$subdir")")
-  for d in "${dirs[@]}"; do
-    for f in "$d"/*.jsonl(N); do
-      m=$(zstat +mtime "$f" 2>/dev/null) || continue
-      (( m >= created && m > best )) && { best=$m; tr="$f" }
-    done
-  done
+  # the session (db_session_transcript in wts-db.zsh).
+  local tr="" sid="" bytes=0 mtime=0
+  tr=$(db_session_transcript "$worktree" "$subdir" "$created") || tr=""
   if [[ -n "$tr" ]]; then
     # The basename IS the Claude session id. Worth taking here: at teardown the
     # agent is already dead, and that id lives nowhere else on disk.
     sid="${tr:t:r}"
     bytes=$(num "$(zstat +size "$tr" 2>/dev/null)")
-    mtime=$best
+    mtime=$(num "$(zstat +mtime "$tr" 2>/dev/null)")
   fi
 
   local title=""

@@ -273,7 +273,7 @@ _wts() {
       "restore:restart sessions missing from tmux" \
       "stop:kill the tmux session only, keep the worktree" \
       "rm:remove session, worktree and branch" \
-      "pr:open the session's pull request on GitHub" \
+      "pr:open the session's pull request on GitHub (--refresh: cache its state)" \
       "doc:context documents attached to a session" \
       "db:the state database: queries, and notes the agents share" \
       "gc:clean up dead worktrees and branches" \
@@ -386,7 +386,15 @@ _wts() {
       fi ;;
 
     pr)
-      if (( CURRENT == 3 )); then
+      if [[ $PREFIX == -* ]]; then
+        if (( ${words[(I)--refresh]} )); then
+          _wts_offer options option "" "--json:the refreshed state as JSON"
+        else
+          _wts_offer options option "" "--refresh:ask gh for each session's PR, checks and review"
+        fi
+      elif (( ${words[(I)--refresh]} )); then
+        _wts_pr_targets
+      elif (( CURRENT == 3 )); then
         _wts_pr_targets
       else
         _wts_say "no more arguments"

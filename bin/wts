@@ -14,7 +14,7 @@
 #        wts tail <session> [-n <k>] [--json]
 #        wts restore [name...]
 #        wts stop <name>
-#        wts pr [name]
+#        wts pr [name] | pr --refresh [--json] [name...]
 #        wts rm <name> [-f]
 #        wts gc [--all] [--all-branches] [--apply] [--no-fetch] [--no-retro]
 #        wts gc [--all] [--all-branches] [--no-fetch] --json
@@ -67,7 +67,10 @@
 #   rm         : delete the tmux session, the worktree and the branch
 #     -f       : force (dirty worktree, unmerged branch)
 #   pr         : open the session's pull request on GitHub (needs gh); the
-#                current session when run inside one
+#                current session when run inside one. --refresh asks gh for
+#                each session's PR, checks and review and caches them for the
+#                switcher's PR column and `wts status --json` (which never call
+#                gh themselves); the switcher also does it every 5 minutes
 #   doc        : the library of reusable context documents (a Notion page, a
 #                markdown file) attached to a session with --doc
 #   gc         : clean up from the remote: worktrees and branches whose PR is
@@ -196,6 +199,8 @@ registry_del() {
         DELETE FROM agent_events WHERE session IN $in;
         DELETE FROM agent_panes WHERE session IN $in;
         DELETE FROM touches WHERE session IN $in;
+        DELETE FROM pr_state WHERE session IN $in;
+        DELETE FROM merge_checks WHERE session IN $in;
         COMMIT;" >/dev/null 2>&1 || true
 }
 
@@ -1189,8 +1194,25 @@ fi
 # too), and works on a GitHub Enterprise remote. The switcher's ctrl-o calls this.
 
 if [[ "$1" == "pr" ]]; then
+  # --refresh: the cache behind the PR column, for every session or the ones
+  # named. Names go through the resolver as everywhere else; wts-pr does the rest.
+  if [[ " ${*:2} " == *" --refresh "* ]]; then
+    typeset -a PR_ARGS=()
+    for a in "${@:2}"; do
+      if [[ "$a" == -* ]]; then
+        PR_ARGS+=("$a")
+      elif [[ "${PR_ARGS[-1]:-}" == --if-older ]]; then
+        PR_ARGS+=("$a")
+      elif resolved=$(registry_resolve_name "${a//\//-}"); then
+        PR_ARGS+=("$resolved")
+      else
+        exit 1
+      fi
+    done
+    exec "$WTS_LIBEXEC/wts-pr" "${PR_ARGS[@]}"
+  fi
   if [[ $# -gt 2 ]]; then
-    echo "Usage: wts pr [name]" >&2
+    echo "Usage: wts pr [name] | wts pr --refresh [--json] [name...]" >&2
     exit 1
   fi
 
@@ -1350,6 +1372,24 @@ if [[ "$1" == "rm" ]]; then
     fi
   fi
 
+  # Whether the branch landed in the base, squash included (merge_verdict in
+  # wts-db.zsh, gc's test). It names the archive's outcome, and lets step 3
+  # delete a squash-merged branch, which `branch -d` refuses: ctrl-d on a row
+  # the switcher shows as merged ended on "not merged (use -f)", the branch
+  # left behind for gc.
+  LANDED=""
+  RM_BRANCH="$REG_BRANCH"
+  if [[ -d "$worktree_path" ]]; then
+    RM_BRANCH=$(git -C "$worktree_path" rev-parse --abbrev-ref HEAD 2>/dev/null) || RM_BRANCH="$REG_BRANCH"
+  fi
+  if [[ "$FORCE" != true && -n "$RM_BRANCH" && "$RM_BRANCH" != HEAD && -d "$repo_root" ]]; then
+    merge_base_of "$repo_root"
+    merge_scope "$repo_root" "$MERGE_BASE" "$MERGE_BASE_REF" "$RM_BRANCH"
+    if merge_verdict "$RM_BRANCH"; then
+      LANDED="$REPLY"
+    fi
+  fi
+
   # 1. Kill the tmux session
   if tmux has-session -t "=$SESSION" 2>/dev/null; then
     tmux kill-session -t "=$SESSION"
@@ -1382,6 +1422,8 @@ if [[ "$1" == "rm" ]]; then
       # -f is the caller saying they know the branch did not land.
       if [[ "$FORCE" == true ]]; then
         retro_outcome=abandoned
+      elif [[ -n "$LANDED" ]]; then
+        retro_outcome="$LANDED"
       else
         retro_outcome=removed
       fi
@@ -1431,6 +1473,12 @@ if [[ "$1" == "rm" ]]; then
     if [[ "$FORCE" == true ]]; then
       git -C "$repo_root" branch -D "$BRANCH" 2>/dev/null && \
         echo "→ branch $BRANCH deleted" || \
+        echo "→ branch $BRANCH not found"
+    elif [[ -n "$LANDED" && "$BRANCH" == "$RM_BRANCH" ]]; then
+      # -D, as gc does: a squashed branch is not "merged" in git's sense, while
+      # every one of its commits has an equivalent in the base.
+      git -C "$repo_root" branch -D "$BRANCH" >/dev/null 2>&1 && \
+        echo "→ branch $BRANCH deleted ($LANDED)" || \
         echo "→ branch $BRANCH not found"
     else
       git -C "$repo_root" branch -d "$BRANCH" 2>/dev/null && \

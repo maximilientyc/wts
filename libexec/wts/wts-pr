@@ -1,0 +1,248 @@
+#!/usr/bin/env zsh
+# wts-pr — the pull request, CI and review state of each session, from gh,
+# cached in the pr_state table for the switcher and `wts status --json`.
+#
+# Usage: wts-pr --refresh [--if-older <s>] [--quiet] [--json] [name...]
+#        (normally through `wts pr --refresh`, which resolves the names)
+#
+#   --refresh       ask gh about every registered session, or the ones named
+#   --if-older <s>  the switcher's slow timer: do nothing unless the last
+#                   refresh, from anywhere, is at least <s> seconds old
+#   --quiet         print nothing (the timer runs this in the background)
+#   --json          {"version": 1, "sessions": [{name, pr, error}]}, `pr` in
+#                   the shape `wts status --json` carries it
+#
+# gh is a network round trip per session (0.5 to 1 s), so it is called only
+# here, and this only runs on an explicit command or the switcher's slow timer:
+# never from `wts ls`, the collector or the 2-second tick, which read the table.
+# Calls run in parallel, one per session.
+#
+# Which PR: the one Claude Code linked in the session's transcript (its
+# `pr-link` record, as wts-brief reads it) when its head is the session's
+# branch, else whatever gh finds for the branch. The transcript first because a
+# session name, and so its branch, is reused (wts rm, then wts <name>): gh by
+# branch may answer with the previous incarnation's merged PR. The head check
+# because an agent also opens PRs elsewhere (a tap, a dependency), and the last
+# link is not always this branch's.
+#
+# Exit: 0, 1 when gh failed for a session (its reason is printed and kept in
+# pr_state.error), 2 on usage, 3 without gh.
+
+set -uo pipefail
+
+WTS_BIN="${0:A:h}"
+source "$WTS_BIN/wts-db.zsh"
+zmodload zsh/datetime 2>/dev/null
+
+REFRESH=false
+QUIET=false
+JSON=false
+IF_OLDER=""
+typeset -a NAMES=()
+while (( $# )); do
+  case "$1" in
+    --refresh)  REFRESH=true ;;
+    --quiet)    QUIET=true ;;
+    --json)     JSON=true ;;
+    --if-older)
+      if [[ "${2:-}" != <-> ]]; then
+        print -u2 "wts pr: --if-older takes a number of seconds"
+        exit 2
+      fi
+      IF_OLDER="$2"
+      shift ;;
+    -*) print -u2 "wts pr: unknown option '$1' (--refresh, --json, --if-older <s>, --quiet)"; exit 2 ;;
+    *)  NAMES+=("$1") ;;
+  esac
+  shift
+done
+if ! $REFRESH; then
+  print -u2 "usage: wts-pr --refresh [--if-older <s>] [--quiet] [--json] [name...]"
+  exit 2
+fi
+
+if ! command -v gh >/dev/null 2>&1; then
+  $QUIET || print -u2 "wts: gh not found (brew install gh)"
+  exit 3
+fi
+for tool in jq sqlite3; do
+  if ! command -v $tool >/dev/null 2>&1; then
+    $QUIET || print -u2 "wts pr: $tool is required"
+    exit 1
+  fi
+done
+db_init || exit 1
+
+NOW=${EPOCHSECONDS:-$(date +%s)}
+
+# The timer's slot, claimed in one statement: the upsert only writes when the
+# previous refresh is old enough, and changes() says whether it did. Two popups
+# opening together cannot both win it. An explicit refresh always takes it, so
+# the timer does not repeat it a minute later.
+if [[ -n "$IF_OLDER" ]]; then
+  won=$(db_q "INSERT INTO kv (key, value) VALUES ('pr.refresh_at', '$NOW')
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                WHERE CAST(kv.value AS INTEGER) <= $(( NOW - IF_OLDER ));
+              SELECT changes();" 2>/dev/null)
+  [[ "$won" == 1 ]] || exit 0
+else
+  db_q "INSERT OR REPLACE INTO kv (key, value) VALUES ('pr.refresh_at', '$NOW')" >/dev/null 2>&1
+fi
+
+# CheckRun items carry `status` and `conclusion`, StatusContext items `state`.
+# One failing check is a failing PR; one still running, with none failing, is
+# pending; anything else that reported is a pass.
+SUMMARY='
+  def lower: if . == null or . == "" then "" else ascii_downcase end;
+  (.statusCheckRollup // []) as $c
+  | [ (.number // "" | tostring),
+      (.state | lower),
+      (.reviewDecision | lower),
+      (if ($c | length) == 0 then ""
+       elif any($c[]; ((.conclusion // "") | IN("FAILURE", "TIMED_OUT", "CANCELLED",
+                                                  "ACTION_REQUIRED", "STARTUP_FAILURE"))
+                     or ((.state // "") | IN("FAILURE", "ERROR"))) then "fail"
+       elif any($c[]; ((.status // "COMPLETED") != "COMPLETED")
+                     or ((.state // "") | IN("PENDING", "EXPECTED"))) then "pending"
+       else "pass" end),
+      (.mergedAt // ""),
+      (.url // ""),
+      (.headRefName // "") ]
+  | join("\u001f")'
+
+# gh pr view <ident> in the repository, the JSON on stdout or the reason on
+# stderr. GH_PROMPT_DISABLED: a gh that wants to ask something must fail instead.
+gh_view() { # <repo_root> <ident>
+  ( cd "$1" 2>/dev/null && GH_PROMPT_DISABLED=1 gh pr view "$2" \
+      --json number,state,reviewDecision,statusCheckRollup,mergedAt,url,headRefName )
+}
+
+# One session: ask gh, write the row. Runs in a background job of its own.
+refresh_one() { # <name> <repo_root> <worktree> <branch> <subdir> <created epoch>
+  local name="$1" root="$2" worktree="$3" branch="$4" subdir="$5" created="$6"
+  local tr url out err errf ok=false
+  local -a f
+  errf=$(mktemp "${TMPDIR:-/tmp}/wts-pr.XXXXXX") || return 1
+  if [[ -z "$branch" || ! -d "$root" ]]; then
+    print -r -- "no branch or repository in the registry" > "$errf"
+  else
+    tr=$(db_session_transcript "$worktree" "$subdir" "$created") || tr=""
+    url=$(db_transcript_pr_url "$tr")
+    if [[ -n "$url" ]] && out=$(gh_view "$root" "$url" 2>"$errf"); then
+      f=("${(@ps:\x1f:)$(print -r -- "$out" | jq -r "$SUMMARY" 2>/dev/null)}")
+      [[ "${f[1]:-}" == <-> && "${f[7]:-}" == "$branch" ]] && ok=true
+    fi
+    if ! $ok && out=$(gh_view "$root" "$branch" 2>"$errf"); then
+      f=("${(@ps:\x1f:)$(print -r -- "$out" | jq -r "$SUMMARY" 2>/dev/null)}")
+      [[ "${f[1]:-}" == <-> ]] && ok=true
+    fi
+  fi
+  err=$(<"$errf")
+  rm -f "$errf"
+
+  # Whether the branch landed, as the collector would say it (merge_check in
+  # wts-db.zsh): a squash merge then reads `merged` in the lines printed below
+  # and in the popup's first fill, not `#40 ✓` until the next full pass.
+  local tip btip
+  if [[ -n "$branch" && -d "$root" ]]; then
+    merge_base_of "$root"
+    tip=$(git -C "$root" rev-parse --verify --quiet "refs/heads/$branch" 2>/dev/null)
+    btip=$(git -C "$root" rev-parse --verify --quiet "$MERGE_BASE_REF^{commit}" 2>/dev/null)
+    if [[ -n "$tip" && -n "$btip" ]]; then
+      merge_check "$name" "$root" "$branch" "$MERGE_BASE" "$MERGE_BASE_REF" "$tip" "$btip"
+    fi
+  fi
+  # The first line, by pattern: `${${(@f)err}[1]}` gives the first CHARACTER
+  # of a one-line text (no split, so [1] indexes the string).
+  err="${err%%$'\n'*}"
+
+  if $ok; then
+    db_q "INSERT OR REPLACE INTO pr_state
+            (session, branch, number, state, review, checks, merged_at, url, error, fetched_at, checked_at)
+          VALUES ($(sql_str "$name"), $(sql_str "$branch"), ${f[1]}, $(sql_str "${f[2]:-}"),
+                  $(sql_str "${f[3]:-}"), $(sql_str "${f[4]:-}"), $(sql_str "${f[5]:-}"),
+                  $(sql_str "${f[6]:-}"), '', $NOW, $NOW)" >/dev/null 2>&1
+    return 0
+  fi
+  # "no pull requests found for branch …" is an answer, not a failure: the
+  # branch has no PR (yet), and a row says it was asked. So is a repository
+  # with no GitHub remote at all ("none of the git remotes configured for this
+  # repository point to a known GitHub host", "no git remotes found"): it will
+  # never have one, and as an error it sat above every session's preview —
+  # found in the README demo's clone, whose only remote is a local folder.
+  if [[ "$err" == *"no pull requests found"* || "$err" == *"none of the git remotes"* \
+        || "$err" == *"no git remotes"* ]]; then
+    db_q "INSERT OR REPLACE INTO pr_state
+            (session, branch, number, state, error, fetched_at, checked_at)
+          VALUES ($(sql_str "$name"), $(sql_str "$branch"), NULL, 'none', '', $NOW, $NOW)" >/dev/null 2>&1
+    return 0
+  fi
+  # Anything else (not logged in, offline, not a GitHub remote) keeps what the
+  # last good answer said, and the reason next to it.
+  [[ -n "$err" ]] || err="gh pr view failed for branch '$branch'"
+  db_q "INSERT INTO pr_state (session, branch, error, checked_at)
+          VALUES ($(sql_str "$name"), $(sql_str "$branch"), $(sql_str "$err"), $NOW)
+        ON CONFLICT(session) DO UPDATE SET error = excluded.error, checked_at = excluded.checked_at" \
+    >/dev/null 2>&1
+  return 1
+}
+
+where=""
+(( ${#NAMES} )) && where="WHERE name IN $(sql_list "${NAMES[@]}")"
+rows=$(db_rows "SELECT name, repo_root, worktree, branch, subdir,
+                       coalesce(strftime('%s', created_at), 0)
+                  FROM sessions $where ORDER BY name" 2>/dev/null)
+typeset -a pids done_names
+for row in "${(@ps:\x1e:)rows}"; do
+  f=("${(@ps:\x1f:)row}")
+  [[ -n "${f[1]:-}" ]] || continue
+  refresh_one "${f[1]}" "${f[2]:-}" "${f[3]:-}" "${f[4]:-}" "${f[5]:-}" "${f[6]:-0}" &
+  pids+=($!)
+  done_names+=("${f[1]}")
+done
+failed=0
+for pid in "${pids[@]}"; do
+  wait "$pid" || failed=1
+done
+
+$QUIET && exit $failed
+
+if (( ! ${#done_names} )); then
+  if $JSON; then print -r -- '{"version":1,"sessions":[]}'; else print -u2 "wts pr: no session"; fi
+  exit 0
+fi
+
+if $JSON; then
+  db_ro "SELECT json_object('version', 1, 'sessions', json_group_array(json(o))) FROM (
+           SELECT json_object('name', s.name,
+                    'pr', CASE WHEN p.number IS NULL THEN NULL ELSE json($WTS_PR_JSON) END,
+                    'error', nullif(coalesce(p.error, ''), '')) AS o
+             FROM sessions s LEFT JOIN pr_state p ON p.session = s.name
+            WHERE s.name IN $(sql_list "${done_names[@]}") ORDER BY s.name)"
+  exit $failed
+fi
+
+# One line per session: the label the switcher shows, the URL, or the reason.
+typeset -A label
+for row in "${(@ps:\x1e:)$(db_pr_labels)}"; do
+  f=("${(@ps:\x1f:)row}")
+  [[ -n "${f[1]:-}" ]] && label[${f[1]}]="${f[2]:-}"
+done
+integer w=0
+for n in "${done_names[@]}"; do (( ${#n} > w )) && w=${#n}; done
+out=$(db_rows "SELECT s.name, coalesce(p.url, ''), coalesce(p.error, ''), coalesce(p.state, '')
+                 FROM sessions s LEFT JOIN pr_state p ON p.session = s.name
+                WHERE s.name IN $(sql_list "${done_names[@]}") ORDER BY s.name" 2>/dev/null)
+for row in "${(@ps:\x1e:)out}"; do
+  f=("${(@ps:\x1f:)row}")
+  [[ -n "${f[1]:-}" ]] || continue
+  n="${f[1]}" url="${f[2]:-}" err="${f[3]:-}" st="${f[4]:-}"
+  if [[ -n "$err" ]]; then
+    printf '%-*s  ⚠ %s\n' $w "$n" "$err"
+  elif [[ -n "${label[$n]:-}" ]]; then
+    printf '%-*s  %s%s\n' $w "$n" "${label[$n]}" "${url:+  $url}"
+  else
+    printf '%-*s  no pull request\n' $w "$n"
+  fi
+done
+exit $failed
