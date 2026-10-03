@@ -400,8 +400,12 @@ db_task_of_session() {  # <name>
 #
 # Database reads only: this runs inside the switcher's 2-second refresh and
 # inside the Claude SessionStart hook, neither of which may call the model.
-task_context_md() {  # <task id> [<max note lines>]
-  local id="$1" cap="${2:-0}"
+#
+# <max attempts> is the "Previous attempts" block (task_attempts_md): 3 by
+# default, 0 for none — the switcher places that block itself, next to the live
+# sessions, rather than below a long note.
+task_context_md() {  # <task id> [<max note lines>] [<max attempts>]
+  local id="$1" cap="${2:-0}" attempts="${3:-3}"
   [[ -n "$id" ]] || return 1
   db_available || return 1
 
@@ -444,6 +448,8 @@ task_context_md() {  # <task id> [<max note lines>]
   done
   (( n )) && print -r -- ""
 
+  (( attempts > 0 )) && task_attempts_md "$id" "$attempts"
+
   # Every link the task carries, even the ones that became documents below: an
   # agent that can reach a page itself should not have to guess its address.
   local url kind
@@ -472,6 +478,60 @@ task_context_md() {  # <task id> [<max note lines>]
     print -r -- "- $slug"
   done
   (( n )) && print -r -- ""
+  return 0
+}
+
+# The sessions a task already had, from the archive, newest first: outcome, PR
+# and the three retrospective lines a retry needs — what was hard, how it was
+# overcome, what was dropped. The schema promised that "the second attempt
+# starts where the first left off", and until this block nothing a new session
+# reads carried the first attempt at all: wts task show printed `delivered`
+# alone, and the context file and the hook not even that.
+#
+# Database reads only, like task_context_md: the switcher preview and the
+# SessionStart hook call it. Each retro line is flattened and cut, since this
+# block is re-injected into an agent's context at every start and /clear.
+task_attempts_md() {  # <task id> [<max attempts>]
+  local id="$1" max="${2:-3}"
+  [[ -n "$id" ]] || return 1
+  db_available || return 1
+  local out row k v
+  local -a f
+  local -i n=0 total
+  total=$(db_ro "SELECT count(*) FROM archive WHERE task = $(sql_str "$id")" 2>/dev/null)
+  (( total > 0 )) || return 0
+  out=$(db_rows "
+    SELECT session, substr(finished_at, 1, 10), outcome, pr_url,
+           retro_delivered, retro_resisted, retro_resolved, retro_abandoned, retro_error
+      FROM archive WHERE task = $(sql_str "$id")
+     ORDER BY finished_at DESC, id DESC LIMIT $(( max ))" 2>/dev/null)
+  if (( total > max )); then
+    print -r -- "Previous attempts (the last $max of $total, newest first):"
+  else
+    print -r -- "Previous attempts (newest first):"
+  fi
+  print -r -- ""
+  for row in "${(@ps:\x1e:)out}"; do
+    f=("${(@ps:\x1f:)row}")
+    [[ -n "${f[1]:-}" ]] || continue
+    (( n++ ))
+    print -r -- "- ${f[1]} (${f[3]:-unknown}, ${f[2]:-?})${f[4]:+  ${f[4]}}"
+    if [[ -z "${f[5]:-}${f[6]:-}${f[7]:-}${f[8]:-}" ]]; then
+      print -r -- "  no retrospective yet${f[9]:+ (${f[9]//[[:cntrl:]]/ })}: wts retro"
+      continue
+    fi
+    for k v in delivered "${f[5]:-}" resisted "${f[6]:-}" \
+               resolved "${f[7]:-}" abandoned "${f[8]:-}"; do
+      v="${v//[[:cntrl:]]/ }"
+      # '-' and 'nothing notable' are the retro prompt's own words for "nothing
+      # here", and wts-retro writes 'unknown' for a line the model left out.
+      [[ -n "$v" && "$v" != (-|unknown|nothing notable) ]] || continue
+      (( ${#v} > 160 )) && v="${v[1,159]}…"
+      print -r -- "  $k: $v"
+    done
+  done
+  (( total > max )) && print -r -- "- ($(( total - max )) earlier: wts task show $id)"
+  print -r -- ""
   return 0
 }
 

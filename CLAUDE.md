@@ -36,6 +36,7 @@ docs/roadmap.md            what the 2026-09-28 review left open, ordered; read i
 docs/demo/                record.zsh + demo.tape (README GIF, make demo)
                           + journal.tape (the wts log demo, WTS_DEMO_TAPE=)
                           + new-task.zsh/.tape (switcher tasks GIF, no agent, no model)
+                          + read-data.zsh/.tape (brief, notes, attempts, gc --all)
 ```
 
 Homebrew, `make install` and a git checkout share this tree, so `bin/wts` works
@@ -219,10 +220,40 @@ bin/wts setup tmux > /tmp/wts-dev.tmux && tmux source-file /tmp/wts-dev.tmux
 tmux source-file ~/.tmux.conf   # back to the installed version
 ```
 
-When a change shows in the README demo (switcher, `wts ls`, `brief`, `gc`
-output), re-record `docs/demo.gif` with `make demo`: real agents on a throwaway
-clone, a few minutes and a few agent turns. Requirements are in the header of
+`docs/demo.gif` is re-recorded with `make demo` before every PR (see below):
+real agents on a throwaway clone. Requirements are in the header of
 `docs/demo/record.zsh`.
+
+## Before opening a PR
+
+The author reviews a PR by watching it, and the recording is also the QA: a
+check that passes on a substring can hide a screen that is broken. Both steps
+below, every time, before `gh pr create`:
+
+1. **Record the change itself.** A small GIF of what the PR changes, from a
+   script of its own in `docs/demo/` (`new-task.zsh`, `read-data.zsh`: a sandbox
+   on a private tmux server, a stand-in `claude`, state written straight into its
+   database, no agent and no model call). Commit it under `docs/` and embed it in
+   the PR body. This is how the preview's `bad substitution` in #30 was found:
+   352 checks passed and the pane under the new lines never printed.
+2. **Re-record the README demo** (`docs/demo.gif`) without changing
+   `record.zsh` or `demo.tape`: it is the end-to-end check that nothing around
+   the change broke. Real agents, a few minutes, a few turns on the account.
+   Record the checkout, not the installed wts: `WTS_DEMO_BIN=$PWD/bin` puts the
+   checkout first on PATH, but `prefix+s` and `prefix+a` come from
+   `~/.tmux.conf`, which binds the **Homebrew** libexec. So pass
+   `WTS_DEMO_TAPE=` a scratch copy of `demo.tape` whose first hidden block also
+   runs `wts setup tmux > <file> && tmux source-file <file>`, as `new-task.zsh`
+   does.
+
+Then **look at the frames**, do not just check that a file was written:
+`ffmpeg -i docs/x.gif -vf fps=1/2.5 <dir>/f%02d.png` and read them. Any error
+text, an empty preview or a command typed into the wrong program (a pager, a
+popup that did not open) is a failed take and usually a bug. Mention in the PR
+what the recordings showed.
+
+vhs 0.12.0 writes no GIF (charmbracelet/vhs#787): every script takes `VHS=` a
+0.11.0 binary (the GitHub release tarball works as is).
 
 ## Release
 

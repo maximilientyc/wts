@@ -89,6 +89,14 @@ if [[ -n "${my_task:-}" ]]; then
                         ORDER BY added_at DESC LIMIT 10)
                       ORDER BY added_at" 2>/dev/null)
   fi
+  # The sessions that already tried, and what stopped them: without this a
+  # retry rediscovers the flaky test and the wrong assumption the first one hit.
+  # Three at most, each line cut by the renderer: this is re-injected at every
+  # start, /clear and /compact.
+  if [[ -n "${my_task_id:-}" ]]; then
+    task_attempts=$(task_attempts_md "$my_task_id" 3 2>/dev/null) || task_attempts=""
+    [[ -n "$task_attempts" ]] && print -r -- "$task_attempts" | sed -e '/^$/d' -e '2,$s/^/  /'
+  fi
   # Selected since the task layer landed and never printed until now: the links
   # ARE the context, and the agent in this pane can often read a private page the
   # sandboxed `wts doc` fetch could not.

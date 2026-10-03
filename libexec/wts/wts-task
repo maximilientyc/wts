@@ -369,16 +369,25 @@ cmd_show() {
     print -r -- "    $slug"
   done < <(db_rows "SELECT slug FROM task_docs WHERE task = $(sql_str "$id")
                     ORDER BY added_at" 2>/dev/null)
-  print -r -- "  sessions:"
   local name state outcome pr added removed retro
+  integer live=0
   while IFS=$'\x1f' read -r -d $'\x1e' name state outcome pr added removed retro; do
-    [[ -n "$name" ]] || continue
-    print -r -- "    $name ($state, $outcome)${pr:+  $pr}"
-    [[ -n "$retro" ]] && print -r -- "      delivered: $retro"
+    [[ "$state" == live && -n "$name" ]] || continue
+    (( live++ == 0 )) && print -r -- "  sessions on it now:"
+    print -r -- "    $name"
   done < <(sessions_of "$id")
-  # The loop's status is its last body command's: `[[ -n "$retro" ]] && …` is 1
-  # for a session without a retrospective yet, and `wts task show` exited 1 on
-  # every successful listing that ended on one.
+  # Every attempt, with the three retrospective lines a retry needs, and not
+  # `delivered` alone: what resisted and what was abandoned is what the next
+  # session must not rediscover. Same renderer as the context file and the hook.
+  local attempts
+  attempts=$(task_attempts_md "$id" 1000 2>/dev/null) || attempts=""
+  if [[ -n "$attempts" ]]; then
+    print -r -- "$attempts" | sed -e '/^$/d' -e 's/^/  /'
+  elif (( live == 0 )); then
+    print -r -- "  sessions: none yet"
+  fi
+  # Explicit: a function's status is its last command's, and `wts task show`
+  # once exited 1 on every successful listing that ended on a `[[ ]] && …`.
   return 0
 }
 

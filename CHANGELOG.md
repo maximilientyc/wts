@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+wts reads what it already writes: the archive, the briefs and the notes were
+written at every teardown and read by almost nothing.
+
+- **Previous attempts, in the task's context.** `.wts/context.md`, the
+  `SessionStart` hook and the switcher's task preview now carry the last three
+  archived sessions of the task: outcome, PR, and the retrospective's
+  `delivered`, `resisted`, `resolved` and `abandoned` lines. A retry starts
+  where the last attempt stopped instead of rediscovering it. `wts task show`
+  prints every attempt with all four lines; it used to print `delivered` alone.
+- **The session preview shows its brief and notes.** Under the state line, the
+  cached `done:` / `next:` of `wts brief` with its age, and the last two notes
+  the session's agent left. Database reads only, no model call.
+- **`wts gc --all`** runs the same collection once per repository that has a
+  registered session, each from its main worktree, from anywhere.
+- **`wts ls` gets a REPO column** when sessions span more than one repository.
+
 ## 1.5.2 — 2026-10-02
 
 - **A task's preview in the switcher lists its sessions**: the live ones with

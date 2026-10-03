@@ -651,51 +651,36 @@ loaded() { # [--no-git]
   print -rn -- "${(j:+:)chain}"
 }
 
-# The sessions started from a task: the live ones with their agent's state, then
-# the finished ones from the archive, newest first. The list row only said
-# "2 session(s)", and finding out which meant leaving the popup for
-# `wts task show`. Not part of task_context_md: that one is also the agent's
-# context, where a live state would be stale the moment it was written.
-TASK_PREVIEW_ARCHIVED=5
+# The sessions started from a task: the live ones with their agent's state,
+# then the finished ones through task_attempts_md (outcome, PR, retrospective),
+# newest first. The list row only said "2 session(s)", and finding out which
+# meant leaving the popup for `wts task show`. The live part is not in
+# task_context_md: that one is also the agent's context, where a live state
+# would be stale the moment it was written.
+TASK_PREVIEW_ARCHIVED=3
 
 task_sessions_md() { # $1 = task id
   db_available || return 0
-  local out row name kind outcome pr retro head
-  local -a f
-  local -i n=0 shown=0
+  local out name head
+  local -i n=0
   # Split rather than `read -d`, which stops this very process under fzf's
   # preview: see db_rows in wts-db.zsh.
   out=$(db_rows "
-    SELECT name, kind, outcome, pr, retro FROM (
-      SELECT s.name AS name, 'live' AS kind, '' AS outcome, '' AS pr, '' AS retro,
-             0 AS o1, 0 AS o2
-        FROM task_links l JOIN sessions s ON s.name = l.session
-       WHERE l.task = $(sql_str "$1")
-      UNION ALL
-      SELECT session, 'archived', outcome, pr_url, retro_delivered, 1, -id
-        FROM archive WHERE task = $(sql_str "$1"))
-     ORDER BY o1, o2, name" 2>/dev/null)
-  for row in "${(@ps:\x1e:)out}"; do
-    f=("${(@ps:\x1f:)row}")
-    name="${f[1]:-}" kind="${f[2]:-}" outcome="${f[3]:-}" pr="${f[4]:-}" retro="${f[5]:-}"
+    SELECT s.name FROM task_links l JOIN sessions s ON s.name = l.session
+     WHERE l.task = $(sql_str "$1") ORDER BY s.name" 2>/dev/null)
+  for name in "${(@ps:\x1e:)out}"; do
     [[ -n "$name" ]] || continue
-    (( n++ == 0 )) && { print -r -- "Sessions started from it:"; print -r -- "" }
-    if [[ "$kind" == live ]]; then
-      head=$(preview_header "$name") || head="live"
-      print -r -- "- $name  $head"
-      continue
-    fi
-    if (( shown >= TASK_PREVIEW_ARCHIVED )); then continue; fi
-    (( shown++ ))
-    print -r -- "- $name (${outcome:-unknown})${pr:+  $pr}"
-    [[ -n "$retro" ]] && print -r -- "  delivered: ${retro%%$'\n'*}"
+    (( n++ == 0 )) && { print -r -- "Sessions on it now:"; print -r -- "" }
+    head=$(preview_header "$name") || head="live"
+    print -r -- "- $name  $head"
   done
-  if (( n == 0 )); then
+  (( n )) && print -r -- ""
+  local attempts
+  attempts=$(task_attempts_md "$1" "$TASK_PREVIEW_ARCHIVED" 2>/dev/null) || attempts=""
+  if [[ -n "$attempts" ]]; then
+    print -r -- "$attempts"
+  elif (( n == 0 )); then
     print -r -- "Sessions started from it: none yet, enter starts one."
-  else
-    local -i archived_n
-    archived_n=$(db_ro "SELECT count(*) FROM archive WHERE task = $(sql_str "$1")" 2>/dev/null)
-    (( archived_n > shown )) && print -r -- "- ($(( archived_n - shown )) more: wts task show $1)"
   fi
   return 0
 }
@@ -707,7 +692,7 @@ task_sessions_md() { # $1 = task id
 # where you check whether a piece of work is ready to start.
 task_preview() { # $1 = task id
   local md
-  md=$(task_context_md "$1" 2>/dev/null) || md=""
+  md=$(task_context_md "$1" 0 0 2>/dev/null) || md=""
   if [[ -z "$md" ]]; then
     print -r -- "(task $1 is unknown here)"
     return
@@ -758,14 +743,60 @@ preview_header() { # <session name>
   return 1
 }
 
+# What the session already said about itself, under the state line: the cached
+# `done:` / `next:` of `wts brief` and the last two notes its agent left with
+# `wts db set`. Both were written at every brief and every note and read by no
+# switcher code, so finding out meant leaving the popup. The cache only, never
+# a model call (CLAUDE.md): a brief that is a day old says so with its age.
+# One database read per refresh, no git.
+preview_memo() { # <session name>
+  local name="$1" out row line age
+  local -a f lines
+  local -i width=${FZF_PREVIEW_COLUMNS:-80} first
+  [[ -n "$name" ]] && db_available || return 1
+  out=$(db_rows "
+    SELECT 'brief', '', body, updated_at FROM briefs WHERE session = $(sql_str "$name")
+    UNION ALL
+    SELECT * FROM (SELECT 'note', key, value,
+                          CAST(strftime('%s', updated_at) AS INTEGER)
+                     FROM notes WHERE session = $(sql_str "$name")
+                    ORDER BY updated_at DESC LIMIT 2)" 2>/dev/null)
+  [[ -n "$out" ]] || return 1
+  for row in "${(@ps:\x1e:)out}"; do
+    f=("${(@ps:\x1f:)row}")
+    [[ -n "${f[3]:-}" ]] || continue
+    age=""
+    [[ "${f[4]:-}" == <-> ]] && age=" ($(age_of "${f[4]}"))"
+    if [[ "${f[1]}" == brief ]]; then
+      # The body is the two lines `done: …` and `next: …`; the age goes on the
+      # first, as for a note.
+      first=1
+      for line in "${(@f)f[3]}"; do
+        [[ -n "$line" ]] || continue
+        (( first )) && { line+="$age"; first=0 }
+        lines+=("$line")
+      done
+    else
+      lines+=("note ${f[2]}$age: ${f[3]//[[:cntrl:]]/ }")
+    fi
+  done
+  (( ${#lines} )) || return 1
+  for line in "${lines[@]}"; do
+    (( ${#line} > width )) && line="${line[1,width-1]}…"
+    # Dim: these are memos about the pane, and the pane is what the eye is for.
+    print -r -- $'\e[2m'"$line"$'\e[0m'
+  done
+}
+
 preview() { # $1 = cursor target, $2 = cursor name
-  local target capture header=""
+  local target capture header="" memo=""
   target=$(resolve_target "${1:-}" "${2:-}")
   if [[ "$target" == task:* ]]; then
     capture=$(task_preview "${target#task:}")
   else
     capture=$(tmux capture-pane -p -e -S "-$SCROLLBACK" -t "$target" 2>/dev/null)
     header=$(preview_header "${2:-}") || header=""
+    memo=$(preview_memo "${2:-}") || memo=""
   fi
   # The header takes the first line and is never scrolled away: it is printed
   # before the window sliced below, which is one line shorter for it — and
@@ -775,8 +806,23 @@ preview() { # $1 = cursor target, $2 = cursor name
   if [[ -n "$header" ]]; then
     print -r -- "$header"
     (( height-- ))
-    (( height < 1 )) && height=1
   fi
+  # Pinned like the header, and only while the pane keeps most of the window:
+  # on a short popup the agent's last lines matter more than its memos.
+  if [[ -n "$memo" ]]; then
+    local -a memo_lines=("${(@f)memo}")
+    # The width a plain variable and the operand an explicit empty string: a
+    # `${…}` inside the (l::) flag is a "bad substitution", and no operand at
+    # all is "parameter not set" under set -u. Either ended the preview right
+    # here, before the pane.
+    local -i rule_w=${FZF_PREVIEW_COLUMNS:-80}
+    if (( height - ${#memo_lines} - 1 >= 8 )); then
+      print -r -- "$memo"
+      print -r -- $'\e[2m'"${(l:rule_w::-:)${:-}}"$'\e[0m'
+      (( height -= ${#memo_lines} + 1 ))
+    fi
+  fi
+  (( height < 1 )) && height=1
   [[ -n "$capture" ]] || { print -r -- "(no preview)"; return }
 
   # Command substitution already ate the trailing empty lines: the bottom of

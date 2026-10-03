@@ -115,6 +115,7 @@ cd ~/code/myapp
 wts auth-form                          # ../myapp-worktrees/auth-form, branch auth-form
 wts "rate-limit the public API per key"   # Claude proposes the name, starts on the task
 wts ls                                 # agent state, branch, git delta, tmux state
+                                       # (and REPO, once sessions span two repositories)
 wts stop auth-form                     # tmux session only; wts restore brings it back
 wts rm auth-form -f                    # session + worktree + branch + registry entry
 ```
@@ -133,7 +134,7 @@ wts restore [name...]
 wts stop <name>
 wts pr [name]
 wts rm <name> [-f]
-wts gc [--apply] [--no-fetch] [--no-retro]
+wts gc [--all] [--apply] [--no-fetch] [--no-retro]
 wts log [--since <when>] [--until <when>] [--task <id>] [--brief] [--no-notes]
 wts retro [name...] [--force]
 wts task ls | show <id> | link [<id>] [name] | unlink [name] | new "<title>"
@@ -340,8 +341,11 @@ the width of their longest value, capped so that every column stays visible, and
 a cell too long for its column is cut with `…` rather than pushing its row out
 of line. `*` after a name marks the session you came from. The preview takes the
 right half; its first line is the agent's state, for how long, and the question
-it waits on when there is one (`blocked 4m: Bash: rm -rf dist`), above the
-pane itself.
+it waits on when there is one (`blocked 4m: Bash: rm -rf dist`). Under it, dimmed,
+what the session already said about itself: the cached `done:` / `next:` of
+`wts brief` with its age, and the last two notes its agent left with `wts db set`
+— from the database, never a model call, and dropped on a popup too short to
+spare the lines. Then the pane itself.
 
 `tab` **answers the agent without leaving the popup**: the prompt becomes
 `reply to <session>>`, what you type no longer filters the list, and `enter` sends
@@ -399,7 +403,9 @@ carries, so you can see at a glance whether a piece of work is ready to start. A
 task some sessions already serve stays listed, with `N session(s)` in SUBJECT:
 `enter` on it starts one more, for a second attempt next to the first.
 The preview is the task itself — title, status, the sessions started from it
-(live ones with their agent's state, finished ones with their outcome), the
+(live ones with their agent's state, then the last three finished ones as
+*previous attempts*: outcome, PR, and what was delivered, what resisted, how it
+was resolved, what was abandoned, from their retrospectives), the
 notes you kept on it, its links, its documents — which makes the popup the place you decide *what* to do,
 not only *where* to go back to.
 
@@ -603,11 +609,14 @@ state database (table `doc_cache`).
 wts gc              # dry run: lists, deletes nothing
 wts gc --apply      # does it
 wts gc --no-fetch   # without contacting the remote (offline)
+wts gc --all        # every repository that has a session, from anywhere
 ```
 
 **The remote is the source of truth.** `wts gc` starts with
 `git fetch --all --prune`, then compares against `origin/<base>` rather than a local
-base that may lag behind. Six categories, limited to the current repository:
+base that may lag behind. Six categories, limited to the current repository —
+`--all` runs the same collection once per repository in the registry, each from
+its main worktree:
 
 1. **Husk folders** in `<repo>-worktrees/` — `git worktree remove` leaves git-ignored
    files behind, so a folder without `.git` remains after each `wts rm`.
@@ -725,7 +734,9 @@ fails differently:
    `wts fix-audit --task <id>` used to start the agent on nothing at all.
 2. **The documents on the task** are attached like `--doc` ones. Already fetched,
    so creation pays nothing.
-3. **`.wts/context.md` opens with the task**: its title, status, your notes, its
+3. **`.wts/context.md` opens with the task**: its title, status, your notes,
+   its *previous attempts* (the last three archived sessions with their outcome,
+   PR and retrospective, so a retry starts where the last one stopped), its
    links, before the documents. This is the only channel the agent reads *before
    its first turn*.
 4. **The `SessionStart` hook repeats it** — and it is the only one that comes

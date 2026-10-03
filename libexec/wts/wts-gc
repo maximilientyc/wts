@@ -1,9 +1,13 @@
 #!/usr/bin/env zsh
 # wts-gc — garbage collector for worktrees, branches and registry entries.
 #
-# Usage: wts gc [--apply] [--no-fetch] [--no-retro]
+# Usage: wts gc [--all] [--apply] [--no-fetch] [--no-retro]
 #
 # Default: DRY RUN. Nothing is deleted without --apply.
+#
+# --all runs the same gc, unchanged, once per repository that has a registered
+# session, from that repository's main worktree. Without it, a repository you
+# do not happen to stand in is never cleaned, and its sessions pile up.
 #
 # --apply also ARCHIVES what it tears down, into the `archive` table that
 # `wts log` reports: a session is only tellable once it is finished, and this
@@ -66,17 +70,65 @@ set -uo pipefail
 APPLY=false
 FETCH=true
 RETRO=true
+ALL=false
 WTS_BIN="${0:A:h}"
+WTS_GC="${0:A}"
+typeset -a pass=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --apply)    APPLY=true ;;
-    --no-fetch) FETCH=false ;;
-    --no-retro) RETRO=false ;;
-    --dry-run)  ;;
-    *) print -u2 "wts gc: unknown option '$1' (--apply, --no-fetch, --no-retro)"; exit 2 ;;
+    --apply)    APPLY=true; pass+=("$1") ;;
+    --no-fetch) FETCH=false; pass+=("$1") ;;
+    --no-retro) RETRO=false; pass+=("$1") ;;
+    --dry-run)  pass+=("$1") ;;
+    --all)      ALL=true ;;
+    *) print -u2 "wts gc: unknown option '$1' (--all, --apply, --no-fetch, --no-retro)"; exit 2 ;;
   esac
   shift
 done
+
+# --all: one run per repository, each in a process of its own so the per-
+# repository code below stays exactly what a plain `wts gc` runs. A repository
+# is git's common directory and not repo_root: a session created from inside
+# another worktree records that worktree as its root (see wts-context), and two
+# roots of one repository must not be collected twice. Each run starts from the
+# main worktree, because --show-toplevel answers with the worktree you stand in
+# and the husk scan derives <repo>-worktrees/ from it (CLAUDE.md).
+if $ALL; then
+  source "$WTS_BIN/wts-db.zsh"
+  db_available || { print -u2 "wts gc --all: sqlite3 is required"; exit 1 }
+  typeset -A seen
+  typeset -a mains
+  root="" common="" main=""
+  for root in "${(@f)$(db_ro "SELECT DISTINCT repo_root FROM sessions
+                                    WHERE repo_root != '' ORDER BY repo_root" 2>/dev/null)}"; do
+    [[ -n "$root" ]] || continue
+    if [[ ! -d "$root" ]]; then
+      print -u2 -r -- "→ $root: gone, skipped (its sessions are pruned by wts ls)"
+      continue
+    fi
+    common=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common=""
+    [[ -n "$common" ]] || { print -u2 -r -- "→ $root: not a git repository, skipped"; continue }
+    [[ -n "${seen[$common]+x}" ]] && continue
+    seen[$common]=1
+    # The first entry of `worktree list` is the main worktree; a bare one has
+    # no working tree to stand in, and nothing of gc applies to it.
+    main=$(git -C "$root" worktree list --porcelain 2>/dev/null \
+             | awk 'NR == 1 && /^worktree / { sub(/^worktree /, ""); w = $0 }
+                    /^bare$/ { w = "" } /^$/ { exit } END { print w }')
+    [[ -n "$main" && -d "$main" ]] || { print -u2 -r -- "→ $root: no main worktree, skipped"; continue }
+    mains+=("$main")
+  done
+  if (( ${#mains} == 0 )); then
+    print "No registered session, so no repository to collect."
+    exit 0
+  fi
+  integer rc=0 one=0
+  for main in "${mains[@]}"; do
+    (( one++ )) && print ""
+    ( cd "$main" && WTS_GC_ALL=1 "$WTS_GC" "${pass[@]}" ) || rc=1
+  done
+  exit $rc
+fi
 
 if ! git rev-parse --git-dir >/dev/null 2>&1; then
   print -u2 "wts: not in a git repository"
@@ -665,7 +717,7 @@ fi
 
 if ! $APPLY; then
   if (( ${#husks} + ${#teardown} + ${#free_branches} + ${#orphans} + ${#stale_locks} > 0 )); then
-    print "Nothing was deleted. Run again with: wts gc --apply"
+    print "Nothing was deleted. Run again with: wts gc${WTS_GC_ALL:+ --all} --apply"
   fi
   exit 0
 fi
