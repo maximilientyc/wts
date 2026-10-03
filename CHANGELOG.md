@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.8.3 — 2026-10-03
+## 1.8.3 — 2026-10-04
 
 - **ctrl-e with no document picked goes straight back to the list.** Esc in
   the library picker, or enter on a filter that matches nothing, left a blank
