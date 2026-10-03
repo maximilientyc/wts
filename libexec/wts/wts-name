@@ -13,6 +13,8 @@
 # anything that could slow it down or have side effects:
 #   --safe-mode, disableAllHooks  no hooks (notifications), no CLAUDE.md, no
 #                                 plugins — and ~4 s instead of ~10
+#   alwaysThinkingEnabled false   no thinking before a one-line answer: it
+#                                 is what took retros past 60 s (wts-retro)
 #   --strict-mcp-config           no MCP server to start
 #   --no-session-persistence      no transcript, nothing for `claude --continue`
 #   --tools ""                    no tools: a text answer, nothing else
@@ -120,7 +122,7 @@ if [[ -z "${WTS_NO_LLM:-}" ]]; then
             cd "$WTS_STATE_DIR" 2>/dev/null || cd /
             perl -e 'alarm shift; exec @ARGV' "$timeout" \
               claude -p --model "${WTS_MODEL:-haiku}" --safe-mode --strict-mcp-config \
-                --no-session-persistence --settings '{"disableAllHooks":true}' \
+                --no-session-persistence --settings '{"disableAllHooks":true,"alwaysThinkingEnabled":false}' \
                 --tools "" --system-prompt "$SYSTEM_PROMPT"
           ) 2>"${err:-/dev/null}")
     code=$?

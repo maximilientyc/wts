@@ -80,13 +80,20 @@ num() {
 # reasons — `cd` out of every worktree so wts-status cannot attribute a phantom
 # agent to one, and stderr to a file rather than /dev/null, because a rejected
 # model id and a timeout used to leave the same undiagnosable silence.
+#
+# Thinking off (alwaysThinkingEnabled): Haiku thinks before these four lines
+# when it may, and on a session of a few hours it thought for 4,500 tokens and
+# 45 to 63 s, past the 60 s timeout, from 4 KB of facts. The input was never
+# the problem (FACTS_MAX bounds it, and the transcript is reduced to the
+# author's messages and the last agent text); the same facts without thinking
+# answer in 3 s, with the same four lines. wts-brief and wts-name do the same.
 # ask_claude <errfile>
 ask_claude() {
   (
     cd "$WTS_STATE_DIR" 2>/dev/null || cd /
     perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" \
       claude -p --model "$MODEL" --safe-mode --strict-mcp-config \
-        --no-session-persistence --settings '{"disableAllHooks":true}' \
+        --no-session-persistence --settings '{"disableAllHooks":true,"alwaysThinkingEnabled":false}' \
         --tools "" --system-prompt "$SYSTEM_PROMPT"
   ) 2>"$1"
 }
@@ -97,7 +104,7 @@ why() {
   local errfile="$1" code="$2" msg="" l
   [[ -s "$errfile" ]] && msg=$(oneline "$(<"$errfile")")
   if (( code == 142 )); then              # perl's alarm: 128 + SIGALRM
-    l="no answer in ${TIMEOUT}s"
+    l="no answer in ${TIMEOUT}s (WTS_RETRO_TIMEOUT)"
   elif [[ -n "$msg" ]]; then
     # Where claude wrote its own diagnosis. Status 0 included: an unrecognized
     # model is answered in prose, not with a failure.

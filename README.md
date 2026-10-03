@@ -302,7 +302,8 @@ cache under `pr` (`number`, `state`, `review`, `checks`, `merged_at`, `url`,
 switcher's 2-second refresh ever make it: only `wts pr --refresh`, and the
 switcher's slow timer, which runs it in the background when the popup opens and
 then every `WTS_PR_REFRESH` seconds (300; `0` turns it off), once for all open
-popups. Which PR: the one Claude Code linked in the session's transcript when
+popups. `wts gc` is the one other caller: after its fetch, one `gh pr list` per
+repository for the branches it would otherwise leave as unmerged (see below). Which PR: the one Claude Code linked in the session's transcript when
 its head is the session's branch (a reused session name would otherwise find the
 previous incarnation's PR), else whatever `gh` finds for the branch. A failed
 call (not logged in, offline) keeps the last answer and records why.
@@ -767,8 +768,14 @@ than once per branch): a branch whose every commit has an equivalent in the base
 entirely present in it, whatever the merge method, and is deleted with
 `git branch -D`. A squash of several commits lands as one diff that matches none
 of them, so a branch also counts when merging it into the base would change
-nothing (`git merge-tree`, git 2.38+), or when `wts pr --refresh` saw its pull
-request merged with the branch's current tip as its head. A deleted remote branch is read from `%(upstream:track)` ==
+nothing (`git merge-tree`, git 2.38+), or when gh saw its pull request merged
+with the branch's current tip as its head. That last witness is what survives a
+release: the release rewrites the CHANGELOG lines and the version a squash
+landed, the merge conflicts, and only the pull request still says it merged. So
+after its fetch, `wts gc` asks gh itself — one `gh pr list --state merged` per
+repository, for the branches every other test left unmerged — and writes what it
+learns to `pr_state`. Not with `--no-fetch`, and silently not without gh or a
+GitHub remote; `WTS_GC_GH_TIMEOUT` (20 s) bounds the call. A deleted remote branch is read from `%(upstream:track)` ==
 `[gone]`, which only `--prune` reveals.
 
 **Safety rules:**
@@ -1220,6 +1227,7 @@ locale (`LANG=C`), Ruby refuses to read them ("invalid byte sequence in US-ASCII
 | `WTS_BRIEF_TIMEOUT`     | `45`                          | timeout of one summary, seconds                        |
 | `WTS_BRIEF_JOBS`        | `4`                           | concurrent summaries                                   |
 | `WTS_RETRO_TIMEOUT`     | `60`                          | timeout of one retrospective, seconds                  |
+| `WTS_GC_GH_TIMEOUT`     | `20`                          | timeout of `wts gc`'s one `gh pr list`, seconds        |
 | `WTS_RETRO_JOBS`        | `3`                           | concurrent retrospectives (`wts retro --jobs`)         |
 | `WTS_NO_ARCHIVE`        | (none)                        | `1`: `wts rm` and `wts gc` archive nothing for `wts log` |
 | `WTS_ARCHIVE_TRANSCRIPT`| `1`                           | `0`: the archive points at the transcript without copying it |

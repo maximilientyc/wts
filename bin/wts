@@ -79,6 +79,8 @@
 #                merged (squash included) or whose remote branch is gone,
 #                plus any stale index.lock blocking writes in a worktree.
 #                Only the branches wts created, unless --all-branches.
+#                After its fetch, one `gh pr list` finds the PRs merged on
+#                GitHub that git alone cannot see (not with --no-fetch).
 #                --apply also archives what it tears down, for `wts log`, and
 #                asks Claude for one retrospective each (--no-retro: none);
 #                --all does every repository that has a session
