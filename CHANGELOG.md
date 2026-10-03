@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- **ctrl-e with no document picked goes straight back to the list.** Esc in
+  the library picker, or enter on a filter that matches nothing, left a blank
+  screen saying "press any key": the pick happened inside `wts doc use ""`,
+  which then exited 0 in silence. The switcher now picks first and only runs
+  `wts doc use` (or `wts task doc`) on a slug, and waits for a key only once
+  something was attached. `wts doc use ""` with nothing chosen now says
+  "no document chosen" and exits 1, as `wts task doc` already did. The README
+  demo showed that blank screen for several releases: its scene 6 typed "2"
+  for the numbered list the picker used to degrade to, and fzf read it as a
+  filter. It now types part of the slug.
+
 ## 1.8.2 — 2026-10-03
 
 - **`wts gc` finds a squashed branch after a release.** The content test of

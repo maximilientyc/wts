@@ -1354,8 +1354,14 @@ close_task() { # $1 = task id
 # ctrl-e: `wts doc use` on the selected row, under `execute` like ctrl-o. With
 # no slug it opens the library picker, an inner fzf: `execute` hands over the
 # alternate screen and blocks this one until it exits — the same terminal
-# stop_session reads its y/N from. It always waits for a key: unlike ctrl-o,
-# nothing else takes the focus, and what was attached is worth reading.
+# stop_session reads its y/N from. Once a document is attached it waits for a
+# key: unlike ctrl-o, nothing else takes the focus, and what was attached is
+# worth reading.
+#
+# The picker runs here, not inside `wts doc use ""`: esc, or enter on a filter
+# that matches nothing, picks no document, and then there is nothing to read.
+# Picked inside, that was a blank screen saying "press any key" — the README
+# demo showed it for several releases after its "2" went to fzf as a filter.
 #
 # On a task row the document goes on the TASK instead, which is the difference
 # that matters: attached to a session it is gone at the merge, attached to the
@@ -1371,10 +1377,13 @@ attach_doc() { # $1 = session name, $2 = preview target
     wait_key
     return 0
   fi
+  local slug
+  slug=$("$WTS_CMD" doc pick) || { print -n "press any key"; wait_key; return 0 }
+  [[ -n "$slug" ]] || return 0
   if [[ -z "$name" ]]; then
-    "$WTS_CMD" task doc "${target#task:}"
+    "$WTS_CMD" task doc "${target#task:}" "$slug"
   else
-    "$WTS_CMD" doc use "" "$name"
+    "$WTS_CMD" doc use "$slug" "$name"
   fi
   print -n "press any key"
   wait_key
