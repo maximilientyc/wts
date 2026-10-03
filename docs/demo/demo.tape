@@ -96,17 +96,20 @@ Sleep 1500ms
 # attaches the document to a session already running, and types the reference
 # into its pane — no restart, no re-pasting.
 #
-# The picker ctrl-e opens is the numbered one, not the fzf one: under fzf's
-# `execute` stdout is not a tty (stdin and stderr are), so pick_doc's
-# `-t 0 && -t 1` test fails and it degrades rather than give up. "2" is the
-# conventions document: record.zsh seeds big-repo first, scene 1 appends it.
+# ctrl-e opens the library's fzf picker (pick_doc tests -t 0 and -t 2, which
+# fzf's `execute` provides), so the document is picked by typing part of its
+# slug, never by a number: a "2" here was a filter that matched nothing, and the
+# take showed an empty screen. record.zsh seeds big-repo, scene 1 adds
+# conventions.
 Type "stale"
 Sleep 1s
 Ctrl+E
-Sleep 2500ms
-Type "2"
-Sleep 1s
+Wait+Screen@10s /doc>/
+Sleep 1500ms
+Type "conv"
+Sleep 1500ms
 Enter
+Wait+Screen@15s /press any key/
 Sleep 4s
 Enter
 Sleep 2500ms

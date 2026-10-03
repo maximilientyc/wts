@@ -829,6 +829,47 @@ check "the picker shows the whole title, not its first two words" \
 check "the picker shows the kind and age columns too" \
   pane_contains pickprobe "file"
 tmux kill-session -t "=pickprobe" 2>/dev/null || true
+
+# ctrl-e when no document is picked: esc, or enter on a filter that matches
+# nothing. It used to hold a blank screen saying "press any key" -- the README
+# demo's scene 6 for several releases -- because the pick happened inside
+# `wts doc use ""`, which then exited 0 in silence. The probe says when the
+# bind's command has returned.
+cat > "$SANDBOX/bin/ctrl-e-probe" <<EOF
+#!/bin/sh
+export PATH="$PATH"
+export XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_STATE_HOME="$XDG_STATE_HOME"
+"$SWITCH" --doc docsess docsess
+echo ctrl-e-probe-back
+exec sleep 30
+EOF
+chmod +x "$SANDBOX/bin/ctrl-e-probe"
+tmux new-session -d -s ctrleprobe -x 100 -y 20 "$SANDBOX/bin/ctrl-e-probe"
+pane_contains ctrleprobe "doc>" || true
+tmux send-keys -t "=ctrleprobe:" Escape
+check "ctrl-e: esc in the picker goes straight back to the list" \
+  pane_contains ctrleprobe ctrl-e-probe-back
+refute "ctrl-e: and holds no empty 'press any key' screen" \
+  pane_contains ctrleprobe "press any key"
+tmux kill-session -t "=ctrleprobe" 2>/dev/null || true
+tmux new-session -d -s ctrleprobe -x 100 -y 20 "$SANDBOX/bin/ctrl-e-probe"
+pane_contains ctrleprobe "doc>" || true
+tmux send-keys -t "=ctrleprobe:" zzqqx
+# Apart: fzf filters asynchronously, and an enter typed with the filter would
+# accept the first row before it is filtered out.
+pane_contains ctrleprobe "0/" || true
+tmux send-keys -t "=ctrleprobe:" Enter
+check "ctrl-e: enter on a filter that matches nothing goes back too" \
+  pane_contains ctrleprobe ctrl-e-probe-back
+tmux kill-session -t "=ctrleprobe" 2>/dev/null || true
+tmux new-session -d -s ctrleprobe -x 100 -y 20 "$SANDBOX/bin/ctrl-e-probe"
+pane_contains ctrleprobe "doc>" || true
+tmux send-keys -t "=ctrleprobe:" contra
+pane_contains ctrleprobe "1/" || true
+tmux send-keys -t "=ctrleprobe:" Enter
+check "ctrl-e: a document picked by its slug is attached, then a key is awaited" \
+  eval 'pane_contains ctrleprobe "press any key" && [[ "$(reg_field docsess docs)" == *contract* ]]'
+tmux kill-session -t "=ctrleprobe" 2>/dev/null || true
 "$WTS" doc forget contract >/dev/null
 
 "$WTS" rm docsess -f >/dev/null

@@ -792,7 +792,8 @@ use_doc() {  # <slug|""> <session> <worktree> <workdir>
   local slug="$1" session="$2" worktree="$3" workdir="${4:-$3}"
   if [[ -z "$slug" ]]; then
     slug=$(pick_doc) || return 1
-    [[ -n "$slug" ]] || return 0
+    # Said, as `wts task doc` says it: a silent exit 0 read as "attached".
+    [[ -n "$slug" ]] || { print -u2 -r -- "wts doc: no document chosen"; return 1 }
   fi
   doc_exists "$slug" || die "wts doc: '$slug' is not in the library (wts doc ls)"
   ensure_fresh "$slug"
