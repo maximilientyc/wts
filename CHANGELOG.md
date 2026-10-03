@@ -1,9 +1,12 @@
 # Changelog
 
-## Unreleased
+## 1.7.0 — 2026-10-03
 
-Schema 7: three new tables (`usage`, `pr_state`, `merge_checks`), created on
-the first command.
+After upgrading: `wts setup claude --install` (the skill lists the new
+`wts status --json` keys). A layout of your own that types
+`claude #{task.shellescape}` still loses a long phrase: read `WTS_PROMPT_FILE`
+as the built-in `default.yml` does. Schema 7: three new tables (`usage`,
+`pr_state`, `merge_checks`), created on the first command.
 
 - **Tokens and cost per session and per task.** `wts brief` and the teardown
   (`wts rm`, `wts gc --apply`) sum `message.usage` from every transcript of a
