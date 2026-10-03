@@ -27,6 +27,12 @@
 # coreutils' or BSD's and they share no options, while sqlite3 is already a hard
 # dependency here. Default window: the last 180 days.
 #
+# Tokens: each session carries `usage` (input, output, cache writes and reads,
+# per model, and their API list price in cost_usd), each work item the total of
+# its sessions — what a task cost across all its attempts. Counted from the
+# transcripts by wts brief and at teardown (see usage_store in wts-db.zsh);
+# null where that never happened. Not what a subscription bills.
+#
 # PRIVACY: this is the most sensitive thing wts prints. Prompts, commit subjects,
 # file paths, the agents' notes and your own task notes all come out on stdout.
 # --no-notes drops the free text, --brief drops the bulk, and WTS_NO_ARCHIVE=1
@@ -135,12 +141,13 @@ archived=$(db_ro "
                          'error', retro_error),
     'transcript', json_object('path', transcript,
                               'session_id', claude_session,
-                              'bytes', transcript_bytes))), json('[]'))
+                              'bytes', transcript_bytes),
+    'usage', json($(usage_json_sql ar.session ar.created_at)))), json('[]'))
   FROM (SELECT * FROM archive
         WHERE finished_at >= $(sql_str "$since_iso")
           AND finished_at <= $(sql_str "$until_iso")
           $task_filter
-        ORDER BY finished_at)" 2>/dev/null)
+        ORDER BY finished_at) ar" 2>/dev/null)
 [[ -n "$archived" ]] || archived='[]'
 
 # Live sessions: work in flight when the review is written is still work. Not
@@ -180,7 +187,8 @@ live=$(db_ro "
                        WHERE session = s.name), json('{}')),
     'retro', json_object('delivered', '', 'resisted', '', 'resolved', '',
                          'abandoned', '', 'model', '', 'error', ''),
-    'transcript', json_object('path', '', 'session_id', '', 'bytes', 0))), json('[]'))
+    'transcript', json_object('path', '', 'session_id', '', 'bytes', 0),
+    'usage', json($(usage_json_sql s.name s.created_at)))), json('[]'))
   FROM sessions s LEFT JOIN task_links t ON t.session = s.name
   WHERE s.created_at <= $(sql_str "$until_iso")
     AND NOT EXISTS (SELECT 1 FROM archive x
@@ -260,7 +268,7 @@ jq -n \
     | {
         name, repo: ($s.repo_root | split("/") | last),
         branch, base, state, created_at, finished_at,
-        prompt, context, title, docs, outcome, pr_url, diff, retro,
+        prompt, context, title, docs, outcome, pr_url, diff, retro, usage,
         transcript: ($s.transcript + {available:
           ($s.transcript.path != ""
            and (($ARGS.positional | index($s.transcript.path)) != null))}),
@@ -269,6 +277,18 @@ jq -n \
         files: (if $brief then [] else ($s.files_raw | lines) end),
         notes: (if $notes and ($brief | not) then $s.notes else {} end),
       };
+
+  # The usage of a work item: that of its sessions added up. null
+  # when none of them was ever summed, rather than a zero that reads as free.
+  def total_usage:
+    [.[] | .usage | select(. != null)]
+    | if length == 0 then null else {
+        input: (map(.input) | add), output: (map(.output) | add),
+        cache_write: (map(.cache_write) | add), cache_read: (map(.cache_read) | add),
+        tokens: (map(.tokens) | add), messages: (map(.messages) | add),
+        cost_usd: (map(.cost_usd) | add * 10000 | round / 10000),
+        cost_complete: all(.cost_complete),
+        sessions: length } end;
 
   # Every task wts knows about: the live Things rows win over the snapshots,
   # because the snapshot is a fallback and not a cache to be trusted.
@@ -297,6 +317,7 @@ jq -n \
                    else "completed" end),
           completed_at: (if $t then $t.completed_at
                          else ([.[] | .finished_at | select(. != null)] | max // "") end),
+          usage: total_usage,
           sessions: [.[] | session] | sort_by(.created_at),
         } ]
   as $with_sessions
@@ -312,7 +333,7 @@ jq -n \
           id: .id, source: .source, title: .title,
           notes: (if ($notes and ($brief | not)) then .notes else "" end),
           links: (if $notes then .links else [] end),
-          status: .status, completed_at: .completed_at, sessions: [],
+          status: .status, completed_at: .completed_at, usage: null, sessions: [],
         } ]
   as $taskonly
 

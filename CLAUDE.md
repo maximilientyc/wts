@@ -225,6 +225,18 @@ straight from the checkout. Scripts locate each other from their own path
 - `cmd | grep -q` under `pipefail` (the smoke test) fails when `cmd` prints
   more after the first match: grep quits, the rest hits a closed pipe, and the
   pipeline's status is that of `cmd`. Capture with `out=$(cmd)` and test `$out`.
+- A smoke `check … eval '…'` runs in the test's own shell: an `exit` inside it
+  ends the whole run, with no FAIL line, and the next checks silently never
+  run. Do the setup and the cleanup outside the check, as plain statements.
+- Claude Code names a transcript directory after the **resolved** working
+  directory: a sandbox under `/tmp` registers its worktrees as `/private/tmp/…`,
+  and a transcript written by hand under a `-tmp-…` project is never found.
+  Build the path from `${D:A}` (`docs/demo/token-cost.zsh`), or from the
+  registry's `worktree`.
+- Claude Code writes one transcript record per content block of an assistant
+  message, each repeating the message's `usage`: summing records counts a turn
+  with thinking, text and a tool call three times. One per `message.id`
+  (`usage_store` in `wts-db.zsh`).
 - The status of a `while` loop is that of the last body command: a loop ending
   on `[[ cond ]] && print …` returns 1 whenever the condition was false on the
   last row, and a function ending on that loop returns it. `wts task show`

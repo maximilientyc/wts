@@ -267,7 +267,14 @@ cmd_store() {
            $added, $removed, $commit_count, $file_count,
            $(sql_str "$kept"), $(sql_str "$sid"), $bytes, $mtime,
            s.created_at, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-    FROM sessions s WHERE s.name = $(sql_str "$session")" >/dev/null 2>&1
+    FROM sessions s WHERE s.name = $(sql_str "$session")" >/dev/null 2>&1 || return 1
+
+  # The last count of what the session consumed, while the registry row still
+  # says where its transcripts are; the rows are keyed like the archive row, so
+  # they stay with it once the session is gone. Every transcript and not only
+  # the one above: a /clear starts a new file, and subagents write their own.
+  usage_refresh "$session"
+  return 0
 }
 
 # ─── write ───────────────────────────────────────────────────────────────────
@@ -366,6 +373,25 @@ retro_one() {
          WHERE id = $(sql_str "${ids[$idx]}")" >/dev/null 2>&1
 }
 
+# Archive rows from before the usage table existed: their kept transcript, while
+# it is there, still holds every usage record. One pass each, then never again
+# (usage_store remembers the file). The main transcript only: that is all the
+# archive kept.
+usage_backfill() {
+  local out row
+  local -a f
+  out=$(db_rows "SELECT session, created_at, transcript FROM archive a
+                 WHERE transcript != '' AND NOT EXISTS (
+                   SELECT 1 FROM usage u
+                   WHERE u.session = a.session AND u.created_at = a.created_at)" 2>/dev/null)
+  for row in "${(@ps:\x1e:)out}"; do
+    f=("${(@ps:\x1f:)row}")
+    [[ -n "${f[3]:-}" && -f "${f[3]}" ]] || continue
+    usage_store "${f[1]}" "${f[2]:-}" "${f[3]}"
+  done
+  return 0
+}
+
 cmd_write() {
   local force=false a expect_jobs=false
   typeset -a want
@@ -382,6 +408,7 @@ cmd_write() {
   JOBS=$(num "$JOBS"); (( JOBS > 0 )) || JOBS=1
 
   db_init 2>/dev/null || return 1
+  usage_backfill
 
   local filter="retro_delivered = ''"
   $force && filter="1 = 1"
