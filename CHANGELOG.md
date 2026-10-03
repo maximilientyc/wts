@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.8.2 — 2026-10-03
 
 - **`wts gc` finds a squashed branch after a release.** The content test of
   1.8.1 (`git merge-tree`) conflicts once the base rewrote the lines a squash
