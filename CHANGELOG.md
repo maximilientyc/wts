@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- **A squash of several commits reads merged.** The content test compared
+  patch-ids commit by commit, and a squash lands as one combined diff that
+  matches none of them: #39 and #40 (4 and 3 commits) read `merged: false` in
+  `wts status --json`, `wts gc` left them out of the teardown, and `wts rm -f`
+  archived them `abandoned`. A branch now also counts as landed when merging it
+  into the base would change nothing (`git merge-tree --write-tree` gives the
+  base's own tree; git 2.38+, run only when the patch-ids say no — one call
+  per unmerged branch), and when gh saw its pull request merged with the
+  branch's current tip as its head. A commit added after the squash, or after
+  the PR's head, still reads unmerged; a branch whose commits cancel out does
+  too. Status, gc, `wts rm` and the archive's outcome share this one verdict.
+- **`wts rm -f` archives a landed branch as `merged` or `squashed`.** `-f` used
+  to skip the test and write `abandoned` whatever the branch held.
+- Schema 8: `pr_state` has a `head` column (the PR's head sha, from
+  `wts pr --refresh`), added to an existing database on the next command. The
+  cached verdicts in `merge_checks` are recomputed once.
+
 ## 1.8.0 — 2026-10-03
 
 - **The switcher at ten sessions and more.** Its first line counts the

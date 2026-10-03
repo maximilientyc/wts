@@ -53,8 +53,11 @@
 # Why `git branch --merged` is not enough: it only recognizes merges by
 # ancestry. PRs merged by squash or rebase rewrite SHAs, so the branch is never
 # an ancestor of the base and `--merged` does not see it. So we also compare by
-# patch-id, the test behind `git cherry`: merge_scope, merge_content and
-# merge_is_new in wts-db.zsh, which the collector and `wts rm` share.
+# patch-id, the test behind `git cherry`, then by a three-way merge that would
+# change nothing (a squash of several commits matches none of their
+# patch-ids), and takes a pull request gh saw merged at the branch's tip as a
+# witness: merge_scope, merge_content, merge_pr_landed and merge_is_new in
+# wts-db.zsh, which the collector and `wts rm` share.
 #
 # Caution:
 #   - only <repo>-worktrees/ is scanned for husks, and a folder that has a
@@ -491,7 +494,7 @@ if [[ -n "$base" ]]; then
       continue
     fi
 
-    if merge_content "$b"; then
+    if merge_content "$b" || merge_pr_landed "$b"; then
       if merge_is_new "$b"; then
         new_branches+=("$b")
         continue

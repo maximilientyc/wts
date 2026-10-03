@@ -1369,13 +1369,14 @@ if [[ "$1" == "rm" ]]; then
   # wts-db.zsh, gc's test). It names the archive's outcome, and lets step 3
   # delete a squash-merged branch, which `branch -d` refuses: ctrl-d on a row
   # the switcher shows as merged ended on "not merged (use -f)", the branch
-  # left behind for gc.
+  # left behind for gc. Asked under -f too: -f deletes the branch either way,
+  # but a squash-merged session archived `abandoned` lied about how it ended.
   LANDED=""
   RM_BRANCH="$REG_BRANCH"
   if [[ -d "$worktree_path" ]]; then
     RM_BRANCH=$(git -C "$worktree_path" rev-parse --abbrev-ref HEAD 2>/dev/null) || RM_BRANCH="$REG_BRANCH"
   fi
-  if [[ "$FORCE" != true && -n "$RM_BRANCH" && "$RM_BRANCH" != HEAD && -d "$repo_root" ]]; then
+  if [[ -n "$RM_BRANCH" && "$RM_BRANCH" != HEAD && -d "$repo_root" ]]; then
     merge_base_of "$repo_root"
     merge_scope "$repo_root" "$MERGE_BASE" "$MERGE_BASE_REF" "$RM_BRANCH"
     if merge_verdict "$RM_BRANCH"; then
@@ -1412,11 +1413,12 @@ if [[ "$1" == "rm" ]]; then
                            refs/remotes/origin/HEAD 2>/dev/null || true)
         base_for_retro="${base_for_retro#origin/}"
       fi
-      # -f is the caller saying they know the branch did not land.
-      if [[ "$FORCE" == true ]]; then
-        retro_outcome=abandoned
-      elif [[ -n "$LANDED" ]]; then
+      # -f is the caller saying the branch may go whatever it holds: abandoned,
+      # unless it did land.
+      if [[ -n "$LANDED" ]]; then
         retro_outcome="$LANDED"
+      elif [[ "$FORCE" == true ]]; then
+        retro_outcome=abandoned
       else
         retro_outcome=removed
       fi

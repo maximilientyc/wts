@@ -29,7 +29,7 @@
 
 WTS_STATE_DIR="${WTS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wts}"
 WTS_DB="${WTS_DB:-$WTS_STATE_DIR/wts.db}"
-WTS_DB_SCHEMA=7
+WTS_DB_SCHEMA=8
 # Where the helpers are, for the few functions below that call one. Top level:
 # when this file is sourced, $0 is this file.
 WTS_DB_HOME="${0:A:h}"
@@ -204,6 +204,22 @@ INSERT OR IGNORE INTO doc_cache
          coalesce(json_extract(m, '\$.error'), ''), json_extract(m, '\$.truncated')
   FROM (SELECT readfile($(sql_str "$f")) AS m) WHERE json_valid(m);"
   done
+
+  # A column on an existing table, which CREATE TABLE IF NOT EXISTS never adds.
+  # SQLite has no ADD COLUMN IF NOT EXISTS, and a duplicate column fails the
+  # statement: so it runs on its own, before the schema's transaction, only when
+  # the column is missing, and a loser of a race between two first runs fails
+  # harmlessly. Checked again after: the version is not raised over a table
+  # still without it, and the next command tries again.
+  if [[ "$(db_q "SELECT count(*) FROM sqlite_master WHERE name = 'pr_state'" 2>/dev/null)" == 1 ]]; then
+    if [[ "$(db_q "SELECT count(*) FROM pragma_table_info('pr_state') WHERE name = 'head'" 2>/dev/null)" != 1 ]]; then
+      db_q "ALTER TABLE pr_state ADD COLUMN head TEXT NOT NULL DEFAULT ''" >/dev/null 2>&1
+      if [[ "$(db_q "SELECT count(*) FROM pragma_table_info('pr_state') WHERE name = 'head'" 2>/dev/null)" != 1 ]]; then
+        print -u2 -r -- "⚠ wts: could not add pr_state.head to $WTS_DB"
+        return 1
+      fi
+    fi
+  fi
 
   sql="BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS sessions (
@@ -416,7 +432,9 @@ CREATE INDEX IF NOT EXISTS touches_by_path ON touches(path);
 -- normalized (approved, changes_requested, review_required; pass, fail,
 -- pending), empty when there is nothing to report. A failed call keeps the last
 -- good values and only sets error and checked_at: an expired gh login must not
--- erase what the list showed. Dropped with its session.
+-- erase what the list showed. head is the sha of the PR's head commit (schema
+-- 8): a PR merged at the branch's current tip says the branch landed, even when
+-- its squash matches none of the branch's own commits. Dropped with its session.
 CREATE TABLE IF NOT EXISTS pr_state (
   session    TEXT PRIMARY KEY,
   branch     TEXT NOT NULL DEFAULT '',
@@ -428,7 +446,8 @@ CREATE TABLE IF NOT EXISTS pr_state (
   url        TEXT NOT NULL DEFAULT '',
   error      TEXT NOT NULL DEFAULT '',
   fetched_at INTEGER NOT NULL DEFAULT 0,
-  checked_at INTEGER NOT NULL DEFAULT 0
+  checked_at INTEGER NOT NULL DEFAULT 0,
+  head       TEXT NOT NULL DEFAULT ''
 );
 -- Whether a session's branch is in its base, squash and rebase included
 -- (merge_verdict below), for one pair of tips. The patch-id test reads the
@@ -475,6 +494,10 @@ CREATE TABLE IF NOT EXISTS usage (
   PRIMARY KEY (session, created_at, transcript, model, speed)
 );
 $imports
+-- merge_checks is a cache of verdicts: a schema change may come with a new
+-- test (8: squashes of several commits), and an old verdict stays until a tip
+-- moves. Recomputed on the next collector pass.
+DELETE FROM merge_checks;
 PRAGMA user_version = $WTS_DB_SCHEMA;
 COMMIT;"
   if ! print -r -- "$sql" | db_q >/dev/null; then
@@ -778,12 +801,22 @@ db_current_session() {
 # branch whose every commit has an equivalent in the base is entirely present
 # in it, whatever the merge mode.
 #
+# Patch-ids alone miss the most common merge of all: a squash of SEVERAL
+# commits lands as one combined diff, which matches none of them. #39 and #40
+# (4 and 3 commits) read merged:false, gc left them out and `wts rm -f`
+# archived them `abandoned`. Two more witnesses cover it: a three-way merge of
+# the branch into the base that changes nothing (merge_tree_landed), and a pull
+# request gh saw merged at the branch's current tip (MERGE_PR_HEAD).
+#
 # The caller picks a repository with merge_scope, then asks per branch. The
 # results live in globals, not on stdout: called as `$(…)`, the per-repository
 # hashes would be computed again for every branch (see CLAUDE.md).
-typeset -gA MERGE_ANCESTRY MERGE_TRACK _MERGE_BASE_PID _MERGE_TIP_DATE _MERGE_OWN_PID
-typeset -g MERGE_ROOT="" MERGE_BASE="" MERGE_BASE_REF=""
+typeset -gA MERGE_ANCESTRY MERGE_TRACK MERGE_TIP MERGE_PR_HEAD
+typeset -gA _MERGE_BASE_PID _MERGE_TIP_DATE _MERGE_OWN_PID
+typeset -g MERGE_ROOT="" MERGE_BASE="" MERGE_BASE_REF="" _MERGE_BASE_TREE=""
 typeset -gi _MERGE_LOADED=0
+# -1 unknown, 0 no, 1 yes: whether git has `merge-tree --write-tree` (2.38).
+typeset -gi _MERGE_TREE_OK=-1
 typeset -ga _MERGE_ONLY
 
 # The base of a repository, as wts-status and wts-gc detect it: WTS_BASE_BRANCH,
@@ -823,15 +856,27 @@ merge_scope() {  # <repo_root> <base> <base_ref> [branch...]
   MERGE_ROOT="$1" MERGE_BASE="$2" MERGE_BASE_REF="$3"
   shift 3
   _MERGE_ONLY=("$@")
-  _MERGE_LOADED=0
-  MERGE_ANCESTRY=() MERGE_TRACK=() _MERGE_BASE_PID=() _MERGE_TIP_DATE=() _MERGE_OWN_PID=()
-  local b tr
-  local -a refs
+  _MERGE_LOADED=0 _MERGE_BASE_TREE=""
+  MERGE_ANCESTRY=() MERGE_TRACK=() MERGE_TIP=() MERGE_PR_HEAD=()
+  _MERGE_BASE_PID=() _MERGE_TIP_DATE=() _MERGE_OWN_PID=()
+  local b tr tip row key
+  local -a refs f
   if (( $# )); then refs=("${@/#/refs/heads/}"); else refs=(refs/heads/); fi
-  while IFS=$'\x1f' read -r b tr; do
-    [[ -n "$b" ]] && MERGE_TRACK[$b]="$tr"
+  while IFS=$'\x1f' read -r b tr tip; do
+    [[ -n "$b" ]] || continue
+    MERGE_TRACK[$b]="$tr" MERGE_TIP[$b]="$tip"
   done < <(git -C "$MERGE_ROOT" for-each-ref \
-    --format='%(refname:short)%1f%(upstream:track)' "${refs[@]}" 2>/dev/null)
+    --format='%(refname:short)%1f%(upstream:track)%1f%(objectname)' "${refs[@]}" 2>/dev/null)
+  # The pull requests gh last saw merged, by branch and head: wts-pr's cache,
+  # a database read and never gh (see CLAUDE.md). The head pins it to one tip:
+  # a commit added after the merge, or a reused branch name, is not covered.
+  for row in "${(@ps:\x1e:)$(db_rows "SELECT branch, head FROM pr_state
+                                       WHERE state = 'merged' AND head != ''" 2>/dev/null)}"; do
+    f=("${(@ps:\x1f:)row}")
+    [[ -n "${f[1]:-}" && -n "${f[2]:-}" ]] || continue
+    key="${f[1]}"$'\x1f'"${f[2]}"
+    MERGE_PR_HEAD[$key]=1
+  done
   # Merged by ancestry (fast-forward or merge commit).
   if [[ -n "$MERGE_BASE" && -n "$MERGE_BASE_REF" ]]; then
     for b in "${(@f)$(git -C "$MERGE_ROOT" for-each-ref --merged "$MERGE_BASE_REF" \
@@ -895,12 +940,10 @@ merge_load() {
 }
 
 # True if every commit of <branch> has an equivalent (patch-id) in the base:
-# content entirely present, squash and rebase included. A commit with an empty
-# diff has no patch-id and nothing to be missing.
-merge_content() {  # <branch>
+# content entirely present, rebase and one-commit squash included. A commit
+# with an empty diff has no patch-id and nothing to be missing.
+merge_patch_ids() {  # <branch>
   local b="$1" cid pid
-  [[ -n "$MERGE_BASE_REF" ]] || return 1
-  [[ -n "${MERGE_ANCESTRY[$b]:-}" ]] && return 0
   merge_load
   for cid in "${(@f)$(git -C "$MERGE_ROOT" rev-list --no-merges "$b" "^$MERGE_BASE_REF" 2>/dev/null)}"; do
     [[ -n "$cid" ]] || continue
@@ -910,6 +953,61 @@ merge_content() {  # <branch>
     (( _MERGE_BASE_PID[$pid] + 86400 >= ${_MERGE_TIP_DATE[$b]:-0} )) || return 1
   done
   return 0
+}
+
+# True if merging <branch> into the base would change nothing: the three-way
+# merge of the two tips is the base's own tree, so everything the branch did
+# since the merge-base is already there, however it got there — a squash of any
+# number of commits included. One `merge-tree` per branch, whose work follows
+# the trees that differ rather than history, and only when the patch-ids said
+# no: 8 ms a branch on the small bench, mostly the fork. A branch whose net
+# change is nothing (a commit and its revert) has not landed anywhere and stays
+# out, as the patch-ids leave it: checked on a match only, the rare case. Needs
+# `merge-tree --write-tree` (git 2.38); older gits keep the patch-ids alone.
+merge_tree_landed() {  # <branch>
+  local b="$1" t mb v
+  local -a trees match mbegin mend
+  if (( _MERGE_TREE_OK < 0 )); then
+    v=$(git version 2>/dev/null)
+    _MERGE_TREE_OK=0
+    if [[ "$v" =~ '([0-9]+)\.([0-9]+)' ]] \
+         && (( match[1] > 2 || (match[1] == 2 && match[2] >= 38) )); then
+      _MERGE_TREE_OK=1
+    fi
+  fi
+  (( _MERGE_TREE_OK )) || return 1
+  if [[ -z "$_MERGE_BASE_TREE" ]]; then
+    _MERGE_BASE_TREE=$(git -C "$MERGE_ROOT" rev-parse --verify --quiet "$MERGE_BASE_REF^{tree}" 2>/dev/null)
+    [[ -n "$_MERGE_BASE_TREE" ]] || return 1
+  fi
+  # Exit 1 is a conflict: the base holds something else there, not this.
+  t=$(git -C "$MERGE_ROOT" merge-tree --write-tree --no-messages \
+        "$MERGE_BASE_REF" "$b" 2>/dev/null) || return 1
+  [[ "${t%%$'\n'*}" == "$_MERGE_BASE_TREE" ]] || return 1
+  mb=$(git -C "$MERGE_ROOT" merge-base "$MERGE_BASE_REF" "$b" 2>/dev/null) || return 1
+  trees=("${(@f)$(git -C "$MERGE_ROOT" rev-parse "$mb^{tree}" "$b^{tree}" 2>/dev/null)}")
+  (( ${#trees} == 2 )) && [[ "${trees[1]}" != "${trees[2]}" ]]
+}
+
+# True if <branch>'s content is in the base: by ancestry, by patch-id, or by a
+# merge that would change nothing. In that order, cheapest first.
+merge_content() {  # <branch>
+  local b="$1"
+  [[ -n "$MERGE_BASE_REF" ]] || return 1
+  [[ -n "${MERGE_ANCESTRY[$b]:-}" ]] && return 0
+  merge_patch_ids "$b" && return 0
+  merge_tree_landed "$b"
+}
+
+# True if gh saw a pull request of <branch> merged with the branch's current
+# tip as its head. A witness for a base not fetched yet (`wts rm` does not
+# fetch), and for a merge whose content test fails anyway (the base changed
+# the same lines again since). No witness without a recorded head: rows from
+# before schema 8 say nothing.
+merge_pr_landed() {  # <branch>
+  local key="$1"$'\x1f'"${MERGE_TIP[$1]:-}"
+  [[ -n "${MERGE_TIP[$1]:-}" ]] || return 1
+  (( ${+MERGE_PR_HEAD[$key]} ))
 }
 
 # True if <branch> was created and never received a commit. With zero commits
@@ -940,10 +1038,10 @@ merge_is_new() {  # <branch>
 
 # The whole verdict, in the merge_scope'd repository: true when <branch> landed
 # and is not merely new, with REPLY set to `merged` (ancestry) or `squashed`
-# (patch-id) — the archive's own outcome words.
+# (content or pull request) — the archive's own outcome words.
 merge_verdict() {  # <branch>
   REPLY=""
-  merge_content "$1" || return 1
+  merge_content "$1" || merge_pr_landed "$1" || return 1
   merge_is_new "$1" && return 1
   if [[ -n "${MERGE_ANCESTRY[$1]:-}" ]]; then REPLY=merged; else REPLY=squashed; fi
   return 0
