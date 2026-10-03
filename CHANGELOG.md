@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.8.0 — 2026-10-03
 
 - **The switcher at ten sessions and more.** Its first line counts the
   sessions per agent state (`all 12: 2 blocked 1 idle 7 working 2 done`), and
