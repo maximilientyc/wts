@@ -345,7 +345,7 @@ tmux kill-session -t "=namer" 2>/dev/null || true
 
 check "ls shows the session" eval '"$WTS" ls | grep -q "^auth-form "'
 check "status --json" eval '"$WTS" status --json | jq -e "length == 2 and all(.[]; .exists and .tmux_alive)"'
-check "status --fzf has 10 fields" eval '"$WTS" status --fzf | awk -F "\037" "NF != 10 { exit 1 }"'
+check "status --fzf has 11 fields" eval '"$WTS" status --fzf | awk -F "\037" "NF != 11 { exit 1 }"'
 
 # An interactive agent waiting for an answer needs a human: blocked, sorted first.
 jq -n --arg cwd "$WT/export-users-csv" \
@@ -387,10 +387,11 @@ check "skeleton has 3 fields" \
 check "skeleton lists the same sessions" \
   eval 'diff <("$SWITCH" --list-fast | cut -f3 | sort) <("$SWITCH" --list | cut -f3 | sort)'
 # Both go through emit, with widths measured on the same registry: if they ever
-# disagree, every column redraws shifted at the swap. The header is the first
-# line of each list, so equal headers means equal widths.
+# disagree, every column redraws shifted at the swap. The column titles are the
+# second line of each list (the counts come first), so equal titles means equal
+# widths.
 check "skeleton aligns with the collected list" \
-  eval 'diff <("$SWITCH" --list-fast | head -1) <("$SWITCH" --list | head -1)'
+  eval 'diff <("$SWITCH" --list-fast | sed -n 2p) <("$SWITCH" --list | sed -n 2p)'
 
 # Every display field of stdin is exactly $1 characters wide. zsh's ${#} counts
 # characters, unlike awk's length on macOS, so `…` costs one like any letter.
@@ -411,6 +412,45 @@ check "long cells are cut with an ellipsis" \
 check "the cut row is as wide as the others" \
   eval 'WTS_SWITCH_COLS=60 "$SWITCH" --list | same_width 60'
 tmux kill-session -t "=$LONG"
+
+# ─── View (ctrl-g) ───────────────────────────────────────────────────────────
+# The first header line counts the sessions per agent state, and ctrl-g keeps
+# only the ones that need you. The toggle re-emits the last pass's rows
+# (--list-cached) rather than collecting again.
+export WTS_SWITCH_VIEW="$SANDBOX/view" WTS_SWITCH_ROWS="$SANDBOX/rows"
+check "the first header line counts the sessions per state" eval '
+  l=$("$SWITCH" --list); [[ "${l%%$'\''\n'\''*}" == "all 2: 1 blocked  ^g needs you "* ]]'
+check "the skeleton counts them, states unknown" eval '
+  l=$("$SWITCH" --list-fast); [[ "${l%%$'\''\n'\''*}" == "all 2 "* ]]'
+check "fzf accepts the ctrl-g bind" \
+  eval 'printf "x\n" | fzf --bind="ctrl-g:transform(true)" --filter=x'
+chain=$("$SWITCH" --view toggle)
+check "ctrl-g turns the view on, on disk" test -e "$WTS_SWITCH_VIEW"
+check "and re-emits the cached rows under a new prompt" eval '
+  [[ "$chain" == "reload("*"--list-cached)+change-prompt(needs you> )+first" ]]'
+check "fzf parses the ctrl-g chain" eval 'printf "x\n" | fzf --bind="start:$chain" --filter=x'
+check "the view keeps only the sessions that need you" eval '
+  [[ "$("$SWITCH" --list-cached | tail -n +3 | cut -f3)" == export-users-csv ]]'
+check "and says so, with what it hides" eval '
+  l=$("$SWITCH" --list-cached); [[ "${l%%$'\''\n'\''*}" == "needs you 1/2: 1 blocked  ^g all "* ]]'
+check "the collected list keeps the view" eval '
+  [[ "$("$SWITCH" --list | tail -n +3 | cut -f3)" == export-users-csv ]]'
+check "the view keeps the columns of every row" eval '
+  diff <("$SWITCH" --list-cached | sed -n 2p) <("$SWITCH" --list-fast | sed -n 2p)'
+check "filtered rows are padded and have 3 fields" eval '
+  WTS_SWITCH_COLS=60 "$SWITCH" --list-cached | same_width 60 \
+  && "$SWITCH" --list-cached | awk -F "\t" "NF != 3 { exit 1 }"'
+check "the skeleton ignores the view" eval '
+  [[ $("$SWITCH" --list-fast | tail -n +3 | wc -l) -eq 2 ]]'
+check "leaving reply mode keeps the view's prompt" eval '
+  [[ "$(WTS_SWITCH_REPLY="$SANDBOX/no-reply" "$SWITCH" --reply leave)" == *"change-prompt(needs you> )"* ]]'
+chain=$("$SWITCH" --view toggle)
+check "ctrl-g again shows every row" eval '
+  [[ ! -e "$WTS_SWITCH_VIEW" && "$chain" == *"change-prompt(session> )"* \
+     && $("$SWITCH" --list-cached | tail -n +3 | wc -l) -eq 2 ]]'
+check "ctrl-g is in the key table" eval '
+  out=$("$ROOT/libexec/wts/wts-keys"); [[ "$out" == *$'\''\n'\''"  ^g      only what needs you"* ]]'
+unset WTS_SWITCH_VIEW WTS_SWITCH_ROWS
 
 # fzf exits 2 on an unknown --bind action, and in a popup that means the frame
 # closes without a word. --filter validates binds headlessly, so the actions the
@@ -487,7 +527,7 @@ check "an empty reply sends a bare Enter" \
 check "a drifted cursor does not retarget the reply" pane_shows auth-form wts-reply-pinned
 chain=$("$SWITCH" --reply esc)
 check "esc leaves reply mode" \
-  eval 'print -r -- "$chain" | grep -q "^enable-search+.*rebind(ctrl-d,ctrl-x,ctrl-e,ctrl-t)" && [[ ! -e "$WTS_SWITCH_REPLY" ]]'
+  eval 'print -r -- "$chain" | grep -q "^enable-search+.*rebind(ctrl-d,ctrl-x,ctrl-e,ctrl-t,ctrl-g)" && [[ ! -e "$WTS_SWITCH_REPLY" ]]'
 check "fzf parses the leave chain" fzf_parses "$chain"
 check "tab toggles back out too" \
   eval '"$SWITCH" --reply toggle auth-form auth-form >/dev/null && "$SWITCH" --reply toggle auth-form auth-form | grep -q "^enable-search" && [[ ! -e "$WTS_SWITCH_REPLY" ]]'
@@ -543,12 +583,12 @@ check "? collapses it again" \
   eval '"$SWITCH" --keys toggle "" >/dev/null && [[ ! -e "$WTS_SWITCH_HELP" ]]'
 chain=$("$SWITCH" --reply toggle auth-form auth-form)
 check "reply mode unbinds ? and repaints the footer" \
-  eval 'print -r -- "$chain" | grep -qF "unbind(ctrl-d,ctrl-x,ctrl-e,ctrl-t,?)" &&
+  eval 'print -r -- "$chain" | grep -qF "unbind(ctrl-d,ctrl-x,ctrl-e,ctrl-t,ctrl-g,?)" &&
         print -r -- "$chain" | grep -qF "change-footer|enter send"'
 check "fzf parses the reply chain with its footer" fzf_parses "$chain"
 chain=$("$SWITCH" --reply esc)
 check "leaving reply mode rebinds ? and puts the list's keys back" \
-  eval 'print -r -- "$chain" | grep -qF "rebind(ctrl-d,ctrl-x,ctrl-e,ctrl-t,?)" &&
+  eval 'print -r -- "$chain" | grep -qF "rebind(ctrl-d,ctrl-x,ctrl-e,ctrl-t,ctrl-g,?)" &&
         print -r -- "$chain" | grep -qF "change-footer|enter switch"'
 check "fzf parses the leave chain with its footer" fzf_parses "$chain"
 unset WTS_SWITCH_FOOTER
@@ -683,8 +723,8 @@ check "a pass over unchanged tips reads the merge verdict from its cache" \
   eval '! grep -qE -- "--merged|patch-id" "$WTS_SMOKE_BRANCHLOG"'
 
 # --no-git: agent and tmux columns only, git columns "-", same field count.
-check "status --fzf --no-git keeps 10 fields" \
-  eval '"$ROOT/libexec/wts/wts-status" --fzf --no-git | awk -F "\037" "NF != 10 { exit 1 }"'
+check "status --fzf --no-git keeps 11 fields" \
+  eval '"$ROOT/libexec/wts/wts-status" --fzf --no-git | awk -F "\037" "NF != 11 { exit 1 }"'
 check "status --fzf --no-git shows - for delta and dirty" \
   eval '"$ROOT/libexec/wts/wts-status" --fzf --no-git | awk -F "\037" "\$4 != \"-\" || \$5 != \"-\" { exit 1 }"'
 check "status --json --no-git lists every session with zeroed git columns" \
@@ -871,10 +911,20 @@ print hi > "$REPO2/README"
 git -C "$REPO2" add README
 git -C "$REPO2" commit -qm init
 refute "ls has no REPO column with one repository" eval '"$WTS" ls | head -1 | grep -q REPO'
+refute "nor the switcher" eval '"$SWITCH" --list | sed -n 2p | grep -q REPO'
 ( cd "$REPO2" && env WTS_NO_ATTACH=1 "$WTS" elsewhere smoke >/dev/null )
 check "ls adds a REPO column once sessions span two repositories" eval '
   out=$("$WTS" ls)
   [[ "${out%%$'\''\n'\''*}" == *REPO* && "$out" == *"elsewhere "*" other "* ]]'
+check "the switcher adds a REPO column too, named after the repository" eval '
+  l=$("$SWITCH" --list); [[ "$(print -r -- "$l" | sed -n 2p)" == "SESSION"*" REPO "* ]] \
+    && print -r -- "$l" | grep -q "^elsewhere[*]\{0,1\}  *other " \
+    && print -r -- "$l" | grep -q "^export-users-csv  *demo "'
+check "in the skeleton as well, same layout" \
+  eval 'diff <("$SWITCH" --list-fast | sed -n 2p) <("$SWITCH" --list | sed -n 2p)'
+check "rows with a REPO column are padded to the list width" \
+  eval 'WTS_SWITCH_COLS=70 "$SWITCH" --list | same_width 70 \
+        && WTS_SWITCH_COLS=70 "$SWITCH" --list-fast | same_width 70'
 check "gc --all collects every repository with a session, from outside any" eval '
   out=$(cd "$SANDBOX" && "$WTS" gc --all --no-fetch)
   [[ "$out" == *"Garbage collection — demo "* && "$out" == *"Garbage collection — other "* ]]'
@@ -1626,16 +1676,24 @@ check "ctrl-t enters new-task mode" eval '
 check "fzf parses the new-task chain" fzf_parses "$chain"
 check "the new-task footer says create" eval '
   [[ "$(env WTS_SWITCH_COLS=120 "$ROOT/libexec/wts/wts-keys" --footer newtask)" == "enter create"* ]]'
+# Under ctrl-g's view, which lists no task: the new one could not be focused.
+export WTS_SWITCH_VIEW="$SANDBOX/view"
+: > "$WTS_SWITCH_VIEW"
+check "the needs-you view hides the task rows" eval '
+  out=$("$SWITCH" --list | cut -f2); [[ "$out" != *task:* ]]'
 chain=$("$SWITCH" --reply send "  Write the migration guide " "" "")
 NEWTASK=$(q "select id from tasks where title = 'Write the migration guide'")
 check "enter creates a local task, trimmed" eval '[[ "$NEWTASK" == local:* ]]'
+check "and turns the view back to every row, to show it" eval '
+  [[ ! -e "$WTS_SWITCH_VIEW" && "$chain" == *"change-prompt(session> )"* ]]'
+unset WTS_SWITCH_VIEW
 check "and leaves the mode, reloading with load rebound" eval '
   [[ ! -e "$WTS_SWITCH_REPLY" && "$chain" == enable-search+* \
      && "$chain" == *"rebind(load)+reload-sync("* ]]'
 check "fzf parses the create chain" fzf_parses "$chain"
 check "load then puts the cursor on the new task" eval '
   n=$("$SWITCH" --loaded)
-  row=$("$SWITCH" --list-fast | sed -n "$(( ${${n#*pos\(}%\)} + 1 ))p" | cut -f2)
+  row=$("$SWITCH" --list-fast | sed -n "$(( ${${n#*pos\(}%\)} + 2 ))p" | cut -f2)
   [[ "$n" == "unbind(load)+pos("* && "$row" == "task:$NEWTASK" && ! -e "$WTS_SWITCH_FOCUS" ]]'
 check "and the next load is the startup reload again" eval '
   [[ "$("$SWITCH" --loaded --no-git)" == *"reload-sync("*"--list --no-git)" ]]'
@@ -2022,10 +2080,10 @@ check "status --fzf field 9 is the PR label" eval '
 check "a PR gh saw merged reads merged and sorts last" eval '
   "$WTS" status --json | jq -e "last | .name == \"pr-link\" and .pr.state == \"merged\""'
 check "the switcher has a PR column" eval '
-  l=$("$SWITCH" --list); [[ "$(print -r -- "$l" | head -1)" == *" PR "* ]] \
+  l=$("$SWITCH" --list); [[ "$(print -r -- "$l" | sed -n 2p)" == *" PR "* ]] \
     && print -r -- "$l" | grep -q "#42 ✗ci"'
 check "the PR column is in the skeleton too, same layout" \
-  eval 'diff <("$SWITCH" --list-fast | head -1) <("$SWITCH" --list | head -1)'
+  eval 'diff <("$SWITCH" --list-fast | sed -n 2p) <("$SWITCH" --list | sed -n 2p)'
 check "rows with a PR column are padded to the list width" \
   eval 'WTS_SWITCH_COLS=70 "$SWITCH" --list | same_width 70 \
         && WTS_SWITCH_COLS=70 "$SWITCH" --list-fast | same_width 70'
@@ -2276,7 +2334,7 @@ check "ls --wide adds tokens, cost and model" eval '
   [[ "$out" == *TOKENS*COST*MODEL*SUBJECT* && "$(print -r -- "$out" | grep "^agent-a ")" == *"32k"*"\$0.03"*"opus-5-5"* ]]'
 check "plain ls does not" eval '[[ "$("$WTS" ls)" != *TOKENS* ]]'
 check "status --table --wide is the same table" eval '[[ "$("$WTS" status --table --wide)" == *TOKENS* ]]'
-check "the switcher list keeps its 10 fields (usage adds none)" eval '"$WTS" status --fzf | awk -F "\037" "NF != 10 { exit 1 }"'
+check "the switcher list keeps its 11 fields (usage adds none)" eval '"$WTS" status --fzf | awk -F "\037" "NF != 11 { exit 1 }"'
 check "--no-git, what prefix+a and wait poll, leaves it out" eval '
   "$WTS" status --json --no-git agent-a | jq -e ".[0].usage == null"'
 q "UPDATE usage SET input = 999 WHERE session = 'agent-a' AND model = 'claude-opus-5-5'"

@@ -30,6 +30,7 @@ typeset -ga KEYS
 KEYS=(
   "enter${SEP}switch${SEP}switch, or choose for the task"
   "tab${SEP}reply${SEP}reply to the agent, or note a task"
+  "^g${SEP}view${SEP}only what needs you, or every row"
   "^x${SEP}stop${SEP}stop the session, keep the worktree"
   "^d${SEP}rm${SEP}rm session, or close a local task"
   "^o${SEP}pr${SEP}open the pull request on GitHub"

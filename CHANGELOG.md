@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **The switcher at ten sessions and more.** Its first line counts the
+  sessions per agent state (`all 12: 2 blocked 1 idle 7 working 2 done`), and
+  **`ctrl-g`** toggles between every row and only the sessions that need
+  you — blocked, `stuck?`, failed, idle: what `prefix+a` cycles through —
+  with the prompt reading `needs you>`. The toggle redraws the last refresh's
+  rows at once (no git pass) and keeps the column widths; each popup opens on
+  every row. In `wts keys` and the footer.
+- **A REPO column in the switcher** once the sessions span several
+  repositories, as `wts ls` has: the main repository's name, read from the
+  worktree's `.git` file rather than asked of git on every tick.
+- `wts status --fzf` lines have 11 fields: the repository root is field 10,
+  the subject stays last. The switcher's list has two header lines (counts,
+  then column titles); the three-TAB-field row contract is unchanged.
 - **CI runs on Linux too.** The smoke test runs on `ubuntu-latest` next to
   `macos-latest` (fzf from its release, as Ubuntu's 0.44 predates the
   switcher's binds). The Things checks needed no gate: they run on fixtures

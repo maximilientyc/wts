@@ -570,7 +570,8 @@ case "$FORMAT" in
   # raw facts.
   # Fields 7 and 8, since (epoch) and waiting-for, feed the preview's header.
   # Field 9 is the PR column (db_pr_labels in wts-db.zsh, which the switcher's
-  # skeleton reads too), and the subject stays last.
+  # skeleton reads too), field 10 the repository root (the switcher's REPO
+  # column, named there without a fork), and the subject stays last.
   fzf)   typeset -a label_pairs=()
          for pr_row in "${(@ps:\x1e:)$(db_pr_labels)}"; do
            pr_f=("${(@ps:\x1f:)pr_row}")
@@ -591,6 +592,7 @@ case "$FORMAT" in
                (.agent_waiting_for | if type == "string" then . elif . == null then "" else tojson end
                 | gsub("[\\t\\n\\r\u001f\u001e]"; " ")),
                ($labels[.name] // ""),
+               (.repo_root // ""),
                subject ]
            | join("")' ;;
   # One line for a status bar, empty when nobody needs you: dead tmux sessions
