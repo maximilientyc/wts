@@ -9,7 +9,8 @@ User documentation is in `README.md`; this file is about working on the code.
 bin/wts                    entry point: dispatch, registry, layouts, normal flow
 libexec/wts/wts-status     the single collector (registry + git + tmux + claude) → --json/--table/--fzf
 libexec/wts/wts-switch     fzf popup (prefix+s) and --next (prefix+a)
-libexec/wts/wts-gc         squash-aware cleanup, dry run by default
+libexec/wts/wts-gc         squash-aware cleanup, dry run by default; asks gh which PRs
+                           merged, for the branches it would otherwise keep
 libexec/wts/wts-fresh      tmux `command-alias` entry: fetch origin/<default>, then wts
 libexec/wts/wts-name       slug from a phrase (Claude Haiku, local fallback)
 libexec/wts/wts-keys       the key table: switcher footer and `wts keys`
@@ -48,6 +49,7 @@ docs/demo/                record.zsh + demo.tape (README GIF, make demo)
                           + read-data.zsh/.tape (brief, notes, attempts, gc --all)
                           + small-fixes.zsh/.tape (names, agent states, preview, branch hint)
                           + squash-gc.zsh/.tape (gc on a squash of several commits)
+                          + release-gc.zsh/.tape (gc on a squash a release rewrote, stand-in gh)
 ```
 
 Homebrew, `make install` and a git checkout share this tree, so `bin/wts` works
@@ -92,9 +94,16 @@ straight from the checkout. Scripts locate each other from their own path
   precisely a job for the machine's own connectors, whose names differ from one
   machine to the next, so the allow list is enumerated, never hardcoded.
 - `gh` is a network round trip per session: like the model, never from `ls`,
-  the collector or the switcher's 2-second tick. Only `wts pr --refresh`, and
-  the switcher's slow timer (`wts-pr --if-older`, which claims its slot in `kv`
-  so several popups make one call). Everything else reads `pr_state`.
+  the collector or the switcher's 2-second tick. Only `wts pr --refresh`, the
+  switcher's slow timer (`wts-pr --if-older`, which claims its slot in `kv`
+  so several popups make one call), and `wts gc` (`pr_witness` in `wts-gc`).
+  gc is there because a release rewrites the lines a squash landed (CHANGELOG,
+  version), the content test then conflicts, and only a merged PR still says
+  the branch landed: waiting for someone to run `wts pr --refresh` first left
+  those branches in place. It earns the call the way it earns the model's: the
+  user typed it, it already went to the network for its fetch (no gh with
+  `--no-fetch`, or when the fetch failed), and it makes one `gh pr list` per
+  repository, not one per branch. Everything else reads `pr_state`.
 - **Another app's data is privileged on macOS 15+** (`~/Library/Containers`,
   `~/Library/Group Containers`): the first touch raises "iTerm would like to
   access data from other apps" — the *glob* raises it, before any open, and a
@@ -223,6 +232,10 @@ straight from the checkout. Scripts locate each other from their own path
   substrings **both ways**: `api-v2` resolves to `api`. Fine for `stop` and
   `brief`; a destructive verb must confirm a non-exact match, and refuse it when
   stdin is not a terminal.
+- A `$'…'` quote inside an associative array's subscript is kept literally:
+  `a[$b$'\x1f'$h]=1` stores the key `x$'\x1f'y`, and a lookup built as
+  `"$b"$'\x1f'"$h"` never finds it. Build the key in a variable first,
+  `key="$b"$'\x1f'"$h"; a[$key]=1` (`pr_witness` in `wts-gc`).
 - `$name:stop` is not "the value of name, then `:stop`": zsh reads `:s` as the
   substitution modifier (`${a[$name:stop]}` → "bad substitution"), and `:h`,
   `:t`, `:r`, `:e`, `:p` are modifiers too. Brace the parameter in a compound

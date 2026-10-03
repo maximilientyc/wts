@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+- **`wts gc` finds a squashed branch after a release.** The content test of
+  1.8.1 (`git merge-tree`) conflicts once the base rewrote the lines a squash
+  landed, and a release does exactly that (CHANGELOG `## Unreleased` →
+  `## x.y.z`, the version). The merged pull request still says it, but gc only
+  read `pr_state`, so the branch stayed until someone ran `wts pr --refresh`.
+  gc now asks gh itself after its fetch: one `gh pr list --state merged` per
+  repository, filtered to the branches every other test left unmerged, a PR
+  counting only when its head is the branch's current tip (a commit added
+  after the merge keeps the branch). What it learns goes to the session's
+  `pr_state`, for the switcher and `wts status --json`. Not with `--no-fetch`
+  or after a failed fetch, silently not without gh or a GitHub remote, and a
+  failing gh is named on one line; `WTS_GC_GH_TIMEOUT` (20 s) bounds it. `ls`,
+  status, the collector and the switcher's tick still never call gh.
+- **`wts retro` answers in seconds on long sessions.** Two retrospectives of a
+  few hours each failed with "no answer in 60s". The facts were never large
+  (4 KB here, capped at 20 KB): Haiku spent 4,500 tokens thinking before its
+  four lines, 45 to 63 s. The headless calls of `wts retro`, `wts brief` and
+  naming now run with thinking off (`alwaysThinkingEnabled: false`): the same
+  two retros take 3.7 and 4.5 s, with the same content. A timeout now names
+  `WTS_RETRO_TIMEOUT`.
+
 ## 1.8.1 — 2026-10-03
 
 - **A squash of several commits reads merged.** The content test compared

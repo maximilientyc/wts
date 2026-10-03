@@ -63,6 +63,7 @@ fi
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 # Headless call: same options, for the same reasons, as wts-name.
+# Thinking off: see ask_claude in wts-retro (45 s of it for four lines).
 # ask_claude <errfile> — stderr goes to that file rather than /dev/null: a
 # rejected model id and a timeout used to leave the same silence, impossible to
 # diagnose on someone else's machine.
@@ -71,7 +72,7 @@ ask_claude() {
     cd "$WTS_STATE_DIR" 2>/dev/null || cd /
     perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" \
       claude -p --model "$MODEL" --safe-mode --strict-mcp-config \
-        --no-session-persistence --settings '{"disableAllHooks":true}' \
+        --no-session-persistence --settings '{"disableAllHooks":true,"alwaysThinkingEnabled":false}' \
         --tools "" --system-prompt "$SYSTEM_PROMPT"
   ) 2>"$1"
 }

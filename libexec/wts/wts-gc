@@ -57,7 +57,10 @@
 # change nothing (a squash of several commits matches none of their
 # patch-ids), and takes a pull request gh saw merged at the branch's tip as a
 # witness: merge_scope, merge_content, merge_pr_landed and merge_is_new in
-# wts-db.zsh, which the collector and `wts rm` share.
+# wts-db.zsh, which the collector and `wts rm` share. That last witness is
+# asked of gh by gc itself after its fetch, for the branches the content tests
+# left unmerged (pr_witness below): a release rewrites the lines a squash
+# landed, and only the pull request still says it merged.
 #
 # Caution:
 #   - only <repo>-worktrees/ is scanned for husks, and a folder that has a
@@ -80,7 +83,8 @@
 #     ONE path on a case-insensitive filesystem, so neither can be locked nor
 #     verified separately, and the transaction aborts.
 #
-# Variables: WTS_LOCK_STALE_AFTER (300 s before an index.lock counts as stale).
+# Variables: WTS_LOCK_STALE_AFTER (300 s before an index.lock counts as stale),
+#            WTS_GC_GH_TIMEOUT (20 s for the one `gh pr list`, see pr_witness).
 
 set -uo pipefail
 
@@ -175,6 +179,8 @@ if $JSON; then
   exec 3>&1 >/dev/null
 fi
 fetch_state=skipped
+# Whether origin answered: the one condition for asking gh below.
+remote_ok=false
 
 # The main worktree, not --show-toplevel: run from inside a session — where an
 # agent always is — that named the session's worktree, and gc reported on
@@ -269,6 +275,7 @@ if $FETCH && [[ -n "$(git -C "$repo_root" remote 2>/dev/null)" ]]; then
   if git -C "$repo_root" fetch --all --prune --quiet 2>"${fetch_err:-/dev/null}"; then
     print "Remote: fetch --prune ok"
     fetch_state=ok
+    remote_ok=true
   else
     print "Remote: fetch --prune FAILED"
     fetch_state=failed
@@ -278,6 +285,7 @@ if $FETCH && [[ -n "$(git -C "$repo_root" remote 2>/dev/null)" ]]; then
     # deleted are simply not part of it, so this second fetch does go through:
     # the base is fresh again and only `[gone]` stays out of reach.
     if git -C "$repo_root" fetch --all --quiet 2>/dev/null; then
+      remote_ok=true
       print "  refs updated without --prune: the base is fresh, but a deleted"
       print "  remote is not seen, so cat. 4 (orphan branches) under-reports"
     else
@@ -474,6 +482,108 @@ fi
   && print "  ($foreign_husks other folder(s) without .git, not named after a wts session: --all-branches)"
 print ""
 
+# ─── Pull requests merged on GitHub ──────────────────────────────────────────
+# The content tests miss a squash whose lines the base rewrote afterwards: the
+# three-way merge then conflicts. A release does exactly that, to the CHANGELOG
+# entry and the version every branch touches, and gc left squash-merged
+# branches alone until someone ran `wts pr --refresh`. The pull request is the
+# witness that survives it (merge_pr_landed), so gc asks gh itself — the one
+# caller of gh besides wts-pr (CLAUDE.md) — and only here: after a fetch that
+# went through, never with --no-fetch, and for the branches every other test
+# called unlanded. One `gh pr list` for the whole repository, not one call per
+# branch, filtered to those heads.
+#
+# A merged PR counts only when its head is the branch's current tip, as in
+# wts-pr: a commit added after the merge, or a reused branch name, is not
+# covered. Such a match is also written to the session's pr_state row, which
+# the switcher and `wts status --json` read; review and checks are kept. Its
+# merge_checks row goes: the busy check above ran the collector, which cached
+# "not merged" for these very tips, and kept it until a tip moved.
+#
+# Silent without gh or jq, and when the repository has no GitHub remote (gh's
+# own wording, as wts-pr matches it): a GitHub-less repository is not an error.
+# The 200 most recent merged PRs: gc runs days after a merge, not years.
+pr_witness() { # <branch...>
+  local out err errf b head num at url sess key n=0 now
+  command -v gh >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 0
+  errf=$(mktemp "${TMPDIR:-/tmp}/wts-gc-gh.XXXXXX" 2>/dev/null) || errf=""
+  out=$(cd "$repo_root" && GH_PROMPT_DISABLED=1 perl -e 'alarm shift; exec @ARGV' \
+          "${WTS_GC_GH_TIMEOUT:-20}" gh pr list --state merged --limit 200 \
+          --json number,headRefName,headRefOid,mergedAt,url 2>"${errf:-/dev/null}")
+  local rc=$?
+  [[ -n "$errf" ]] && { err=$(<"$errf"); rm -f "$errf" }
+  err="${${err:-}%%$'\n'*}"
+  if (( rc != 0 )); then
+    if [[ "$err" == *"none of the git remotes"* || "$err" == *"no git remotes"* \
+          || "$err" == *"no pull requests found"* ]]; then
+      return 0
+    fi
+    (( rc == 142 )) && err="no answer in ${WTS_GC_GH_TIMEOUT:-20}s"
+    print "Pull requests: gh failed (${err:-exit $rc}), merged PRs not consulted"
+    return 0
+  fi
+  now=${EPOCHSECONDS:-$(date +%s)}
+  while IFS=$'\x1f' read -r b head num at url; do
+    [[ -n "$b" && -n "$head" && "$head" == "${MERGE_TIP[$b]:-}" ]] || continue
+    # Through a variable, as merge_scope does: a $'..' quote inside the
+    # subscript is not the key merge_pr_landed builds.
+    key="$b"$'\x1f'"$head"
+    MERGE_PR_HEAD[$key]=1
+    (( n++ ))
+    sess=""
+    [[ -n "${branch_wt[$b]:-}" ]] && sess=$(session_for_worktree "${branch_wt[$b]}")
+    [[ -n "$sess" && "$num" == <-> ]] || continue
+    db_q "INSERT INTO pr_state (session, branch, number, state, merged_at, url, head,
+                                error, fetched_at, checked_at)
+            VALUES ($(sql_str "$sess"), $(sql_str "$b"), $num, 'merged', $(sql_str "$at"),
+                    $(sql_str "$url"), $(sql_str "$head"), '', $now, $now)
+          ON CONFLICT(session) DO UPDATE SET branch = excluded.branch,
+            number = excluded.number, state = 'merged', merged_at = excluded.merged_at,
+            url = excluded.url, head = excluded.head, error = '',
+            fetched_at = excluded.fetched_at, checked_at = excluded.checked_at;
+          DELETE FROM merge_checks WHERE session = $(sql_str "$sess")" >/dev/null 2>&1
+  done < <(print -r -- "$out" | jq -r --args '
+             .[]? | select(.headRefName as $h | $ARGS.positional | index($h))
+             | [.headRefName, (.headRefOid // ""), (.number | tostring), (.mergedAt // ""), (.url // "")]
+             | join("\u001f")' "$@" 2>/dev/null)
+  print "Pull requests: asked gh about ${#@} unmerged branch(es), $n merged at their tip"
+  return 0
+}
+
+# A branch whose content is in the base (or whose PR merged at its tip):
+# left alone if new, else a teardown, a dead branch, or held back.
+classify_landed() { # <branch>
+  local b="$1" why wt dirty
+  if merge_is_new "$b"; then
+    new_branches+=("$b")
+    return 0
+  fi
+
+  if [[ -n "${MERGE_ANCESTRY[$b]:-}" ]]; then why="merged"; else why="squashed/rebased"; fi
+  [[ "${MERGE_TRACK[$b]:-}" == "[gone]" ]] && why="$why, remote deleted"
+
+  wt="${branch_wt[$b]:-}"
+  if [[ -z "$wt" ]]; then
+    free_branches+=("$b"$'\x1f'"$why")
+  elif [[ "$wt" == "$repo_root" ]]; then
+    : # the working branch of the main repository: never touched
+  else
+    # --no-optional-locks, and not GIT_OPTIONAL_LOCKS=0 for the whole
+    # script: gc also removes worktrees and deletes branches, and those
+    # locks are not optional. Without it this status took the worktree's
+    # index.lock and raced the agent living there (see wts-status).
+    dirty=$(git -C "$wt" --no-optional-locks status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    if (( ${dirty:-0} > 0 )); then
+      held+=("$b"$'\x1f'"$wt"$'\x1f'"${dirty} modified file(s)")
+    elif [[ -n "${busy_wt[$wt]:-}" ]]; then
+      held+=("$b"$'\x1f'"$wt"$'\x1f'"agent busy (${busy_wt[$wt]})")
+    else
+      teardown+=("$b"$'\x1f'"$wt"$'\x1f'"$(session_for_worktree "$wt")"$'\x1f'"$why")
+    fi
+  fi
+  return 0
+}
+
 # ─── Classifying branches ────────────────────────────────────────────────────
 # dead   : content entirely in the base (whatever the merge mode)
 # orphan : remote gone, but some content is still missing from the base
@@ -487,42 +597,26 @@ if [[ -n "$base" ]]; then
   # Seconds per thousand branches now, but still the longest step: say so.
   (( ${#all_branches} > 200 )) && [[ -t 2 ]] \
     && print -u2 "→ classifying ${#all_branches} local branches…"
+  # Branches no content test placed in the base: the second pass below asks
+  # gh about them, then judges them again.
+  typeset -a unlanded
+  unlanded=()
   for b in "${all_branches[@]}"; do
     [[ -n "$b" && "$b" != "$base" ]] || continue
     if ! wts_branch "$b"; then
       (( foreign_branches++ ))
       continue
     fi
-
     if merge_content "$b" || merge_pr_landed "$b"; then
-      if merge_is_new "$b"; then
-        new_branches+=("$b")
-        continue
-      fi
-
-      if [[ -n "${MERGE_ANCESTRY[$b]:-}" ]]; then why="merged"; else why="squashed/rebased"; fi
-      [[ "${MERGE_TRACK[$b]:-}" == "[gone]" ]] && why="$why, remote deleted"
-
-      wt="${branch_wt[$b]:-}"
-      if [[ -z "$wt" ]]; then
-        free_branches+=("$b"$'\x1f'"$why")
-      elif [[ "$wt" == "$repo_root" ]]; then
-        : # the working branch of the main repository: never touched
-      else
-        # --no-optional-locks, and not GIT_OPTIONAL_LOCKS=0 for the whole
-        # script: gc also removes worktrees and deletes branches, and those
-        # locks are not optional. Without it this status took the worktree's
-        # index.lock and raced the agent living there (see wts-status).
-        dirty=$(git -C "$wt" --no-optional-locks status --porcelain 2>/dev/null | wc -l | tr -d ' ')
-        if (( ${dirty:-0} > 0 )); then
-          held+=("$b"$'\x1f'"$wt"$'\x1f'"${dirty} modified file(s)")
-        elif [[ -n "${busy_wt[$wt]:-}" ]]; then
-          held+=("$b"$'\x1f'"$wt"$'\x1f'"agent busy (${busy_wt[$wt]})")
-        else
-          teardown+=("$b"$'\x1f'"$wt"$'\x1f'"$(session_for_worktree "$wt")"$'\x1f'"$why")
-        fi
-      fi
-
+      classify_landed "$b"
+    else
+      unlanded+=("$b")
+    fi
+  done
+  (( ${#unlanded} )) && $remote_ok && pr_witness "${unlanded[@]}"
+  for b in "${unlanded[@]}"; do
+    if merge_pr_landed "$b"; then
+      classify_landed "$b"
     elif [[ "${MERGE_TRACK[$b]:-}" == "[gone]" ]]; then
       gone_branches+=("$b")
     fi

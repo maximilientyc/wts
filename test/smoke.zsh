@@ -1336,6 +1336,30 @@ check "a failing claude records why, and counts nothing" eval '
 check "a timeout says how long it waited" eval '
   retro_with "sleep 3" WTS_RETRO_TIMEOUT=1 >/dev/null
   [[ "$(q "select retro_error from archive where session = '\''archsess'\''")" == *"no answer in 1s"* ]]'
+# Haiku's thinking is what took the retros of long sessions past 60 s (4,500
+# tokens of it before four lines), not the size of their facts: the call turns
+# it off, and a transcript of thousands of records still yields bounded facts.
+retro_with "printf '%s\n' \"\$*\" > '$RSTUBS/args'; printf 'delivered: x\n'" >/dev/null
+check "the retro asks with thinking off" eval '
+  grep -qF "\"alwaysThinkingEnabled\":false" "$RSTUBS/args"'
+long_tr="$SANDBOX/long-transcript.jsonl"
+big=$(printf "%04000d" 0)
+for i in {1..1500}; do
+  print -r -- '{"type":"user","message":{"content":"correction number '$i': '"${big[1,300]}"'"},"timestamp":"2026-10-03T10:00:00Z"}'
+  print -r -- '{"type":"user","message":{"content":[{"type":"tool_result","content":"'"$big"'"}]}}'
+  print -r -- '{"type":"assistant","message":{"content":[{"type":"text","text":"answer '$i' '"${big[1,500]}"'"}]}}'
+done > "$long_tr"
+old_tr=$(q "select transcript from archive where session = 'archsess'")
+q "UPDATE archive SET transcript = '$long_tr' WHERE session = 'archsess'"
+print -r -- "#!/bin/sh
+wc -c > '$RSTUBS/facts-bytes'
+printf 'delivered: long\n'" > "$RSTUBS/claude"
+chmod +x "$RSTUBS/claude"
+env PATH="$RSTUBS:$PATH" WTS_NO_LLM= "$WTS" retro --force archsess >/dev/null 2>&1
+check "a transcript of several MB gives at most 20 KB of facts" eval '
+  (( $(wc -c < "$long_tr") > 5000000 && $(tr -d " " < "$RSTUBS/facts-bytes") <= 20000 )) \
+  && [[ "$(q "select retro_delivered from archive where session = '\''archsess'\''")" == long ]]'
+q "UPDATE archive SET transcript = '$old_tr' WHERE session = 'archsess'"
 check "without a model the facts stay archived and it says so" eval '
   out=$("$WTS" retro --force archsess 2>&1)
   [[ "$out" == *"no model available"* && "$out" == *"facts are archived"* ]]'
@@ -1992,6 +2016,15 @@ mkdir -p "$SANDBOX/ghbin" "$WTS_SMOKE_GHDIR"
 cat > "$SANDBOX/ghbin/gh" <<'EOF'
 #!/bin/sh
 echo "$*" >> "$WTS_SMOKE_GHLOG"
+if [ "$1 $2" = "pr list" ]; then
+  if [ -n "$WTS_SMOKE_GH_FAIL" ]; then
+    [ "$WTS_SMOKE_GH_FAIL" = 1 ] && WTS_SMOKE_GH_FAIL="error connecting to api.github.com"
+    echo "$WTS_SMOKE_GH_FAIL" >&2
+    exit 1
+  fi
+  if [ -f "$WTS_SMOKE_GHDIR/pr-list.json" ]; then cat "$WTS_SMOKE_GHDIR/pr-list.json"; else echo '[]'; fi
+  exit 0
+fi
 [ "$1 $2" = "pr view" ] || exit 1
 if [ -n "$WTS_SMOKE_GH_FAIL" ]; then
   [ "$WTS_SMOKE_GH_FAIL" = 1 ] && WTS_SMOKE_GH_FAIL="error connecting to api.github.com"
@@ -2228,6 +2261,63 @@ print "after the merge" >> "$sqp_wt/sq-pr-notes"
 git -C "$sqp_wt" commit -qam "one more, after the merge"
 check "a commit past the PR's head is not covered" eval '! sq_merged sq-pr && ! gc_tears sq-pr'
 "$WTS" rm sq-pr -f </dev/null >/dev/null 2>&1
+
+# After a release. The squash landed, then the base rewrote the very lines it
+# added (the CHANGELOG's "## Unreleased" became a version, the entry got its PR
+# number): the three-way merge conflicts and the content tests say unmerged.
+# Only the pull request still says it merged, and gc now asks gh itself, after
+# its fetch — once for the repository, never with --no-fetch.
+for s in sq-rel sq-wip; do
+  WTS_NO_ATTACH=1 WTS_BASE_BRANCH=origin/main "$WTS" "$s" smoke >/dev/null 2>&1
+done
+rel_wt=$(reg_field sq-rel worktree)
+print -r -- $'# Changelog\n\n## Unreleased\n\n- the release-proof feature\n' > "$rel_wt/RELNOTES"
+git -C "$rel_wt" add RELNOTES && git -C "$rel_wt" commit -qm "sq-rel: notes"
+sq_commits sq-rel 2
+sq_land sq-rel
+sed -e 's/^## Unreleased/## 1.0.0/' -e 's/feature$/feature (#52)/' "$sq_clone/RELNOTES" > "$sq_clone/RELNOTES.new"
+mv "$sq_clone/RELNOTES.new" "$sq_clone/RELNOTES"
+git -C "$sq_clone" commit -qam "Release 1.0.0"
+git -C "$sq_clone" push -q origin HEAD:main
+git -C "$REPO" fetch -q origin
+sq_commits sq-wip 2
+rel_tip=$(git -C "$rel_wt" rev-parse HEAD)
+wip_tip=$(git -C "$(reg_field sq-wip worktree)" rev-parse HEAD)
+check "after a release the content test misses the squash" eval '
+  ! git -C "$REPO" merge-tree --write-tree origin/main "$(reg_field sq-rel branch)" >/dev/null 2>&1 \
+  && ! gc_tears sq-rel'
+# sq-wip: gh lists it merged too, but at an older head — the commit on top is
+# real work no PR carried, and it must stay.
+print -r -- '[{"number":52,"headRefName":"'"$(reg_field sq-rel branch)"'","headRefOid":"'"$rel_tip"'",
+  "mergedAt":"2026-10-03T00:00:00Z","url":"https://github.com/o/r/pull/52"},
+ {"number":53,"headRefName":"'"$(reg_field sq-wip branch)"'","headRefOid":"'"$(git -C "$REPO" rev-parse "$wip_tip~1")"'",
+  "mergedAt":"2026-10-03T00:00:00Z","url":"https://github.com/o/r/pull/53"}]' > "$WTS_SMOKE_GHDIR/pr-list.json"
+: > "$WTS_SMOKE_GHLOG"
+PATH="$GHPATH" "$WTS" gc --no-fetch --json </dev/null >/dev/null 2>&1
+check "gc --no-fetch never asks gh" eval '[[ ! -s "$WTS_SMOKE_GHLOG" ]]'
+plan=$(PATH="$GHPATH" "$WTS" gc --json </dev/null 2>/dev/null)
+check "gc asks gh once for the repository, merged PRs only" eval '
+  [[ "$(grep -c "^pr list" "$WTS_SMOKE_GHLOG")" == 1 && "$(grep -c . "$WTS_SMOKE_GHLOG")" == 1 ]] \
+  && grep -q -- "--state merged" "$WTS_SMOKE_GHLOG"'
+check "and tears down the branch whose PR merged at its tip" eval '
+  print -r -- "$plan" | jq -e "any(.teardown[]; .session == \"sq-rel\" and (.why | startswith(\"squashed\")))"'
+check "a branch with work past its merged PR stays" eval '
+  print -r -- "$plan" | jq -e "all(.teardown[]; .session != \"sq-wip\")"'
+check "gc wrote what gh said to the session's pr_state" eval '
+  [[ "$(q "select state || '"'"'|'"'"' || number || '"'"'|'"'"' || head from pr_state where session = '"'"'sq-rel'"'"'")" == "merged|52|$rel_tip" ]]'
+check "and the collector reads it merged too" eval 'sq_merged sq-rel'
+check "gc says what it asked" eval '
+  out=$(PATH="$GHPATH" "$WTS" gc </dev/null 2>/dev/null); [[ "$out" == *"Pull requests: asked gh about "*" unmerged branch(es), "*" merged at their tip"* ]]'
+check "a repository without a GitHub remote says nothing about gh" eval '
+  out=$(PATH="$GHPATH" WTS_SMOKE_GH_FAIL="none of the git remotes configured for this repository point to a known GitHub host" \
+        "$WTS" gc </dev/null 2>/dev/null)
+  [[ "$out" != *"Pull requests"* && "$out" == *"fetch --prune ok"* ]]'
+check "a failing gh is named, and gc goes on" eval '
+  out=$(PATH="$GHPATH" WTS_SMOKE_GH_FAIL=1 "$WTS" gc </dev/null 2>/dev/null)
+  [[ "$out" == *"gh failed (error connecting"* && "$out" == *"Orphan registry"* ]]'
+rm -f "$WTS_SMOKE_GHDIR/pr-list.json"
+"$WTS" rm sq-rel -f </dev/null >/dev/null 2>&1
+"$WTS" rm sq-wip -f </dev/null >/dev/null 2>&1
 
 for s in pr-ci pr-chg pr-none pr-link; do "$WTS" rm "$s" -f </dev/null >/dev/null 2>&1; done
 
