@@ -1986,10 +1986,15 @@ print -r -- '{"type":"pr-link","prNumber":47,"prUrl":"https://github.com/o/tap/p
 PATH="$GHPATH" "$SWITCH" --list >/dev/null 2>&1
 check "ls, status and the switcher's list never call gh" eval '[[ ! -s "$WTS_SMOKE_GHLOG" ]]'
 
-# gh lives in a Homebrew prefix, never in /usr/bin: a PATH of the system
-# directories alone is a machine without it.
+# A machine without gh: the system directories, minus gh. Not /usr/bin itself,
+# where the Linux runner (and a distribution package) installs it.
+NOGH="$SANDBOX/nogh"
+mkdir -p "$NOGH"
+for f in /usr/bin/*(N*) /bin/*(N*); do
+  [[ "${f:t}" == gh || -e "$NOGH/${f:t}" ]] || ln -s "$f" "$NOGH/${f:t}"
+done
 check "pr --refresh exits 3 without gh" eval '
-  PATH=/usr/bin:/bin "$WTS" pr --refresh >/dev/null 2>&1; (( $? == 3 ))'
+  PATH="$NOGH" "$WTS" pr --refresh >/dev/null 2>&1; (( $? == 3 ))'
 out=$(PATH="$GHPATH" "$WTS" pr --refresh pr-ok pr-ci pr-chg pr-none pr-link 2>&1) || true
 check "pr --refresh prints one line per session" eval '
   [[ "$out" == *"pr-ok"*"#41 ✓"* && "$out" == *"pr-ci"*"#42 ✗ci"* && "$out" == *"pr-chg"*"#43 chg"*
