@@ -382,7 +382,13 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
       failed)         agent_state='"failed"' ;;
       stopped)        agent_state='"stopped"' ;;
       "")             agent_state=null ;;
-      *)              agent_state=$(jq -nc --arg s "$raw" '$s') ;;
+      # Outside the closed list `status --json` promises (CLAUDE.md): an agent
+      # reading the contract would meet a state it cannot know. null, and the
+      # value kept once in kv for `wts doctor` to name.
+      *)              agent_state=null
+                      db_q "INSERT OR IGNORE INTO kv VALUES
+                            ($(sql_str "agent_state.unknown:$raw"), $(sql_str "$sid"))" \
+                        >/dev/null 2>&1 ;;
     esac
 
     if [[ -n "$sid" ]]; then
@@ -393,7 +399,12 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
 
         # Staleness watchdog: pane hash compared with the previous tick.
         if [[ "$agent_state" == '"working"' ]]; then
-          cur=$(tmux capture-pane -p -t "$pane_id" 2>/dev/null | shasum | cut -d' ' -f1)
+          # Only a capture that succeeded: a dead pane hashed as the empty text,
+          # the same every tick, read `stuck?` for good and gc held its worktree.
+          cur=""
+          if pane_text=$(tmux capture-pane -p -t "$pane_id" 2>/dev/null); then
+            cur=$(print -r -- "$pane_text" | hash_stdin)
+          fi
           now=$(date +%s)
           # Split, not `read -d`: this runs inside the switcher's reload, where
           # `read -d` stops the process (see db_rows in wts-db.zsh).

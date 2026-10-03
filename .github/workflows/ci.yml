@@ -7,12 +7,27 @@ on:
 
 jobs:
   smoke:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
 
-      - name: Dependencies
+      - name: Dependencies (macOS)
+        if: runner.os == 'macOS'
         run: brew install fzf jq tmux tmuxinator
+
+      # Ubuntu's fzf (0.44) predates the binds the switcher uses and the smoke
+      # test validates (reply mode, the footer): the release binary instead.
+      - name: Dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zsh tmux jq sqlite3 tmuxinator
+          curl -fsSL https://github.com/junegunn/fzf/releases/download/v0.66.0/fzf-0.66.0-linux_amd64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin fzf
 
       - name: Lint
         run: make lint

@@ -651,18 +651,20 @@ cmd_edit() {
   take_task_arg "$@" || return 1
   id="$REPLY_TASK"
 
+  # An editor needs the terminal. Under fzf's `execute` it has one; in a pipe or
+  # a hook it does not, and vi on a pipe leaves the terminal in a broken state.
+  # Asked first: a machine without vi (a bare Linux image) said "no vi" to an
+  # agent, which has no terminal for any editor anyway.
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    print -u2 -r -- "wts task edit: needs a terminal (use: wts task note \"<text>\")"
+    return 1
+  fi
   editor="${VISUAL:-${EDITOR:-}}"
   if [[ -z "$editor" ]]; then
     if command -v vi >/dev/null 2>&1; then editor=vi; else
       print -u2 -r -- "wts task edit: no \$VISUAL, no \$EDITOR and no vi (use: wts task note)"
       return 1
     fi
-  fi
-  # An editor needs the terminal. Under fzf's `execute` it has one; in a pipe or
-  # a hook it does not, and vi on a pipe leaves the terminal in a broken state.
-  if [[ ! -t 0 || ! -t 1 ]]; then
-    print -u2 -r -- "wts task edit: needs a terminal (use: wts task note \"<text>\")"
-    return 1
   fi
 
   tmp=$(mktemp "${TMPDIR:-/tmp}/wts-task-note.XXXXXX.md") || return 1
