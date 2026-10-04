@@ -1,7 +1,10 @@
 # wts — notes for contributors (and coding agents)
 
 zsh tool: git worktree + tmuxinator session per task, with Claude Code agent state.
-User documentation is in `README.md`; this file is about working on the code.
+User documentation is `README.md` (the landing page: install, a first session,
+the command map, the keys) and one guide per subject under `docs/` (listed
+below); this file is about working on the code. A fact about what wts does
+lives in one place: change the guide that holds it, and link to it elsewhere.
 
 ## Layout
 
@@ -40,6 +43,18 @@ examples/layouts/          richer layouts, not installed as built-ins
 completions/_wts           zsh completion
 test/smoke.zsh             end-to-end test in a sandbox
 test/bench-big.zsh         speed on a generated large repository (make bench)
+docs/install.md            user guide: requirements, Homebrew, tmux and Claude integrations, doctor
+docs/sessions.md           user guide: create, names, branches, new, from tmux, stop, restore, rm
+docs/watching.md           user guide: agent states, notifications, brief, tokens and cost, PRs
+docs/switcher.md           user guide: the popup, its keys, reply mode, ctrl-g, how it refreshes
+docs/documents.md          user guide: wts doc
+docs/tasks.md              user guide: tasks, Things, task rows in the switcher
+docs/cleanup.md            user guide: wts gc, and how a merged branch is recognized
+docs/journal.md            user guide: wts log, wts retro, the archive
+docs/agents.md             user guide: SessionStart block, news, wts db, send/wait/tail
+docs/layouts.md            user guide: writing a layout, its variables
+docs/configuration.md      user guide: every WTS_* variable, base branch, monorepo, big repos
+docs/upgrading.md          user guide: 0.x to 1.0, and the rollback
 docs/big-repo-analysis.md  what that bench found, and the fixes it suggests
 docs/roadmap.md            what the 2026-09-28 review left open, ordered; read it
                            before proposing a feature, and strike what ships

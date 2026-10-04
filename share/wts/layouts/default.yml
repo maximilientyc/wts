@@ -7,7 +7,7 @@
   # it. A layout in that directory shadows the built-in one of the same name.
   # This layout adds no branch prefix (branch = session name); to get
   # feature/<name> branches, give your copy a branch_prefix header - see
-  # "Layouts" in the README, or examples/layouts/feature.yml.
+  # docs/layouts.md, or examples/layouts/feature.yml.
   #
   # Keep this file ASCII, comments included: without a UTF-8 locale (LANG=C)
   # Ruby refuses to read it.

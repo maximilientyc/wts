@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- **The README is a landing page, and the reference is one guide per subject
+  under `docs/`.** The README had grown to 1,400 lines, one release at a time:
+  the same subject sat in several sections, and how a feature works was mixed
+  with how to use it. It now holds what wts is, the install, a first session,
+  the commands, the keys and what is sent to the model. `install`, `sessions`,
+  `watching`, `switcher`, `documents`, `tasks`, `cleanup`, `journal`, `agents`,
+  `layouts`, `configuration` and `upgrading` hold the rest, usage first and
+  "How it works" last. A link to a section of the old README
+  (`README.md#upgrading-to-10`) lands on the top of the page: the content is in
+  the guide of that subject. Six statements the old text had wrong follow the
+  code: the default of `WTS_DOC_MODEL` (`$WTS_MODEL` when set, else `sonnet`),
+  the fourteen commands an agent runs without a prompt, `send`, `wait` and
+  `tail` passed through by `prefix+:` without a fetch, the restore block of
+  `default.yml`, `WTS_DOC` among the layout variables, and every command name
+  shadowing a session of that name. No behavior changes.
+
 ## 1.9.0 — 2026-10-04
 
 - **A task completed in Things leaves the switcher again**, at the next
@@ -745,7 +763,7 @@ first command; nothing existing changes shape or behaviour.
 ## 1.0.0 — 2026-09-28
 
 Major version: the state moves from files to a SQLite database. The import is
-automatic; see [Upgrading to 1.0](README.md#upgrading-to-10) for the steps and
+automatic; see [Upgrading to 1.0](docs/upgrading.md) for the steps and
 the rollback.
 
 - **All state in one SQLite database**, `${XDG_STATE_HOME:-~/.local/state}/wts/wts.db`:
