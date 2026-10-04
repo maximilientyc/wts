@@ -333,11 +333,15 @@ fi
 # `setup claude` allows it without a prompt, and its snapshot read Things — the
 # privileged read CLAUDE.md reserves for a command the user typed, with the
 # macOS dialog it raises, on behalf of an agent the user was not watching.
-# Stdin AND stderr, as for every picker: a captured stdout is still a person.
+# Stdin alone: the agent's has no terminal, a person's does. Not stderr, as a
+# picker would: every caller hides it (`fresh=$("$THINGS" tasks … 2>/dev/null)`
+# in `wts task ls`), so testing it refused the user's own `wts task ls`,
+# `wts task add <id>` and `wts log` from 1.6.0 on, without a word — and a task
+# completed in Things never left the switcher.
 # Exit 3, before the probe, so the refusal is never cached as "unavailable".
 # A fixture (WTS_THINGS_DB) is not privileged; a cron job can opt in.
 if [[ -z "${WTS_THINGS_DB:-}${WTS_NO_THINGS:-}${WTS_THINGS_FROM_SCRIPT:-}" ]] \
-   && ! [[ -t 0 && -t 2 ]]; then
+   && ! [[ -t 0 ]]; then
   print -u2 -r -- "Things is read from a terminal only (macOS asks before another app's data is read); from a script: WTS_THINGS_FROM_SCRIPT=1"
   exit 3
 fi

@@ -50,6 +50,7 @@ docs/demo/                record.zsh + demo.tape (README GIF, make demo)
                           + small-fixes.zsh/.tape (names, agent states, preview, branch hint)
                           + squash-gc.zsh/.tape (gc on a squash of several commits)
                           + release-gc.zsh/.tape (gc on a squash a release rewrote, stand-in gh)
+                          + things-done.zsh/.tape (a task done in Things leaves the switcher)
 ```
 
 Homebrew, `make install` and a git checkout share this tree, so `bin/wts` works
@@ -267,6 +268,12 @@ straight from the checkout. Scripts locate each other from their own path
   on `[[ cond ]] && print …` returns 1 whenever the condition was false on the
   last row, and a function ending on that loop returns it. `wts task show`
   exited 1 on every successful listing for that reason. End with `return 0`.
+- A terminal guard inside a helper must not test an fd its callers redirect:
+  `x=$(helper 2>/dev/null)` makes `-t 2` false for a person too. The Things
+  guard in `wts-things` tested `-t 0 && -t 2`, and every caller hides stderr,
+  which silently turned off every Things read for three releases (1.6.0 on).
+  Test `-t 0`, which is what an agent lacks, and test such a guard on a pane
+  (the smoke test's `thingsls`), not behind a stub.
 
 ## Test
 
