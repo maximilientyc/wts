@@ -166,7 +166,8 @@ wts task doc [<id>] [<url|slug>] | doc [<id>] --rm <slug> | done [<id>]
 wts layouts
 wts keys
 wts doctor [--json]
-wts db path | schema | sql "<SELECT ...>" | notes [--all] | get | set | del
+wts db path | tables | schema [<table>] | row <table> <rowid> | browse [<table>]
+wts db sql "<SELECT ...>" | notes [--all] | get | set | del
 wts setup tmux [--install] | git | claude [--install]
 wts help [<command>] | wts <command> --help | wts version
 ```
@@ -1076,8 +1077,11 @@ read and write the database only: no `git status`, no model call, about 0.1 s.
 **What an agent (or you) can do:**
 
 ```
+wts db tables [--json]                the tables, with their row and column counts
+wts db schema [<table>]               the CREATE statements, of every table or of one
+wts db row <table> <rowid> [--json]   one record, one field per line
+wts db browse [<table>]               a table, then a row, picked in fzf (a terminal only)
 wts db sql "<SELECT ...>" [--json]    read anything: sessions, briefs, notes, doc_cache...
-wts db schema                         the tables
 wts db notes [--all] [--json]         this session's notes, or everyone's
 wts db get <key>                      one note of this session
 wts db set <key> <value|->            write a note ('-' reads stdin)
@@ -1094,6 +1098,13 @@ not someone else's. `wts db sql`
 opens the database read-only and in sqlite3's safe mode (no `.shell`, no
 `ATTACH`, no `readfile`), so no query can damage the registry. `wts rm` and
 `wts gc` drop the notes of the sessions they remove.
+
+`wts db browse` is for you, in a terminal: the tables with their counts and, in
+the preview, the schema of the one under the cursor; `enter` lists its rows,
+newest first, each column cut to 24 characters, with the whole record in the
+preview; `enter` again prints that record and quits, `esc` goes back to the
+tables. Without a terminal it exits 2: an agent reads the same through
+`wts db tables` and `wts db row`.
 
 ## Driving wts from an agent
 
@@ -1123,7 +1134,9 @@ wts tail cors -n 3 --json                        # what it said last, from its t
   --json`, `wts doc ls --json`, `wts doc show <slug> --json`, `wts brief
   --cached --json` (the last summaries, no model call), `wts gc --json` (the dry
   run's plan: what would go and why; never with `--apply`), `wts doctor --json`,
-  `wts wait --json`, `wts tail --json`, and a creation's `--json`.
+  `wts wait --json`, `wts tail --json`, and a creation's `--json`. `wts db sql`,
+  `tables` and `row` answer `--json` with sqlite3's own array of rows, no
+  envelope: a row is whatever the table holds.
 - **Exit codes**: 0 done, 1 failed (a session that did not come back, a wait
   that timed out, a refused send), 2 usage (an unknown option, a typo of a
   command, a picker with no terminal, a write that takes one).

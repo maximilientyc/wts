@@ -1049,6 +1049,48 @@ check "db sql --json" \
 refute "db sql cannot write" "$WTS" db sql "DELETE FROM sessions"
 refute "db sql cannot read files" "$WTS" db sql "SELECT readfile('/etc/hosts')"
 check "the registry survived the attempt" in_registry dbsess
+
+db_tables_lists() {
+  local out
+  out=$("$WTS" db tables)
+  [[ "$out" == *$'\n'sessions$'\t'<->$'\t'<->* ]]
+}
+check "db tables lists sessions with its counts" db_tables_lists
+db_tables_json() {
+  local out
+  out=$("$WTS" db tables --json)
+  print -r -- "$out" | jq -e '.[] | select(.table == "sessions") | .rows >= 2' >/dev/null
+}
+check "db tables --json parses" db_tables_json
+db_schema_one() {
+  local out
+  out=$("$WTS" db schema sessions)
+  [[ "$out" == *"CREATE TABLE sessions"* && "$out" != *"CREATE TABLE notes"* ]]
+}
+check "db schema <table> prints that table only" db_schema_one
+refute "db schema on an unknown table fails" "$WTS" db schema no_such_table
+DBSESS_ROWID=$(q "SELECT rowid FROM sessions WHERE name = 'dbsess'")
+db_row_shows() {
+  local out
+  out=$("$WTS" db row sessions "$DBSESS_ROWID")
+  [[ "$out" == *"name = dbsess"* ]]
+}
+check "db row prints one record, one field per line" db_row_shows
+db_row_json() {
+  local out
+  out=$("$WTS" db row sessions "$DBSESS_ROWID" --json)
+  [[ "$(print -r -- "$out" | jq -r '.[0].name')" == dbsess ]]
+}
+check "db row --json" db_row_json
+refute "db row on an unknown table fails" "$WTS" db row no_such_table 1
+refute "db row on a missing rowid fails" "$WTS" db row sessions 999999
+refute "db row rejects a non-numeric rowid" "$WTS" db row sessions "1 OR 1=1"
+db_browse_no_tty() {
+  local out rc=0
+  out=$("$WTS" db browse </dev/null 2>&1) || rc=$?
+  (( rc == 2 )) && [[ "$out" == *"wts db tables"* ]]
+}
+check "db browse without a terminal exits 2 and names wts db tables" db_browse_no_tty
 refute "db set outside any session fails" eval '(cd / && "$WTS" db set k v)'
 # `wts db` is a verb an agent runs without a prompt, and --session let it
 # rewrite or delete the notes of any other session. Without a terminal, a note

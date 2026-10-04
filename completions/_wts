@@ -510,7 +510,10 @@ _wts() {
           "get:read a note of this session" \
           "set:write a note of this session" \
           "del:remove a note of this session" \
-          "schema:the tables" \
+          "tables:the tables, with their row and column counts" \
+          "schema:the CREATE statements (of one table)" \
+          "row:one record of a table" \
+          "browse:pick a table, then a row, in fzf" \
           "path:where the database is" \
           "help:usage"
       elif [[ ${words[CURRENT-1]} == --session ]]; then
@@ -523,6 +526,9 @@ _wts() {
         case ${words[3]} in
           sql) _wts_say '"<SELECT ...>" (read-only)' ;;
           get|set|del) _wts_say "key" ;;
+          schema|row|browse)
+            if [[ ${words[3]} == row && CURRENT -gt 4 ]]; then _wts_say "rowid"
+            else _wts_say "table (wts db tables)"; fi ;;
           *) _wts_say "no more arguments" ;;
         esac
       fi ;;
