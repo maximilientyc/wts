@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.9.0 — 2026-10-04
 
 - **A task completed in Things leaves the switcher again**, at the next
   `wts task ls`. `wts task add <id>` and the Things half of `wts log` work from
