@@ -125,7 +125,7 @@ tmux_alive=$(tmux list-sessions -F '#{session_name}' 2>/dev/null)
 # (the event that put the agent in its state) and what it waits for — and stand
 # in for it when it cannot be asked. Split, not `read -d`: this runs inside the
 # switcher's reload (see db_rows in wts-db.zsh).
-typeset -A ev_at ev_kind ev_msg ev_sid ev_last ev_last_at
+typeset -A ev_at ev_kind ev_msg ev_sid ev_last ev_last_at ev_last_kind
 if db_available && [[ -s "$WTS_DB" ]]; then
   ev_rows=$(db_rows "SELECT e.session, e.event, e.kind, e.message, e.claude_session, e.at
                      FROM agent_events e
@@ -143,14 +143,13 @@ if db_available && [[ -s "$WTS_DB" ]]; then
     if (( ${ev_f[6]:-0} >= ${ev_last_at[${ev_f[1]}]:-0} )); then
       ev_last_at[${ev_f[1]}]="${ev_f[6]:-0}"
       ev_last[${ev_f[1]}]="${ev_f[2]}"
+      # The kind of whatever came last, not of the notification only: an `end`
+      # carries the reason the conversation closed, and /clear is one of them.
+      ev_last_kind[${ev_f[1]}]="${ev_f[3]:-}"
       [[ -n "${ev_f[5]:-}" ]] && ev_sid[${ev_f[1]}]="${ev_f[5]}"
     fi
   done
 fi
-# A Notification whose kind means the agent cannot go on without a human.
-needs_human() { # <notification_type>
-  [[ "$1" == (permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input) ]]
-}
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -342,18 +341,26 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
   # Not a second opinion: when `claude agents` answers, its word is the state
   # and the events only date it. Without it (no claude on PATH, an agent it
   # does not list) the last event decides — prompt: working, stop: idle, a
-  # notification that needs a human: blocked — unless it is an `end`, or older
-  # than twelve hours, which is an agent that died without saying so.
+  # notification that needs a human: blocked — unless it is older than twelve
+  # hours, which is an agent that died without saying so.
+  # An `end` is the agent saying so: stopped, whatever its age. It used to
+  # leave no state at all, and `wts wait` reads no state as "not started yet":
+  # waiting for an agent that had quit timed out every time, for good. Except
+  # after /clear, which ends the conversation and keeps the agent.
   agent_source=null; agent_since=null
   p_at=${ev_at[${name}:prompt]:-0}; s_at=${ev_at[${name}:stop]:-0}
   n_at=${ev_at[${name}:notification]:-0}; n_kind="${ev_kind[$name]:-}"
+  e_at=${ev_at[${name}:end]:-0}
+  ev_state=""
   if [[ -n "$raw" || "$agent_session" != "null" ]]; then
     agent_source='"agents"'
+  elif [[ "${ev_last[$name]:-}" == end && "${ev_last_kind[$name]:-}" != clear ]]; then
+    ev_state=stopped
   elif [[ -n "${ev_last[$name]:-}" ]] && (( NOW - ${ev_last_at[$name]:-0} < 43200 )); then
-    ev_state=""
     case "${ev_last[$name]}" in
       prompt) ev_state=working ;;
       stop)   ev_state=idle ;;
+      end)    ev_state=idle ;;
       notification)
         if needs_human "$n_kind"; then ev_state=blocked
         elif [[ "$n_kind" == idle_prompt ]]; then ev_state=idle
@@ -361,12 +368,12 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
         else ev_state=idle
         fi ;;
     esac
-    if [[ -n "$ev_state" ]]; then
-      raw="$ev_state"
-      sid="${ev_sid[$name]:-}"
-      [[ -n "$sid" ]] && agent_session=$(jq -nc --arg s "$sid" '$s')
-      agent_source='"events"'
-    fi
+  fi
+  if [[ -n "$ev_state" ]]; then
+    raw="$ev_state"
+    sid="${ev_sid[$name]:-}"
+    [[ -n "$sid" ]] && agent_session=$(jq -nc --arg s "$sid" '$s')
+    agent_source='"events"'
   fi
 
   if [[ -n "$raw" || "$agent_session" != "null" ]]; then
@@ -436,8 +443,12 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
       fi ;;
     '"idle"')
       if [[ "$n_kind" == idle_prompt ]] && (( n_at > s_at )); then agent_since=$n_at
+      elif (( e_at > s_at )) && [[ "$ev_state" == idle ]]; then agent_since=$e_at
       elif (( s_at )); then agent_since=$s_at
       fi ;;
+    # Only when the `end` is what said so: `claude agents` can report stopped
+    # for an agent whose last recorded exit is a previous conversation's.
+    '"stopped"') [[ "$ev_state" == stopped ]] && (( e_at )) && agent_since=$e_at ;;
   esac
   if [[ "$agent_state" == '"blocked"' && "$agent_waiting" == null && -n "${ev_msg[$name]:-}" ]] \
      && (( n_at >= p_at )); then
@@ -502,10 +513,14 @@ all=$(printf '%s\n' "${objects[@]}" | jq -s "$SORT_KEY")
 # phrase.
 # The task this session serves rides along for the same reason: one more field
 # off the registry, and the collection loop above stays untouched.
+# `usage: null` here, filled in below when it is computed: without it --no-git
+# left the key out, where the contract says null — `.usage == null` is true of
+# a missing key too, which is how a check on it passed.
 if merged=$(print -r -- "$all" | jq --slurpfile reg <(print -r -- "$REGISTRY") \
       'map(. + {prompt: ($reg[0][.name].prompt // ""),
                 task: ($reg[0][.name].task // ""),
-                task_title: ($reg[0][.name].task_title // "")})' 2>/dev/null); then
+                task_title: ($reg[0][.name].task_title // ""),
+                usage: null})' 2>/dev/null); then
   all="$merged"
 fi
 
@@ -623,22 +638,37 @@ case "$FORMAT" in
          repos_json=$(jq -nc 'reduce range(0; $ARGS.positional | length; 2) as $i
                                 ({}; . + {($ARGS.positional[$i]): $ARGS.positional[$i + 1]})' \
                         --args "${repo_pairs[@]}")
+         # AGENT carries since when ("blocked 4m", the switcher's own format), and
+         # --wide the question a blocked agent waits on: README has `wts ls` tell
+         # "for how long, and on what question", and the table had neither —
+         # both were in --json and in the switcher preview only.
          print -r -- "$all" | jq -r --argjson git "$WITH_GIT" --argjson wide "$WIDE" \
+             --argjson now "$NOW" \
              --argjson repos "${repos_json:-"{}"}" "$SUBJECT$USAGE_CELLS"'
+           def age: if . == null then "" else ([$now - ., 0] | max) as $s
+             | if $s < 60 then " \($s)s"
+               elif $s < 3600 then " \($s / 60 | floor)m"
+               elif $s < 86400 then " \($s / 3600 | floor)h\(($s % 3600) / 60 | floor)m"
+               else " \($s / 86400 | floor)d" end end;
+           def waiting: (.agent_waiting_for // "")
+             | (if type == "string" then . else tojson end)
+             | gsub("[\\t\\n\\r]"; " ")
+             | if length > 40 then .[0:39] + "…" elif . == "" then "-" else . end;
            ([$repos[]] | unique | length > 1) as $multi
            | (["SESSION"] + (if $multi then ["REPO"] else [] end)
               + ["AGENT","BRANCH","DELTA","DIRTY","TMUX"]
-              + (if $wide then ["TOKENS","COST","MODEL"] else [] end)
+              + (if $wide then ["TOKENS","COST","MODEL","WAITING"] else [] end)
               + ["SUBJECT"] | @tsv),
            (.[] | [ .name ]
                 + (if $multi then [$repos[.repo_root // ""] // "-"] else [] end)
                 + [
-                    (if .stale then "stuck?" else (.agent_state // "-") end),
+                    ((if .stale then "stuck?" else (.agent_state // "-") end)
+                     + (if .agent_state == null then "" else (.agent_since | age) end)),
                     .branch,
                     (if $git then "+\(.added)/-\(.removed)" + (if .ahead > 0 then " ^\(.ahead)" else "" end) else "-" end),
                     (if ($git | not) then "-" elif .dirty > 0 then "yes" else "no" end),
                     (if .tmux_alive then "running" else "stopped" end) ]
-                + (if $wide then usage_cells else [] end)
+                + (if $wide then usage_cells + [waiting] else [] end)
                 + [ (subject | if . == "" then "-" else . end) ] | @tsv)' \
          | column -t -s $'\t' ;;
 esac

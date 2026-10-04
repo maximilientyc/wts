@@ -154,26 +154,11 @@ fi
 # Same repository only: those are the sessions whose work can collide with
 # yours. Not a comparison of repo_root: a session created from inside another
 # worktree records that worktree as its root, so the repository is git's
-# common directory — one rev-parse per distinct root, no status, a few ms.
-typeset -A common
-common_of() {  # <repo_root>
-  if [[ -z "${common[$1]+x}" ]]; then
-    common[$1]=$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
-    [[ -n "${common[$1]}" ]] || common[$1]="$1"
-  fi
-  print -r -- "${common[$1]}"
-}
-my_common=$(common_of "$my_repo")
-
-# "2h ago": a brief is a cache of the model's summary, and one written last
-# week reads exactly like one written a minute ago.
-age_of() {  # <seconds>
-  local s="$1"
-  [[ "$s" == <-> ]] || { print -r -- "?"; return }
-  if (( s < 3600 )); then print -r -- "$(( s / 60 ))m ago"
-  elif (( s < 86400 )); then print -r -- "$(( s / 3600 ))h ago"
-  else print -r -- "$(( s / 86400 ))d ago"; fi
-}
+# common directory (db_common_of in wts-db.zsh) — one rev-parse per distinct
+# root, no status, a few ms. Its memo is filled in the loop below, not in a
+# command substitution, which would lose it and run git once per session.
+db_common_of "$my_repo" >/dev/null
+my_common="${_WTS_COMMON[$my_repo]}"
 
 # Eight at most, newest first: a machine with fifty sessions must not flood the
 # context, and the eighth most recent sibling is rarely the one that collides.
@@ -181,14 +166,17 @@ typeset -a siblings sibling_names
 siblings=() sibling_names=()
 while IFS=$'\x1f' read -r -d $'\x1e' name branch root prompt context brief brief_age; do
   [[ -n "$name" ]] || continue
-  [[ "$(common_of "$root")" == "$my_common" ]] || continue
+  db_common_of "$root" >/dev/null
+  [[ "${_WTS_COMMON[$root]}" == "$my_common" ]] || continue
   sibling_names+=("$name")
   (( ${#siblings} < 8 )) || continue
   line="- $name ($branch)"
   subject="$prompt"
   [[ -n "$subject" ]] || subject="$context"
   [[ -n "$subject" ]] && line+=": $(cut80 "$subject")"
-  [[ -n "$brief" ]] && line+=" — brief, $(age_of "$brief_age"): $(cut80 "$brief")"
+  # "2h ago": a brief is a cache of the model's summary, and one written last
+  # week reads exactly like one written a minute ago.
+  [[ -n "$brief" ]] && line+=" — brief, $(age_ago "$brief_age"): $(cut80 "$brief")"
   siblings+=("$line")
 done < <(db_rows "SELECT s.name, s.branch, s.repo_root, s.prompt, s.context,
                          coalesce(replace(b.body, char(10), ' / '), ''),
@@ -216,10 +204,12 @@ print -rl -- "${siblings[@]}"
 # the others, and another repository's are about files this one does not have.
 typeset -a notes
 notes=()
-while IFS=$'\x1f' read -r -d $'\x1e' session key value at; do
+while IFS=$'\x1f' read -r -d $'\x1e' session key value age; do
   [[ -n "$session" ]] || continue
-  notes+=("- $session/$key ($at): $(cut80 "$value")")
-done < <(db_rows "SELECT session, key, value, updated_at FROM notes
+  notes+=("- $session/$key ($(age_ago "$age")): $(cut80 "$value")")
+done < <(db_rows "SELECT session, key, value,
+                         CAST(strftime('%s', 'now') AS INTEGER) - CAST(strftime('%s', updated_at) AS INTEGER)
+                  FROM notes
                   WHERE session IN $(sql_list "${sibling_names[@]}")
                   ORDER BY updated_at DESC LIMIT 5")
 if (( ${#notes} )); then

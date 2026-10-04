@@ -2,19 +2,24 @@
 # wts-agent — drive another session's agent from a command: what the switcher
 # does with keys, for an agent that delegated work to other sessions.
 #
-# Usage: wts send <session> <text…>
+# Usage: wts send <session> [--answer | --force] <text…>
 #        wts wait <session>… [--until <state>[,<state>…]] [--timeout <s>] [--json]
 #        wts tail <session> [-n <k>] [--json]
 #
 #   send   types <text> into the session's agent and submits it. Into the
 #          agent's own pane, from its hooks or the collector — refused when that
-#          pane is unknown, never typed into whatever pane is active.
+#          pane is unknown, never typed into whatever pane is active. And only
+#          into an agent that will read it as a prompt, working or idle:
+#          --answer is for the one that is blocked on a question (the text is
+#          then its answer, `1`, `y`…), --force types whatever the state.
 #   wait   returns once every named session's agent is in one of the states
-#          (default: anything but working — it stopped, finished, failed or
-#          needs someone), or after --timeout seconds (default 90: under the
-#          2 minutes an agent's Bash tool allows a command; call it again to
-#          keep waiting). Exit 0 when reached, 1 on timeout. States are those of
-#          `wts status --json`: blocked working idle done failed stopped.
+#          (default: anything but working — it stopped, finished, failed, needs
+#          someone, or claims to work on a pane that no longer moves), or after
+#          --timeout seconds (default 90: under the 2 minutes an agent's Bash
+#          tool allows a command; call it again to keep waiting). Exit 0 when
+#          reached, 1 on timeout. States are those of `wts status --json`:
+#          blocked working idle done failed stopped — and `unknown` for a
+#          session no agent is known in, which no wait will ever see change.
 #   tail   the agent's last <k> messages (default 1), from its transcript — what
 #          it concluded, rather than a capture of a terminal UI.
 #
@@ -25,7 +30,6 @@ set -uo pipefail
 
 WTS_BIN="${0:A:h}"
 source "$WTS_BIN/wts-db.zsh"
-CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 
 die() { print -u2 -r -- "wts $VERB: $1"; exit "${2:-1}" }
 
@@ -42,8 +46,17 @@ need_session() {  # <name>
 # ─── send ────────────────────────────────────────────────────────────────────
 
 cmd_send() {
-  local name="${1:-}"
-  (( $# )) && shift
+  local name="" answer=false force=false
+  while (( $# )); do
+    case "$1" in
+      --answer) answer=true ;;
+      --force)  force=true ;;
+      --)       shift; break ;;
+      -*)       die "unknown option '$1' (--answer, --force; put -- before a text that starts with a dash)" 2 ;;
+      *)        [[ -z "$name" ]] || break; name="$1" ;;
+    esac
+    shift
+  done
   need_session "$name"
   local text="$*"
   [[ -n "${text//[[:space:]]/}" ]] || die "nothing to send" 2
@@ -55,8 +68,43 @@ cmd_send() {
   local pane
   pane=$(agent_pane_of "$name") \
     || die "no agent pane known for '$name' (its agent has not run since wts recorded panes; wts status --json)"
+
+  # What is in that pane, before anything is typed into it. The pane outlives
+  # the agent: once Claude has quit it is a shell, and a sentence sent there
+  # ran as a command. And a prompt sent to an agent that is asking a question
+  # is typed into the question, Enter included. The switcher's reply mode shows
+  # the pane to the person typing; a caller with no terminal sees nothing, so
+  # it is told instead. --force is the old behaviour.
+  if ! $force; then
+    local st state="" waiting=""
+    st=$("$WTS_BIN/wts-status" --json --no-git "$name" 2>/dev/null)
+    IFS=$'\x1f' read -r state waiting < <(print -r -- "$st" | jq -r --arg n "$name" '
+      .[] | select(.name == $n)
+      | [ (if .tmux_alive then (.agent_state // "unknown") else "stopped" end),
+          ((.agent_waiting_for // "") | if type == "string" then . else tojson end
+           | gsub("[\\t\\n\\r\u001f]"; " ")) ]
+      | join("\u001f")' 2>/dev/null)
+    state="${state:-unknown}"
+    if $answer; then
+      [[ "$state" == blocked ]] \
+        || die "'$name' is not waiting for an answer (it is $state): send without --answer"
+    else
+      case "$state" in
+        working|idle) ;;
+        blocked)
+          die "'$name' is blocked${waiting:+ on: $waiting}"$'\n'"          what you send would be typed into that question. To answer it: wts send $name --answer <choice>" ;;
+        *)
+          local what="it is $state"
+          [[ "$state" == unknown ]] && what="none is known there"
+          die "no agent is reading in '$name' ($what)"$'\n'"          its pane may be a shell, where the text would run as a command. wts restore $name starts it again; --force types anyway" ;;
+      esac
+    fi
+  fi
+
   "$WTS_BIN/wts-switch" --send "$pane" "$text" || die "could not type into $pane"
-  print -r -- "→ sent to the agent of '$name' ($pane)"
+  if $answer; then print -r -- "→ answered the agent of '$name' ($pane)"
+  else print -r -- "→ sent to the agent of '$name' ($pane)"
+  fi
 }
 
 # ─── wait ────────────────────────────────────────────────────────────────────
@@ -90,18 +138,27 @@ cmd_wait() {
 
   zmodload zsh/datetime 2>/dev/null
   local start=$EPOCHSECONDS st reached=false
-  local -A state
+  local -A state stale
+  local -a nobody
   while :; do
     st=$("$WTS_BIN/wts-status" --json --no-git "${names[@]}" 2>/dev/null)
     reached=true
+    nobody=()
     for n in "${names[@]}"; do
-      s=$(print -r -- "$st" | jq -r --arg n "$n" \
-            '.[] | select(.name == $n) | if .tmux_alive then (.agent_state // "unknown") else "stopped" end' 2>/dev/null)
-      state[$n]="${s:-unknown}"
+      s=$(print -r -- "$st" | jq -r --arg n "$n" '
+            .[] | select(.name == $n)
+            | (if .tmux_alive then (.agent_state // "unknown") else "stopped" end)
+              + " " + (.stale // false | tostring)' 2>/dev/null)
+      state[$n]="${${s%% *}:-unknown}"
+      stale[$n]=false
+      [[ "$s" == *" true" ]] && stale[$n]=true
+      [[ "${state[$n]}" == unknown ]] && nobody+=("$n")
       if (( ${#wanted} )); then
         (( ${wanted[(Ie)${state[$n]}]} )) || reached=false
-      else
-        [[ "${state[$n]}" != (working|unknown) ]] || reached=false
+      # Working on a pane that has stopped moving is not working: the switcher
+      # says `stuck?`, and a wait that ignored it waited on a frozen agent.
+      elif [[ "${state[$n]}" == unknown || ( "${state[$n]}" == working && "${stale[$n]}" == false ) ]]; then
+        reached=false
       fi
     done
     $reached && break
@@ -110,13 +167,26 @@ cmd_wait() {
   done
 
   if $json; then
-    for n in "${names[@]}"; do print -r -- "$n"$'\x1f'"${state[$n]}"; done \
-      | jq -Rc 'split("\u001f") | {name: .[0], state: .[1]}' \
+    for n in "${names[@]}"; do print -r -- "$n"$'\x1f'"${state[$n]}"$'\x1f'"${stale[$n]}"; done \
+      | jq -Rc 'split("\u001f") | {name: .[0], state: .[1], stale: (.[2] == "true")}' \
       | jq -sc --argjson r "$($reached && print true || print false)" \
           --argjson w "$(( EPOCHSECONDS - start ))" '{version: 1, reached: $r, waited_s: $w, sessions: .}'
   else
-    for n in "${names[@]}"; do print -r -- "$n ${state[$n]}"; done
-    $reached || print -u2 -r -- "wts wait: not reached after ${timeout}s; call it again to keep waiting"
+    for n in "${names[@]}"; do
+      if [[ "${stale[$n]}" == true ]]; then print -r -- "$n ${state[$n]} (stuck?)"
+      else print -r -- "$n ${state[$n]}"
+      fi
+    done
+  fi
+  if ! $reached; then
+    # "Call it again" was the only advice, and for a session no agent is known
+    # in it is advice to loop: nothing there will ever report a state.
+    if (( ${#nobody} )); then
+      print -u2 -r -- "wts wait: no agent known in ${(j:, :)nobody} (not started yet, or gone without a word for over 12 hours)"
+      print -u2 -r -- "          waiting longer will not change it: wts status --json, wts restore <name>"
+    else
+      print -u2 -r -- "wts wait: not reached after ${timeout}s; call it again to keep waiting"
+    fi
   fi
   $reached
 }
@@ -124,27 +194,19 @@ cmd_wait() {
 # ─── tail ────────────────────────────────────────────────────────────────────
 
 # The transcript of <session>'s agent: the conversation its hooks named, when
-# its file is there, else the newest one of the session's working directory.
+# its file is there, else the newest one of the session's working directory —
+# through db_session_transcript, like the brief and the retrospective. A lookup
+# of its own here had no lower bound on the file's age: under a name used
+# again, `tail` read out the conversation of the session that had it before.
 transcript_of() {  # <session>
-  local wt sub wd sid proj
+  local wt sub created sid
   wt=$(db_session_field "$1" worktree)
   sub=$(db_session_field "$1" subdir)
-  wd="$wt"
-  [[ -n "$sub" && -d "$wt/$sub" ]] && wd="$wt/$sub"
-  proj="$CLAUDE_DIR/projects/${wd//[^a-zA-Z0-9]/-}"
-  sid=$(db_ro "SELECT claude_session FROM agent_panes WHERE session = $(sql_str "$1")" 2>/dev/null)
-  if [[ -z "$sid" ]]; then
-    sid=$(db_ro "SELECT claude_session FROM agent_events WHERE session = $(sql_str "$1")
-                 AND claude_session != '' ORDER BY at DESC, id DESC LIMIT 1" 2>/dev/null)
-  fi
-  if [[ "$sid" =~ '^[0-9a-f-]+$' && -f "$proj/$sid.jsonl" ]]; then
-    print -r -- "$proj/$sid.jsonl"
-    return 0
-  fi
-  local -a newest
-  newest=("$proj"/*.jsonl(N.om[1]))
-  (( ${#newest} )) || return 1
-  print -r -- "${newest[1]}"
+  created=$(db_ro "SELECT coalesce(strftime('%s', created_at), 0) FROM sessions
+                   WHERE name = $(sql_str "$1")" 2>/dev/null)
+  [[ "$created" == <-> ]] || created=0
+  sid=$(db_claude_session_of "$1") || sid=""
+  db_session_transcript "$wt" "$sub" "$created" "$sid"
 }
 
 cmd_tail() {

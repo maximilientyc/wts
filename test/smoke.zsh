@@ -1050,6 +1050,25 @@ refute "db sql cannot write" "$WTS" db sql "DELETE FROM sessions"
 refute "db sql cannot read files" "$WTS" db sql "SELECT readfile('/etc/hosts')"
 check "the registry survived the attempt" in_registry dbsess
 refute "db set outside any session fails" eval '(cd / && "$WTS" db set k v)'
+# `wts db` is a verb an agent runs without a prompt, and --session let it
+# rewrite or delete the notes of any other session. Without a terminal, a note
+# is written from its own session only; usage errors exit 2, as the skill says.
+check "db set as another session without a terminal: exit 2, nothing written" eval '
+  (cd "$WT/dbsess" && "$WTS" db set k v --session dbpeer </dev/null 2>/dev/null); (( $? == 2 )) \
+  && [[ -z "$(q "SELECT 1 FROM notes WHERE session = '\''dbpeer'\'' AND key = '\''k'\''")" ]]'
+check "nor from outside any session" eval '
+  (cd / && "$WTS" db set k v --session dbpeer </dev/null 2>/dev/null); (( $? == 2 ))'
+check "--session naming the caller itself still writes" eval '
+  (cd "$WT/dbsess" && "$WTS" db set own v --session dbsess </dev/null 2>/dev/null) \
+  && [[ "$(q "SELECT value FROM notes WHERE session = '\''dbsess'\'' AND key = '\''own'\''")" == v ]]'
+check "db del as another session is refused the same way" eval '
+  (cd "$WT/dbpeer" && "$WTS" db del own --session dbsess </dev/null 2>/dev/null); (( $? == 2 )) \
+  && [[ -n "$(q "SELECT 1 FROM notes WHERE session = '\''dbsess'\'' AND key = '\''own'\''")" ]]'
+check "reading another session's note is not a write" eval '
+  [[ "$(cd "$WT/dbpeer" && "$WTS" db get own --session dbsess </dev/null)" == v ]]'
+(cd "$WT/dbsess" && "$WTS" db del own >/dev/null 2>&1) || true
+check "a db usage error exits 2" eval '"$WTS" db set lonely </dev/null 2>/dev/null; (( $? == 2 ))'
+check "so does an unknown db command" eval '"$WTS" db frobnicate </dev/null 2>/dev/null; (( $? == 2 ))'
 
 note_from_worktree() {
   (cd "$WT/dbsess" && "$WTS" db set api "it's 429 on /login") &&
@@ -1076,7 +1095,7 @@ concurrent_writes() {
   local i errs="$SANDBOX/db-errs"
   : > "$errs"
   for i in {1..10}; do
-    "$WTS" db set "k$i" "v$i" --session dbsess 2>>"$errs" &
+    (cd "$WT/dbsess" && "$WTS" db set "k$i" "v$i" 2>>"$errs") &
   done
   for i in {1..3}; do
     WTS_NO_ATTACH=1 "$WTS" dbsess smoke >/dev/null 2>>"$errs" &
@@ -1549,6 +1568,13 @@ check "task show prints them, labelled as added in wts" eval '
 check "a refresh of the task does not wipe them" eval '
   q "update tasks set notes = '\''rewritten from Things'\'', links = json('\''[]'\'') where id = \"$TASK\"" >/dev/null
   [[ "$(q "select count(*) from task_notes where task = '\''$TASK'\''")" == 2 ]]'
+# `wts task note` is a verb an agent runs without a prompt: what it may do
+# there is add. --clear deletes every note of the task, whoever wrote it.
+check "task note --clear without a terminal: exit 2, the notes kept" eval '
+  tt note "$TASK" --clear </dev/null 2>/dev/null; (( $? == 2 )) \
+  && [[ "$(q "select count(*) from task_notes where task = '\''$TASK'\''")" == 2 ]]'
+check "task note with no text is a usage error, exit 2" eval '
+  tt note "$TASK" </dev/null 2>/dev/null; (( $? == 2 ))'
 # Named explicitly: `wts doc add` derives a slug from the document's own title,
 # and the point here is the task↔slug row, not the naming.
 "$WTS" doc add "$SPEC" --name taskspec >/dev/null
@@ -1902,6 +1928,62 @@ check "ls archives a session whose worktree vanished, then forgets it" eval '
   [[ "$(q "select outcome from archive where session = '\''safe-gone'\''")" == unknown ]]'
 refute "and the registry entry is gone" in_registry safe-gone
 
+# `wts rm` on the same state dropped the row with nothing archived: which of
+# the two commands came first decided whether the session left a trace.
+env WTS_NO_ATTACH=1 "$WTS" safe-gone2 smoke >/dev/null
+(cd "$WT/safe-gone2" && "$WTS" db set left "kept by rm too" >/dev/null 2>&1) || true
+tmux kill-session -t "=safe-gone2"
+rm -rf "$WT/safe-gone2"
+check "rm of a session whose worktree vanished archives it too, notes included" eval '
+  "$WTS" rm safe-gone2 -f >/dev/null 2>&1
+  [[ "$(q "select outcome from archive where session = '\''safe-gone2'\''")" == abandoned \
+     && "$(q "select notes from archive where session = '\''safe-gone2'\''")" == *"kept by rm too"* ]]'
+refute "and forgets it" in_registry safe-gone2
+
+# A listing run while `wts rm` is between "worktree removed" and "archived" saw
+# a row with no worktree, archived it `unknown` and deleted it: rm's own record,
+# the one with the outcome, was then refused. rm marks the row for a minute.
+env WTS_NO_ATTACH=1 "$WTS" safe-tear smoke >/dev/null
+tmux kill-session -t "=safe-tear"
+mv "$WT/safe-tear" "$WT/safe-tear.away"
+q "INSERT OR REPLACE INTO kv VALUES ('teardown:safe-tear', strftime('%s', 'now'))"
+check "ls leaves alone a session rm is tearing down" eval '
+  "$WTS" ls >/dev/null 2>&1; in_registry safe-tear'
+q "UPDATE kv SET value = value - 120 WHERE key = 'teardown:safe-tear'"
+check "and takes it once the mark is over a minute old" eval '
+  "$WTS" ls >/dev/null 2>&1; ! in_registry safe-tear'
+check "the mark goes with the row" eval '[[ -z "$(q "SELECT 1 FROM kv WHERE key = '\''teardown:safe-tear'\''")" ]]'
+mv "$WT/safe-tear.away" "$WT/safe-tear"
+git -C "$REPO" worktree remove --force "$WT/safe-tear" >/dev/null 2>&1 || true
+git -C "$REPO" branch -D feature/safe-tear >/dev/null 2>&1 || true
+
+# A name used again for other work. The row is keyed on the name and
+# registry_put upserts: with the old row still there (its worktree and branch
+# removed through git, or a `wts rm` whose delete failed), the new session was
+# born with the old one's creation date, notes and events.
+env WTS_NO_ATTACH=1 "$WTS" safe-again smoke >/dev/null
+(cd "$WT/safe-again" && "$WTS" db set old "from the first life" >/dev/null 2>&1) || true
+first_born=$(reg_field safe-again created_at)
+tmux kill-session -t "=safe-again"
+git -C "$REPO" worktree remove --force "$WT/safe-again" >/dev/null 2>&1 || true
+git -C "$REPO" branch -D feature/safe-again >/dev/null 2>&1 || true
+sleep 1
+env WTS_NO_ATTACH=1 "$WTS" safe-again smoke >/dev/null 2>&1 || true
+check "a name used again inherits no note" eval '
+  in_registry safe-again && [[ "$(q "select count(*) from notes where session = '\''safe-again'\''")" == 0 ]]'
+check "its first life is archived, notes included" eval '
+  [[ "$(q "select notes from archive where session = '\''safe-again'\''")" == *"first life"* ]]'
+check "and it has a creation date of its own" eval '[[ "$(reg_field safe-again created_at)" != "$first_born" ]]'
+# The same name on the branch it had: the worktree brought back for the same
+# work. The row, and what it carries, is that work's.
+(cd "$WT/safe-again" && "$WTS" db set kept "same work" >/dev/null 2>&1) || true
+tmux kill-session -t "=safe-again" 2>/dev/null || true
+git -C "$REPO" worktree remove --force "$WT/safe-again" >/dev/null 2>&1 || true
+env WTS_NO_ATTACH=1 "$WTS" safe-again smoke >/dev/null 2>&1 || true
+check "a worktree brought back on its own branch keeps its row" eval '
+  [[ "$(q "select value from notes where session = '\''safe-again'\'' and key = '\''kept'\''")" == "same work" ]]'
+"$WTS" rm safe-again -f >/dev/null 2>&1 || true
+
 # The hook names the task it tells the agent to look at: a bare `wts task show`
 # opens the Things picker, which an agent may not. Created before the ctrl-d
 # check below, so that this — not safe-a — is the server's most recent session.
@@ -1979,9 +2061,28 @@ check "a stop makes it idle" eval '
 check "and the status line says so" eval '
   line=$("$ROOT/libexec/wts/wts-status" --line)
   [[ "$line" == *"1 blocked"* && "$line" == *"1 idle"* ]]'
-check "an end event leaves no state behind" eval '
+# An agent that quits says so: stopped. It used to leave no state at all, which
+# `wts wait` reads as "not started yet" — waiting for an agent that had quit
+# timed out every time, and the advice was to call it again.
+check "an end event reads stopped" eval '
   ev end "{\"session_id\":\"abc-123\",\"reason\":\"other\"}"
-  [[ "$(ev_state)" == null ]]'
+  "$WTS" status --json --no-git | jq -e "
+    .[] | select(.name == \"evsess\")
+    | .agent_state == \"stopped\" and .agent_source == \"events\" and (.agent_since | type) == \"number\""'
+check "a day later too: the twelve-hour doubt is for agents that said nothing" eval '
+  q "UPDATE agent_events SET at = at - 90000 WHERE session = '\''evsess'\''"
+  [[ "$(ev_state)" == stopped ]]'
+check "wait returns on it, its tmux session still alive" eval '
+  has_session evsess && "$WTS" wait evsess --timeout 2 --json </dev/null \
+    | jq -e ".reached and .sessions[0].state == \"stopped\""'
+check "a /clear ends the conversation, not the agent: idle" eval '
+  ev end "{\"session_id\":\"abc-123\",\"reason\":\"clear\"}"
+  [[ "$(ev_state)" == idle ]]'
+check "ls says since when, next to the state" eval '
+  [[ "$("$WTS" ls | grep "^evsess ")" == "evsess "*" idle "[0-9]*s" "* ]]'
+check "ls --wide says what a blocked agent waits for" eval '
+  out=$("$WTS" ls --wide)
+  [[ "${out%%$'\''\n'\''*}" == *MODEL*WAITING*SUBJECT* && "$(print -r -- "$out" | grep "^evold ")" == *"older question"* ]]'
 check "outside a wts session the hook records nothing and exits 0" eval '
   n=$(q "select count(*) from agent_events")
   (cd "$SANDBOX" && print "{}" | "$HOOK" prompt) \
@@ -2007,6 +2108,15 @@ proj="$CLAUDE_CONFIG_DIR/projects/$(print -r -- "$WT/evresume" | sed 's/[^a-zA-Z
 mkdir -p "$proj" && print '{}' > "$proj/0123abcd-ef01-2345-6789-abcdef012345.jsonl"
 "$WTS" restore evresume >/dev/null
 check "restore pre-fills the conversation the hooks recorded" \
+  pane_shows evresume "RESUME=0123abcd-ef01-2345-6789-abcdef012345/1"
+# The events are swept after seven days; the pane row lasts as long as the
+# session. Restore read only the events, and came back on `--continue`.
+"$WTS" stop evresume >/dev/null
+q "INSERT OR REPLACE INTO agent_panes (session, claude_session, pane, at)
+   VALUES ('evresume', '0123abcd-ef01-2345-6789-abcdef012345', '%999', strftime('%s', 'now'))"
+q "DELETE FROM agent_events WHERE session = 'evresume'"
+"$WTS" restore evresume >/dev/null
+check "and still does once its events are swept" \
   pane_shows evresume "RESUME=0123abcd-ef01-2345-6789-abcdef012345/1"
 check "the default layout renders a --resume pre-fill" eval '
   env WTS_NAME=render WTS_ROOT="$SANDBOX" WTS_WORKDIR="$SANDBOX" WTS_RESTORE=1 WTS_RESUME=1 \
@@ -2476,18 +2586,62 @@ pane_a=$(tmux display-message -p -t "=agent-a:" '#{pane_id}')
 (cd "$WT/agent-a" && print -r -- '{"session_id":"0123abcd-ef01-2345-6789-abcdef0000aa"}' \
   | TMUX_PANE="$pane_a" "$HOOK" prompt)
 check "a hook records its agent's pane" eval '[[ "$(q "SELECT pane FROM agent_panes WHERE session = '\''agent-a'\''")" == "$pane_a" ]]'
+# The stand-in agent pane is a shell, so what is sent runs there and shows.
+# No record from `claude agents`: agent-a is working, from the prompt above.
+print -r -- '[]' > "$WTS_SMOKE_AGENTS"
 check "send types into it and submits" eval '"$WTS" send agent-a "echo wts-send-ok" </dev/null >/dev/null'
 check "the line ran in the agent pane" pane_shows agent-a wts-send-ok
 refute "send to a session whose agent pane is unknown is refused" eval '"$WTS" send agent-b "echo nope" </dev/null 2>/dev/null'
 refute "send to no session is refused" eval '"$WTS" send no-such "x" </dev/null 2>/dev/null'
 
+# send looks before it types. A prompt sent to an agent that is asking a
+# question was typed into the question, Enter included; one sent after the
+# agent had quit ran in the shell its pane had become.
+jq -n --arg cwd "$WT/agent-a" '[{kind: "interactive", status: "waiting", waitingFor: "Bash: rm -rf dist", cwd: $cwd, sessionId: "smoke-a"}]' > "$WTS_SMOKE_AGENTS"
+check "send to a blocked agent is refused, and names the question" eval '
+  out=$("$WTS" send agent-a "echo wts-send-blocked" </dev/null 2>&1); (( $? == 1 )) \
+  && [[ "$out" == *"blocked on: Bash: rm -rf dist"*"--answer"* ]]'
+check "send --answer types into it" eval '"$WTS" send agent-a --answer "echo wts-answer-ok" </dev/null >/dev/null'
+check "the answer ran in the agent pane" pane_shows agent-a wts-answer-ok
+refute "and what was refused never reached the pane" eval '
+  out=$(tmux capture-pane -pJ -t "=agent-a:"); [[ "$out" == *wts-send-blocked* ]]'
+print -r -- '[]' > "$WTS_SMOKE_AGENTS"
+refute "send --answer to an agent that is not blocked is refused" eval '"$WTS" send agent-a --answer 1 </dev/null 2>/dev/null'
+(cd "$WT/agent-a" && print -r -- '{"session_id":"0123abcd-ef01-2345-6789-abcdef0000aa","reason":"other"}' \
+  | TMUX_PANE="$pane_a" "$HOOK" end)
+check "send to an agent that has quit is refused: its pane is a shell" eval '
+  out=$("$WTS" send agent-a "echo wts-send-dead" </dev/null 2>&1); (( $? == 1 )) \
+  && [[ "$out" == *"no agent is reading"*"it is stopped"*"--force"* ]]'
+refute "nothing was typed there either" eval '
+  out=$(tmux capture-pane -pJ -t "=agent-a:"); [[ "$out" == *wts-send-dead* ]]'
+check "send --force types whatever the state" eval '"$WTS" send agent-a --force "echo wts-force-ok" </dev/null >/dev/null'
+check "and it shows" pane_shows agent-a wts-force-ok
+check "an unknown send option is a usage error, exit 2" eval '"$WTS" send agent-a --loudly x </dev/null 2>/dev/null; (( $? == 2 ))'
+(cd "$WT/agent-a" && print -r -- '{"session_id":"0123abcd-ef01-2345-6789-abcdef0000aa"}' \
+  | TMUX_PANE="$pane_a" "$HOOK" prompt)
+
 # wait: the states of `wts status --json`.
 print -r -- '[]' > "$WTS_SMOKE_AGENTS"
 check "wait times out on an agent that never reports, exit 1" eval '
   out=$("$WTS" wait agent-b --until idle --timeout 2 </dev/null 2>/dev/null); (( $? == 1 )) && [[ "$out" == "agent-b "* ]]'
+check "and says no agent is known there, rather than to call again" eval '
+  err=$("$WTS" wait agent-b --timeout 2 </dev/null 2>&1 >/dev/null); [[ "$err" == *"no agent known in agent-b"* && "$err" != *"call it again"* ]]'
 jq -n --arg cwd "$WT/agent-b" '[{kind: "interactive", status: "idle", cwd: $cwd, sessionId: "smoke-b"}]' > "$WTS_SMOKE_AGENTS"
 check "wait returns once the agent is idle" eval '
-  "$WTS" wait agent-b --timeout 10 --json </dev/null | jq -e ".reached == true and .sessions[0].state == \"idle\""'
+  "$WTS" wait agent-b --timeout 10 --json </dev/null | jq -e ".reached == true and .sessions[0].state == \"idle\" and .sessions[0].stale == false"'
+# An agent that claims to work on a pane that no longer moves: the switcher
+# says `stuck?`, and a wait that ignored it waited on a frozen agent.
+pane_b=$(tmux display-message -p -t "=agent-b:" '#{session_name}:#{window_id}.#{pane_id}')
+mkdir -p "$CLAUDE_CONFIG_DIR/sessions"
+jq -n --arg t "$pane_b" '{sessionId: "smoke-b", tmux: $t}' > "$CLAUDE_CONFIG_DIR/sessions/88888.json"
+jq -n --arg cwd "$WT/agent-b" '[{kind: "interactive", status: "busy", cwd: $cwd, sessionId: "smoke-b"}]' > "$WTS_SMOKE_AGENTS"
+check "wait returns on a stuck agent, and says so" eval '
+  WTS_STALE_AFTER=0 "$WTS" wait agent-b --timeout 10 --json </dev/null \
+    | jq -e ".reached == true and .sessions[0].state == \"working\" and .sessions[0].stale == true"'
+check "--until working is not fooled by it" eval '
+  [[ "$(WTS_STALE_AFTER=0 "$WTS" wait agent-b --until working --timeout 2 </dev/null)" == "agent-b working (stuck?)" ]]'
+rm -f "$CLAUDE_CONFIG_DIR/sessions/88888.json"
+q "DELETE FROM pane_hashes WHERE agent_session = 'smoke-b'"
 refute "wait refuses an unknown state" eval '"$WTS" wait agent-b --until sleeping </dev/null 2>/dev/null'
 print -r -- '[]' > "$WTS_SMOKE_AGENTS"
 
@@ -2503,6 +2657,14 @@ mkdir -p "$proj_a"
 check "tail prints the agent's last message" eval '[[ "$("$WTS" tail agent-a </dev/null)" == *"done: the docs are written"* ]]'
 check "tail -n 2 --json skips tool calls" eval '
   "$WTS" tail agent-a -n 2 --json </dev/null | jq -e "[.messages[].text] == [\"first answer\", \"done: the docs are written\"]"'
+# A transcript older than the session is a previous session of the same name's:
+# the brief and the retrospective never read one, and tail did.
+proj_b="$CLAUDE_CONFIG_DIR/projects/$(print -r -- "$WT/agent-b" | sed 's/[^a-zA-Z0-9]/-/g')"
+mkdir -p "$proj_b"
+print -r -- '{"type":"assistant","timestamp":"2020-01-01T00:00:00Z","message":{"content":[{"type":"text","text":"words of a previous life"}]}}' > "$proj_b/old.jsonl"
+touch -t 202001010000 "$proj_b/old.jsonl"
+refute "tail does not read a transcript older than the session" eval '"$WTS" tail agent-b </dev/null 2>/dev/null'
+rm -f "$proj_b/old.jsonl"
 
 # Overlap: the first time a session edits a file a sibling has edited.
 touch_as() { # <session> <relative path> — the PostToolUse hook, as Claude Code runs it
@@ -2526,16 +2688,23 @@ check "and how the task was linked" eval '
 
 # Notes reach the other agents at their next turn.
 prompt_as() { (cd "$WT/$1" && print -r -- '{"session_id":"s"}' | env -u TMUX_PANE "$HOOK" prompt) }
-prompt_as agent-b >/dev/null
-check "a first turn adds nothing (SessionStart covered it)" eval '[[ -z "$(prompt_as agent-b)" ]]'
+note_as() { (cd "$WT/$1" && "$WTS" db set "$2" "$3" >/dev/null 2>&1) }
+# A first turn has no previous one to count from: it counts from the session's
+# creation. It used to deliver nothing, SessionStart having shown its five
+# newest notes — and a note written after SessionStart reached nobody.
+q "DELETE FROM agent_events WHERE session = 'agent-b'"
+note_as agent-a early "written before agent-b's first turn"
+check "a first turn carries the notes left since the session exists" eval '
+  [[ "$(prompt_as agent-b)" == *"agent-a/early: written before"* ]]'
+check "a turn with nothing new adds nothing" eval '[[ -z "$(prompt_as agent-b)" ]]'
 sleep 1
-"$WTS" db set api-contract "POST /login answers 422 on bad input" --session agent-a >/dev/null 2>&1
+note_as agent-a api-contract "POST /login answers 422 on bad input"
 check "the next turn carries the note a sibling left" eval '
   out=$(prompt_as agent-b)
   [[ "$out" == *"new notes"*"agent-a/api-contract: POST /login answers 422"* ]]'
 check "and not twice" eval '[[ -z "$(prompt_as agent-b)" ]]'
 check "WTS_CONTEXT_QUIET silences it" eval '
-  sleep 1; "$WTS" db set other "x" --session agent-a >/dev/null 2>&1
+  sleep 1; note_as agent-a other "x"
   [[ -z "$(cd "$WT/agent-b" && print -r -- "{}" | WTS_CONTEXT_QUIET=1 env -u TMUX_PANE "$HOOK" prompt)" ]]'
 check "a Stop hook still prints nothing" eval '[[ -z "$(cd "$WT/agent-b" && print -r -- "{}" | "$HOOK" stop)" ]]'
 check "rm drops the session's touches and pane" eval '
@@ -2597,8 +2766,8 @@ check "ls --wide adds tokens, cost and model" eval '
 check "plain ls does not" eval '[[ "$("$WTS" ls)" != *TOKENS* ]]'
 check "status --table --wide is the same table" eval '[[ "$("$WTS" status --table --wide)" == *TOKENS* ]]'
 check "the switcher list keeps its 11 fields (usage adds none)" eval '"$WTS" status --fzf | awk -F "\037" "NF != 11 { exit 1 }"'
-check "--no-git, what prefix+a and wait poll, leaves it out" eval '
-  "$WTS" status --json --no-git agent-a | jq -e ".[0].usage == null"'
+check "--no-git, what prefix+a and wait poll, has it null" eval '
+  "$WTS" status --json --no-git agent-a | jq -e ".[0] | has(\"usage\") and .usage == null"'
 q "UPDATE usage SET input = 999 WHERE session = 'agent-a' AND model = 'claude-opus-5-5'"
 "$WTS" brief agent-a </dev/null >/dev/null 2>&1
 check "an unchanged transcript is not read again" eval '

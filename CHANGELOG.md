@@ -15,6 +15,69 @@
   `wts task ls` on a real terminal, against a Things database built in the
   sandbox, through the real guard.
 
+How the agents of different sessions work together, first part: what was said
+to happen now does.
+
+- **`wts send` looks at the agent before it types.** It typed into the agent's
+  pane whatever was in it. Once the agent has quit that pane is a shell, and a
+  sentence sent there ran as a command; while the agent is blocked it is a
+  question, and a prompt sent there was typed into it, Enter included. A plain
+  send now goes to a `working` or `idle` agent only. `wts send <name> --answer
+  <choice>` answers a blocked one, and is refused when nothing is asked;
+  `--force` types whatever the state. **Changed:** `wts send cors "1"` to
+  answer a permission prompt is now `wts send cors --answer 1`.
+- **`wts wait` ends.** An agent that quit while its tmux session lived had no
+  state, `wait` read that as "not started yet", and timed out every time with
+  the advice to call it again. `SessionEnd` now reads `stopped` in `wts status
+  --json` (`agent_source: "events"`, `agent_since` the moment it quit), at any
+  age; after a `/clear` the agent is still there and reads `idle`. `wait` also
+  returns on an agent that is `stuck?` (`"stale": true` per session in
+  `--json`), and when no agent is known in a session it says so instead of
+  "call it again". **Changed:** `agent_state` is `"stopped"`, no longer `null`,
+  after the agent's own exit.
+- **An agent writes its own notes.** `wts db` and `wts task note` run without a
+  permission prompt, and two of their flags acted on someone else's work: `wts
+  db set|del --session <other>` rewrote or deleted another session's notes,
+  `wts task note --clear` deleted every note of a task. Both now take a
+  terminal (exit 2 without one). `--session` still reads.
+- **A name used again starts clean.** The registry row is keyed on the name,
+  and a creation upserts: with the old row still there, the new session was
+  born with the old one's creation date, notes, events, brief, task link and
+  PR state. A creation that cuts a new branch now archives and drops a row
+  whose worktree is gone; one that brings a worktree back on its branch keeps
+  it. `wts rm` no longer says a session is gone when its registry delete
+  failed (a locked database): it names the reason and exits 1, as `wts gc`
+  did.
+- **`wts rm` archives a session whose worktree is already gone**, as `wts ls`
+  does: which of the two ran first decided whether its notes were kept. And a
+  listing run while `rm` is between "worktree removed" and "archived" no
+  longer archives the session `unknown` under it, which made `rm`'s own record
+  (the outcome, the diff, the transcript) be refused.
+- **`wts tail` and `wts restore` find the conversation the way the brief
+  does.** `tail` had its own lookup with no lower bound on the transcript's
+  age: under a name used again it read out the previous session's
+  conversation. `restore` read the conversation id from the events alone,
+  which are kept a week; it now reads the pane row first.
+- **`wts ls` says since when**, next to the state (`blocked 4m`), and `wts ls
+  --wide` has a WAITING column: what a blocked agent waits on. README said `ls`
+  told both; they were in `--json` and the switcher only.
+- **Notes at a turn's start**: a first turn carries the notes left since the
+  session was created (it carried none, and a note written after
+  `SessionStart` reached nobody), so does a turn after a week without one; 50
+  newer notes from other repositories no longer hide this repository's. Ages
+  read the same everywhere an agent sees one (`3h ago`): a note's was a raw
+  timestamp at `SessionStart`, a brief's `1440m ago`.
+- **The idle reminder is not a question.** `idle_prompt` raised the "needs you"
+  banner while the switcher read the agent idle, on the heels of the "is done"
+  of the same turn. It now says "is idle"; one list of what needs a human
+  serves the banner and the state.
+- `wts status --json --no-git` has `"usage": null`: the key was missing.
+  Usage errors of `wts db` and `wts task note` exit 2, as the skill says.
+- Docs: `wts status --json` is an array, not an object with `"version": 1`; a
+  reply with no agent pane known is refused, not sent to the active pane;
+  `stale` is a key of its own, not an `agent_state`. `docs/roadmap.md` has what
+  the audit left open (section 2).
+
 ## 1.8.3 — 2026-10-04
 
 - **ctrl-e with no document picked goes straight back to the list.** Esc in

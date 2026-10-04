@@ -724,9 +724,49 @@ db_repo_siblings() {  # <session>
     f=("${(@ps:\x1f:)row}")
     name="${f[1]:-}" root="${f[2]:-}"
     [[ -n "$name" && -n "$root" ]] || continue
-    [[ "$(db_common_of "$root")" == "$mine" ]] && print -r -- "$name"
+    # Not `$(db_common_of …)`: the memo would be written in the substitution's
+    # subshell and lost, one git call per session instead of one per root.
+    db_common_of "$root" >/dev/null
+    [[ "${_WTS_COMMON[$root]}" == "$mine" ]] && print -r -- "$name"
   done
   return 0
+}
+
+# A Notification whose kind means the agent cannot go on without a human. One
+# list, for the collector's state and the hook's banner: with one each,
+# `idle_prompt` read idle in the switcher while its banner said "needs you",
+# right after the "is done" of the same idle turn.
+needs_human() {  # <notification_type>
+  [[ "$1" == (permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input) ]]
+}
+
+# "3h ago", from a number of seconds: one wording wherever an agent reads an
+# age. A note's was a raw ISO timestamp at SessionStart and nothing at all at a
+# turn's start, a brief's `1440m ago`.
+age_ago() {  # <seconds>
+  local s="${1:-}"
+  [[ "$s" == <-> ]] || { print -r -- "?"; return 0 }
+  if (( s < 60 )); then print -r -- "just now"
+  elif (( s < 3600 )); then print -r -- "$(( s / 60 ))m ago"
+  elif (( s < 86400 )); then print -r -- "$(( s / 3600 ))h ago"
+  else print -r -- "$(( s / 86400 ))d ago"
+  fi
+}
+
+# The Claude Code conversation of <session>'s agent, as its hooks named it, or
+# failure. The pane row first: it lasts as long as the session. The events are
+# swept after seven days, and `wts restore` read only those — a session left
+# alone for a week came back on whatever conversation was newest in the
+# directory, a side chat included. `wts tail` had a lookup of its own.
+db_claude_session_of() {  # <session>
+  local sid
+  sid=$(db_ro "SELECT claude_session FROM agent_panes WHERE session = $(sql_str "$1")" 2>/dev/null)
+  if [[ -z "$sid" ]]; then
+    sid=$(db_ro "SELECT claude_session FROM agent_events WHERE session = $(sql_str "$1")
+                 AND claude_session != '' ORDER BY at DESC, id DESC LIMIT 1" 2>/dev/null)
+  fi
+  [[ "$sid" =~ '^[0-9a-f-]+$' ]] || return 1
+  print -r -- "$sid"
 }
 
 # The tmux pane of <session>'s Claude agent, or failure — never a guess. The

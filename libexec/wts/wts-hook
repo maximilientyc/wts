@@ -133,14 +133,14 @@ if [[ "$EVENT" == touch ]]; then
   (( ${#sibs} )) || exit 0
   typeset -a who
   who=()
-  out=$(db_rows "SELECT t.session, s.branch, CAST(($now - t.at) / 60 AS INTEGER)
+  out=$(db_rows "SELECT t.session, s.branch, $now - t.at
                  FROM touches t JOIN sessions s ON s.name = t.session
                  WHERE t.path = $(sql_str "$rel") AND t.session IN $(sql_list "${sibs[@]}")
                  ORDER BY t.at" 2>/dev/null)
   for row in "${(@ps:\x1e:)out}"; do
     f3=("${(@ps:\x1f:)row}")
     [[ -n "${f3[1]:-}" ]] || continue
-    who+=("\`${f3[1]}\` (branch ${f3[2]}, first edited it ${f3[3]} min ago)")
+    who+=("\`${f3[1]}\` (branch ${f3[2]}, first edited it $(age_ago "${f3[3]:-}"))")
   done
   (( ${#who} )) || exit 0
   text="wts: $rel is also being changed by session ${(j:, :)who}. Read their notes (wts db notes --all) before going further, and leave one if your change affects them (wts db set <key> \"<one line>\")."
@@ -150,11 +150,17 @@ if [[ "$EVENT" == touch ]]; then
 fi
 
 # The previous turn's start, read before this one is recorded: what "since
-# your last turn" means for the note line below.
+# your last turn" means for the note line below. Without one — a first turn,
+# or a session left alone past the seven days the events are kept — since the
+# session exists: SessionStart showed its five newest notes and nothing written
+# after it, and a turn with no previous one used to deliver none at all.
 prev=""
 if [[ "$EVENT" == prompt ]]; then
-  prev=$(db_ro "SELECT max(at) FROM agent_events
-                WHERE session = $(sql_str "$me") AND event = 'prompt'" 2>/dev/null)
+  prev=$(db_ro "SELECT coalesce(
+                  (SELECT max(at) FROM agent_events
+                   WHERE session = $(sql_str "$me") AND event = 'prompt'),
+                  (SELECT CAST(strftime('%s', created_at) AS INTEGER) FROM sessions
+                   WHERE name = $(sql_str "$me")))" 2>/dev/null)
 fi
 
 db_q "INSERT INTO agent_events (session, claude_session, event, kind, message, at)
@@ -164,12 +170,14 @@ db_q "INSERT INTO agent_events (session, claude_session, event, kind, message, a
 
 # ─── prompt: the notes left since the last turn ──────────────────────────────
 # Same repository only, newest first, five at most; nothing at all when there
-# is nothing new — and nothing on the first turn, which SessionStart covered.
+# is nothing new. The limit is applied before the siblings are known (they cost
+# a git call, made only when there is a note to show), so it is wide: at 50, as
+# many newer notes from other repositories hid this one's.
 if [[ "$EVENT" == prompt && "$prev" == <-> ]] && ! $quiet; then
   fresh=$(db_rows "SELECT session, key, value FROM notes
                    WHERE session != $(sql_str "$me")
                      AND updated_at > strftime('%Y-%m-%dT%H:%M:%SZ', $prev, 'unixepoch')
-                   ORDER BY updated_at DESC LIMIT 50" 2>/dev/null)
+                   ORDER BY updated_at DESC LIMIT 500" 2>/dev/null)
   if [[ -n "$fresh" ]]; then
     typeset -a sibs lines
     sibs=("${(@f)$(db_repo_siblings "$me")}")
@@ -194,13 +202,12 @@ fi
 mode="${WTS_NOTIFY:-1}"
 [[ "$mode" == 0 ]] && exit 0
 case "$EVENT" in
-  # Only the kinds that need a human. The rest (auth_success, an elicitation
-  # completed, a quota resume) are recorded above and disturb nobody.
+  # Only the kinds that need a human (needs_human in wts-db.zsh, the list the
+  # collector reads `blocked` from), an untyped one from an older Claude Code,
+  # and the idle reminder. The rest (auth_success, an elicitation completed, a
+  # quota resume) are recorded above and disturb nobody.
   notification)
-    case "$kind" in
-      permission_prompt|idle_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input|"") ;;
-      *) exit 0 ;;
-    esac ;;
+    needs_human "$kind" || [[ -z "$kind" || "$kind" == idle_prompt ]] || exit 0 ;;
   stop) ;;
   *) exit 0 ;;
 esac
@@ -238,9 +245,18 @@ fmt_duration() {
 
 case "$EVENT" in
   notification)
-    title="wts: $me needs you"
-    body="${msg:-waiting for your answer}"
-    sound="Glass"
+    # The idle reminder is not a question: the switcher reads that agent idle,
+    # and its banner said "needs you", on the heels of the "is done" of the
+    # same turn.
+    if [[ "$kind" == idle_prompt ]]; then
+      title="wts: $me is idle"
+      body="${msg:-waiting for your next message}"
+      sound="Pop"
+    else
+      title="wts: $me needs you"
+      body="${msg:-waiting for your answer}"
+      sound="Glass"
+    fi
     ;;
   stop)
     title="wts: $me is done"

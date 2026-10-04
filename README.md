@@ -150,7 +150,7 @@ wts doc add <url|path> | ls [--json] | show [--json] | sync | forget | use <slug
 wts ls [--wide]
 wts status [--json|--table [--wide]|--fzf]
 wts brief [name...] | brief --cached [--json] [name...]
-wts send <name> <text...>
+wts send <name> [--answer | --force] <text...>
 wts wait <name>... [--until <state>,...] [--timeout <s>] [--json]
 wts tail <name> [-n <k>] [--json]
 wts restore [name...]
@@ -267,13 +267,17 @@ the worktree, so `WTS_SUBDIR` keeps working.
 | `idle`     | `status: idle`                     | turn finished, prompt available       |
 | `done`     | `state: done`                      | background session finished           |
 | `failed`   | `state: failed`                    | the turn failed                       |
-| `stopped`  | `state: stopped`, or no tmux session | session stopped, or `wts stop`ped: the switcher shows it for a dead tmux session |
+| `stopped`  | `state: stopped`, the agent's own `SessionEnd`, or no tmux session | the agent quit, or the session was `wts stop`ped: the switcher shows it for a dead tmux session |
 | `stuck?`   | stale guard                        | says `working`, but the pane is frozen |
 | `-`        | no agent found                     | worktree without a Claude session     |
 
 The **stale guard** hashes the agent's pane on every refresh: an agent reported as
 `working` whose pane has not changed for `WTS_STALE_AFTER` seconds (10) is shown as
 `stuck?`. Without it, a `Ctrl-C` leaves a session "working" forever.
+
+`wts ls` puts since when next to the state (`blocked 4m`, `idle 1h12m`), and
+`wts ls --wide` adds a WAITING column: the permission or the question a blocked
+agent waits on.
 
 Sessions are sorted by what needs a human first: `stuck?`, `blocked`, `failed`,
 `idle`, `working`, then the rest — and among equals, the one waiting longest. A
@@ -319,7 +323,10 @@ writes a row to the `agent_events` table (kept a week). The poll remains the
 word on the state; the events date it — the prompt for `working`, the
 notification for `blocked`, the stop for `idle` — and supply the question.
 When claude cannot be asked, or does not list the agent, the last event decides
-the state, unless it is an end or older than twelve hours. Outside a wts
+the state: an end reads `stopped` (the agent said it was leaving; after a
+`/clear` it reads `idle`, the agent is still there), and any other event older
+than twelve hours leaves no state, which is an agent that died without a word.
+Outside a wts
 session the hook is silent, and it never prints on stdout: Claude Code would
 add a `UserPromptSubmit` hook's output to the conversation.
 
@@ -375,9 +382,9 @@ reason the summary is missing. The model is never called by `wts ls` or the swit
 
 ```
 $ wts ls --wide
-SESSION      AGENT    BRANCH       DELTA        DIRTY  TMUX     TOKENS  COST    MODEL     SUBJECT
-auth-form    idle     auth-form    +322/-0 ^4   no     running  13.6M   $5.64   opus-5-5  Server-side email validation
-rate-limit   working  rate-limit   +80/-2 ^1    yes    running  2M      $1.95   opus-5-5  Rate-limit the public API
+SESSION      AGENT       BRANCH       DELTA        DIRTY  TMUX     TOKENS  COST    MODEL     WAITING           SUBJECT
+auth-form    blocked 4m  auth-form    +322/-0 ^4   no     running  13.6M   $5.64   opus-5-5  Bash: npm run db  Server-side email validation
+rate-limit   working 9m  rate-limit   +80/-2 ^1    yes    running  2M      $1.95   opus-5-5  -                 Rate-limit the public API
 ```
 
 `wts brief` also sums what each session's agents consumed: `message.usage` of
@@ -465,9 +472,11 @@ questions and permission prompts, a sentence for the rest, nothing at all for a
 bare Enter. The preview keeps refreshing, so the agent's reaction shows up in
 place; `esc` or `tab` brings the list back (`enter` switches again). The reply
 stays pinned to the session you pressed `tab` on, even if the list re-sorts under
-the cursor, and `ctrl-d` / `ctrl-x` / `ctrl-g` are disabled meanwhile. While the agent column shows `-`,
-wts does not know the agent's pane yet and the reply goes to the session's active
-pane. Needs fzf 0.45 or later; older versions keep the plain switcher.
+the cursor, and `ctrl-d` / `ctrl-x` / `ctrl-e` / `ctrl-t` / `ctrl-g` and `?` are
+disabled meanwhile. While the agent column shows `-`, wts does not know the
+agent's pane yet and the reply is refused (`no agent pane known — not sent`): it
+used to go to the session's active pane, the editor of the default layout.
+Needs fzf 0.45 or later; older versions keep the plain switcher.
 
 The popup is **drawn at once**, on a list built from the registry and tmux alone —
 no git, no agent call. fzf then swaps in the agent states (`load`, then
@@ -1023,7 +1032,7 @@ Sessions on this repository (newest first):
 - csv-export (feature/csv-export): export users as csv
 
 Latest notes they left:
-- rate-limit/api-contract (2026-09-28T09:12:03Z): /login now answers 429 with Retry-After
+- rate-limit/api-contract (3h ago): /login now answers 429 with Retry-After
 
 Files you and another session have both edited:
 - src/api/limits.ts (also: rate-limit)
@@ -1053,12 +1062,13 @@ only when there is something to say:
 - **At the start of a turn** (`UserPromptSubmit`): the notes the same
   repository's other agents left since this agent's last turn, five at most —
   a note written an hour after `SessionStart` used to reach nobody who did not
-  poll.
+  poll. A first turn counts from the session's creation.
 - **After an edit** (`PostToolUse` on `Edit`, `Write`, `MultiEdit`,
   `NotebookEdit`): the first time the agent edits a file another session of the
   repository has edited too, the tool result says which session, on which
-  branch, since when. Every edited path is recorded in the `touches` table,
-  relative to the worktree, which is what makes the overlap exact.
+  branch, since when. Every path edited through those tools is recorded in the
+  `touches` table, relative to the worktree; a file changed from the shell
+  (`sed -i`, a formatter, `git mv`) is not.
 
 Anywhere else — a Claude started outside wts — the hooks print nothing. They
 read and write the database only: no `git status`, no model call, about 0.1 s.
@@ -1077,7 +1087,10 @@ wts db path
 
 Reads cover every table. Writes cover **only `notes`**, keyed by the session the
 command runs in — found from the tmux pane (`$TMUX_PANE`), else from the worktree
-containing the working directory; `--session <name>` overrides it. `wts db sql`
+containing the working directory. `--session <name>` reads another session's;
+writing or deleting as another session takes a terminal (exit 2 without one):
+`wts db` runs without a permission prompt, and an agent leaves its own notes,
+not someone else's. `wts db sql`
 opens the database read-only and in sqlite3's safe mode (no `.shell`, no
 `ATTACH`, no `readfile`), so no query can damage the registry. `wts rm` and
 `wts gc` drop the notes of the sessions they remove.
@@ -1093,7 +1106,8 @@ wts "add a --json flag to wts brief" --json      # {name, branch, worktree, task
 wts new -p default --json cors rate-limit        # several: an array
 wts wait cors rate-limit --timeout 90            # 0 once neither is working, 1 on timeout
 wts status --json | jq '.[] | {name, agent_state, agent_waiting_for}'
-wts send cors "1"                                # answer the question it is blocked on
+wts send cors --answer 1                         # answer the question it is blocked on
+wts send cors "also cover the OPTIONS preflight" # a new prompt: to a working or idle agent only
 wts tail cors -n 3 --json                        # what it said last, from its transcript
 ```
 
@@ -1103,22 +1117,31 @@ wts tail cors -n 3 --json                        # what it said last, from its t
   confirmations exit 2 and name what to pass instead (`pass its id (wts task ls
   --json)`), and Things is never read — macOS asks before another app's data is
   read, and an agent is not you (`WTS_THINGS_FROM_SCRIPT=1` lets a cron job).
-- **JSON for every listing**, each with `"version": 1`, keys added and never
-  renamed: `wts status --json`, `wts task ls --json`, `wts task show <id>
+- **JSON for every listing**, keys added and never renamed. `wts status --json`
+  is an array of sessions, as it always was; the others are objects with
+  `"version": 1`: `wts task ls --json`, `wts task show <id>
   --json`, `wts doc ls --json`, `wts doc show <slug> --json`, `wts brief
   --cached --json` (the last summaries, no model call), `wts gc --json` (the dry
   run's plan: what would go and why; never with `--apply`), `wts doctor --json`,
   `wts wait --json`, `wts tail --json`, and a creation's `--json`.
 - **Exit codes**: 0 done, 1 failed (a session that did not come back, a wait
   that timed out, a refused send), 2 usage (an unknown option, a typo of a
-  command, a picker with no terminal).
+  command, a picker with no terminal, a write that takes one).
 - **`wts send`** types into the agent's own pane — the one its hooks recorded
   from `$TMUX_PANE`, or the one the collector matched — and refuses when it does
   not know it. The switcher's reply mode and `ctrl-e` follow the same rule: they
   used to type into the session's active pane, the editor of the default layout.
+  It also looks at the agent first, because the caller cannot: a prompt goes to
+  a `working` or `idle` agent only. A `blocked` one is asking a question, and
+  what is typed there answers it, so that takes `--answer`; once the agent has
+  quit its pane is a shell, where a sentence would run as a command, so that is
+  refused (`--force` types whatever the state).
 - **`wts wait`** returns after `--timeout` (90 s by default, under the two
   minutes an agent's Bash tool gives a command): call it again to keep waiting.
-  `--until blocked,idle` waits for those states only.
+  `--until blocked,idle` waits for those states only. Without `--until` it also
+  returns on an agent that is `stuck?` (`"stale": true` in `--json`), and on one
+  that quit (`stopped`). A session no agent is known in reads `unknown`: the
+  wait times out and says so, since waiting longer would not change it.
 
 The skill (`wts setup claude --install` writes it, `wts doctor` checks it) is
 this section and the commands above, for the agent: when to read, when to
