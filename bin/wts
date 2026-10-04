@@ -222,6 +222,11 @@ registry_del() {
     return 1
   fi
   db_q "$(usage_prune_sql)" >/dev/null 2>&1 || true
+  # What it was told, and the marks others hold on its notes and files: a name
+  # comes back. A statement of its own, like the usage prune: on a database an
+  # older wts left at schema 8 the table is missing, and inside the transaction
+  # -bail would have aborted the whole deletion.
+  db_q "$(seen_prune_sql "$in")" >/dev/null 2>&1 || true
   return 0
 }
 

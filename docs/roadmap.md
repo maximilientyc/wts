@@ -29,7 +29,11 @@ on its first line, `ctrl-g` between what needs you and every row, a REPO
 column once the sessions span two repositories. Then the first part of *agents
 working together* (section 2): `wts send` looks at the agent before it types,
 `wts wait` ends on an agent that quit or is stuck, a name used again starts
-clean, and an agent writes its own notes only.
+clean, and an agent writes its own notes only. Then its second part, *exact
+delivery*: a `seen` table (schema 9) records what each agent was told, so a
+note reaches every sibling once at any clock resolution, at its next turn or
+edit; the first editor of a file hears of the second, and a session that
+finishes is announced with its outcome and the notes it left.
 
 ## 1. Then, by what you feel first
 
@@ -45,20 +49,6 @@ through the database, and what the person running them sees of it. What the
 agents share reaches the others by a comparison of clocks, half of it one way
 only, and almost none of it is on a screen.
 
-- **Exact delivery. [M]** One table, `seen(session, stream, ref, mark, at)`,
-  and no column added to `notes` or `touches` (an older wts sharing the
-  database would never fill one). A note is unseen while its reader has no
-  mark for it, or the mark is not its current value: exact at any clock
-  resolution, independent of the week `agent_events` is kept, and it records
-  who has read what. One `deliver_news` in `wts-hook` for the `prompt` and the
-  `touch` hooks, so a note reaches a working agent at its next edit and not at
-  its next turn. Same table for the two things nobody is told today: the
-  **first** editor of a file, when a sibling edits it too, and every sibling,
-  when a session **finishes** — "`pr-state` finished (squashed, PR #37)" with
-  the notes it left, read from `archive` (a note is deleted with its author,
-  at the moment the change it announces lands). Schema 9; the hooks call
-  `db_init`, and the cleanup in `rm` and `gc` is a statement of its own, like
-  `usage_prune_sql`.
 - **A sent line says who sent it, and you see what they share. [M]** Without a
   terminal, `wts send` types `[wts: from session <me>] <text>`: the receiving
   agent reads it, the hook records it on the prompt row (`kind = send`), and

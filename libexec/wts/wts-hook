@@ -20,14 +20,17 @@
 #
 # It prints on stdout in two places only, both on purpose, both through fd 3
 # (stdout itself goes to /dev/null right after the payload is read):
-#   prompt  the notes the same repository's other agents left since this one's
-#           last turn, one line each, five at most, nothing when there are
-#           none. Claude Code adds a UserPromptSubmit hook's stdout to the
-#           conversation, which is exactly the point: a note written an hour
-#           after SessionStart otherwise reached nobody who did not poll.
-#   touch   the first time this agent edits a file another session of the
-#           repository has edited too, PostToolUse's additionalContext JSON
-#           naming that session. Silence otherwise.
+#   prompt  the news (deliver_news below): the notes the same repository's
+#           other agents left that this one has not been told, the files it
+#           edited that one of them has edited too, the sessions that finished
+#           and the notes they left; five lines per kind at most, nothing when
+#           there is nothing new. Claude Code adds a UserPromptSubmit hook's
+#           stdout to the conversation, which is exactly the point: a note
+#           written an hour after SessionStart otherwise reached nobody who did
+#           not poll.
+#   touch   the same news, at every edit, as PostToolUse's additionalContext
+#           JSON (one object): a working agent hears of them mid-turn, and the
+#           second editor of a file at the edit itself. Silence otherwise.
 # Nothing else may ever reach stdout, and every path exits 0: a non-zero exit
 # from a Stop hook is read as "block the turn and hand stderr to the model".
 # WTS_CONTEXT_QUIET=1 silences both, like the SessionStart hook.
@@ -105,62 +108,188 @@ cut120() {
   print -r -- "$v"
 }
 
+# ─── News: what the other sessions did since this agent last heard ──────────
+# Three streams, marked in `seen` as they are delivered (schema 9): the notes of
+# the same repository's sessions, the files this agent edited that one of them
+# has edited too, and the sessions of the repository that finished. A note used
+# to count as new when its updated_at was later than the reader's previous
+# prompt, to the second: one rewritten in the second it was read was lost, a
+# working agent heard of it only at its next turn, the first editor of a file
+# was never told a sibling edited it too, and a note died with its author.
+#
+# Prints the lines, nothing when there is nothing new. Called on every prompt
+# and every edit, so the common case costs one read-only query; only when it
+# finds something are the siblings computed (git calls) and the marks written.
+deliver_news() {
+  local R c row i k
+  R=$(sql_str "$me")
+  # The reader's own birth: a mark written before it belongs to an earlier
+  # session of the same name, a note older than it was shown by SessionStart,
+  # and a session that finished by then (in the same second included: the rm
+  # that made room for this one) is not news.
+  c="(SELECT CAST(strftime('%s', created_at) AS INTEGER) FROM sessions WHERE name = $R)"
+  # Nine columns: stream, mark, then the stream's own. The ref is not one of
+  # them: notes and overlap refs hold char(31), the field separator, and are
+  # rebuilt below from their two halves.
+  local out
+  out=$(db_rows "
+    WITH amark AS (SELECT coalesce(
+           (SELECT CAST(mark AS INTEGER) FROM seen
+            WHERE session = $R AND stream = 'archive' AND ref = '' AND at >= $c),
+           (SELECT max(id) FROM archive
+            WHERE CAST(strftime('%s', finished_at) AS INTEGER) <= $c),
+           0) AS id)
+    SELECT 'notes', n.value, n.session, n.key, n.value, '', '', '',
+           -CAST(strftime('%s', n.updated_at) AS INTEGER)
+    FROM notes n JOIN sessions a ON a.name = n.session
+    WHERE n.session != $R
+      AND CAST(strftime('%s', n.updated_at) AS INTEGER) >= $c
+      AND NOT EXISTS (SELECT 1 FROM seen m
+                      WHERE m.session = $R AND m.stream = 'notes'
+                        AND m.ref = n.session || char(31) || n.key AND m.mark = n.value
+                        AND m.at >= $c AND m.at >= CAST(strftime('%s', a.created_at) AS INTEGER))
+    UNION ALL
+    SELECT 'overlap', '1', o.session, o.path, s.branch, $now - o.at, '', '', o.at
+    FROM touches t
+    JOIN touches o ON o.path = t.path AND o.session != t.session
+    JOIN sessions s ON s.name = o.session
+    WHERE t.session = $R
+      AND NOT EXISTS (SELECT 1 FROM seen m
+                      WHERE m.session = $R AND m.stream = 'overlap'
+                        AND m.ref = o.session || char(31) || o.path
+                        AND m.at >= $c AND m.at >= CAST(strftime('%s', s.created_at) AS INTEGER))
+    UNION ALL
+    SELECT 'archive', '', a.id, a.session, a.outcome, a.pr_url, a.repo_root,
+           coalesce((SELECT group_concat(key || ': ' || value, '; ')
+                     FROM json_each(CASE WHEN json_valid(a.notes) THEN a.notes ELSE '{}' END)), ''),
+           a.id
+    FROM archive a, amark
+    WHERE a.id > amark.id AND a.session != $R AND $c IS NOT NULL
+    ORDER BY 1, 9" 2>/dev/null) || return 0
+  [[ -n "$out" ]] || return 0
+
+  # Something is new: is it this repository's? Another repository's rows are
+  # marked too, without a word, or every edit would find them again.
+  local -a rows sibs f
+  rows=() sibs=()
+  for row in "${(@ps:\x1e:)out}"; do
+    [[ -n "$row" ]] && rows+=("$row")
+  done
+  (( ${#rows} )) || return 0
+  sibs=("${(@f)$(db_repo_siblings "$me")}")
+  sibs=("${(@)sibs:#}")
+  local myroot mycommon root show ref sql=""
+  myroot=$(db_session_field "$me" repo_root)
+  db_common_of "$myroot" >/dev/null
+  mycommon="${_WTS_COMMON[$myroot]}"
+  for (( i = 1; i <= ${#rows}; i++ )); do
+    f=("${(@ps:\x1f:)rows[i]}")
+    show=0
+    if [[ "${f[1]}" == archive ]]; then
+      ref=$(sql_str "${f[3]:-}")
+      root="${f[7]:-}"
+      if [[ -n "$root" ]]; then
+        db_common_of "$root" >/dev/null
+        [[ "${_WTS_COMMON[$root]}" == "$mycommon" ]] && show=1
+      fi
+    else
+      ref="$(sql_str "${f[3]:-}") || char(31) || $(sql_str "${f[4]:-}")"
+      (( ${sibs[(Ie)${f[3]:-}]} )) && show=1
+    fi
+    sql+="INSERT INTO cand VALUES ($i, $(sql_str "${f[1]}"), $ref, $(sql_str "${f[2]:-}"), $show);"$'\n'
+  done
+
+  # Read and mark in one write transaction: two hooks of the same agent (a
+  # prompt and an edit, or parallel edits) wait on BEGIN IMMEDIATE, and the
+  # second finds the first one's marks and delivers nothing.
+  local got
+  got=$(db_rows_rw "BEGIN IMMEDIATE;
+    CREATE TEMP TABLE cand (i INTEGER, stream TEXT, ref TEXT, mark TEXT, show INTEGER);
+    $sql
+    DELETE FROM cand WHERE stream != 'archive' AND EXISTS (
+      SELECT 1 FROM seen m WHERE m.session = $R AND m.stream = cand.stream
+        AND m.ref = cand.ref AND m.mark = cand.mark AND m.at >= $c);
+    DELETE FROM cand WHERE stream = 'archive' AND CAST(ref AS INTEGER) <= coalesce(
+      (SELECT CAST(mark AS INTEGER) FROM seen
+       WHERE session = $R AND stream = 'archive' AND ref = '' AND at >= $c), 0);
+    SELECT i FROM cand WHERE show = 1 ORDER BY i;
+    INSERT OR REPLACE INTO seen (session, stream, ref, mark, at)
+      SELECT $R, stream, ref, mark, $now FROM cand WHERE stream != 'archive';
+    INSERT OR REPLACE INTO seen (session, stream, ref, mark, at)
+      SELECT $R, 'archive', '', max(CAST(ref AS INTEGER)), $now FROM cand
+      WHERE stream = 'archive' HAVING count(*) > 0;
+    COMMIT;" 2>/dev/null) || return 0
+
+  local -a notes overlap finished
+  notes=() overlap=() finished=()
+  local what
+  for k in "${(@ps:\x1e:)got}"; do
+    [[ "$k" == <-> ]] || continue
+    f=("${(@ps:\x1f:)rows[k]}")
+    case "${f[1]}" in
+      notes)
+        notes+=("- ${f[3]}/${f[4]}: $(cut120 "${f[5]:-}")") ;;
+      overlap)
+        overlap+=("wts: ${f[4]} was edited by session \`${f[3]}\` too (branch ${f[5]:--}, first edited it $(age_ago "${f[6]:-}")).") ;;
+      archive)
+        what="${f[5]:-unknown}"
+        if [[ "${f[6]:-}" =~ '/pull/([0-9]+)' ]]; then what+=", PR #${match[1]}"; fi
+        if [[ -n "${f[8]:-}" ]]; then
+          finished+=("wts: session \`${f[4]}\` finished ($what) — the notes it left: $(cut120 "${f[8]}")")
+        else
+          finished+=("wts: session \`${f[4]}\` finished ($what), and left no notes.")
+        fi ;;
+    esac
+  done
+  # Five lines per stream at most: this lands in the agent's context.
+  if (( ${#notes} )); then
+    print -r -- "wts: new notes from the other sessions on this repository:"
+    print -rl -- "${(@)notes[1,5]}"
+    (( ${#notes} > 5 )) && print -r -- "- (… $(( ${#notes} - 5 )) more: wts db notes --all)"
+  fi
+  if (( ${#overlap} )); then
+    print -rl -- "${(@)overlap[1,5]}"
+    (( ${#overlap} > 5 )) && print -r -- "wts: (… $(( ${#overlap} - 5 )) more: wts db sql \"select * from touches\")"
+    print -r -- "Read their notes (wts db notes --all) before going further, and leave one if your change affects them (wts db set <key> \"<one line>\")."
+  fi
+  if (( ${#finished} )); then
+    print -rl -- "${(@)finished[1,5]}"
+    (( ${#finished} > 5 )) && print -r -- "wts: (… $(( ${#finished} - 5 )) more: wts log)"
+  fi
+  return 0
+}
+
 # ─── touch: a file edited ────────────────────────────────────────────────────
 # Not an agent_events row: an agent edits dozens of files a turn, and the
 # events are about its state. One touches row per (session, path), the first
-# time — and only then is the overlap looked for, so the warning comes once
-# per file and sibling rather than at every edit.
+# time. The news are looked at on every edit, not only a new file's: that is
+# how a working agent hears of a note before its turn is over, and how the
+# first editor of a file hears that a sibling edited it too. The overlap itself
+# is one of the news, marked like the rest: once per sibling and file.
 if [[ "$EVENT" == touch ]]; then
-  [[ -n "$file" ]] || exit 0
-  wt=$(db_session_field "$me" worktree)
-  [[ -n "$wt" ]] || exit 0
-  [[ "$file" == /* ]] || file="$PWD/$file"
-  rel=""
-  for root in "$wt" "${wt:A}"; do
-    for f in "$file" "${file:A}"; do
-      if [[ "$f" == "$root"/* ]]; then rel="${f#$root/}"; break 2; fi
-    done
-  done
-  [[ -n "$rel" ]] || exit 0   # outside the worktree: not this repository's file
-  added=$(db_q "INSERT OR IGNORE INTO touches (session, path, at)
-                VALUES ($(sql_str "$me"), $(sql_str "$rel"), $now);
-                SELECT changes();" 2>/dev/null)
-  [[ "$added" == 1 ]] || exit 0
+  if [[ -n "$file" ]]; then
+    wt=$(db_session_field "$me" worktree)
+    [[ "$file" == /* ]] || file="$PWD/$file"
+    rel=""
+    if [[ -n "$wt" ]]; then
+      for root in "$wt" "${wt:A}"; do
+        for f in "$file" "${file:A}"; do
+          if [[ "$f" == "$root"/* ]]; then rel="${f#$root/}"; break 2; fi
+        done
+      done
+    fi
+    # Outside the worktree: not this repository's file, not recorded.
+    if [[ -n "$rel" ]]; then
+      db_q "INSERT OR IGNORE INTO touches (session, path, at)
+            VALUES ($(sql_str "$me"), $(sql_str "$rel"), $now)" >/dev/null 2>&1
+    fi
+  fi
   $quiet && exit 0
-  typeset -a sibs
-  sibs=("${(@f)$(db_repo_siblings "$me")}")
-  sibs=("${(@)sibs:#}")
-  (( ${#sibs} )) || exit 0
-  typeset -a who
-  who=()
-  out=$(db_rows "SELECT t.session, s.branch, $now - t.at
-                 FROM touches t JOIN sessions s ON s.name = t.session
-                 WHERE t.path = $(sql_str "$rel") AND t.session IN $(sql_list "${sibs[@]}")
-                 ORDER BY t.at" 2>/dev/null)
-  for row in "${(@ps:\x1e:)out}"; do
-    f3=("${(@ps:\x1f:)row}")
-    [[ -n "${f3[1]:-}" ]] || continue
-    who+=("\`${f3[1]}\` (branch ${f3[2]}, first edited it $(age_ago "${f3[3]:-}"))")
-  done
-  (( ${#who} )) || exit 0
-  text="wts: $rel is also being changed by session ${(j:, :)who}. Read their notes (wts db notes --all) before going further, and leave one if your change affects them (wts db set <key> \"<one line>\")."
+  text=$(deliver_news)
+  [[ -n "$text" ]] || exit 0
   jq -cn --arg t "$text" \
     '{hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext: $t}}' >&3 2>/dev/null
   exit 0
-fi
-
-# The previous turn's start, read before this one is recorded: what "since
-# your last turn" means for the note line below. Without one — a first turn,
-# or a session left alone past the seven days the events are kept — since the
-# session exists: SessionStart showed its five newest notes and nothing written
-# after it, and a turn with no previous one used to deliver none at all.
-prev=""
-if [[ "$EVENT" == prompt ]]; then
-  prev=$(db_ro "SELECT coalesce(
-                  (SELECT max(at) FROM agent_events
-                   WHERE session = $(sql_str "$me") AND event = 'prompt'),
-                  (SELECT CAST(strftime('%s', created_at) AS INTEGER) FROM sessions
-                   WHERE name = $(sql_str "$me")))" 2>/dev/null)
 fi
 
 db_q "INSERT INTO agent_events (session, claude_session, event, kind, message, at)
@@ -168,33 +297,13 @@ db_q "INSERT INTO agent_events (session, claude_session, event, kind, message, a
               $(sql_str "$kind"), $(sql_str "${msg[1,400]}"), $now);
       DELETE FROM agent_events WHERE at < $now - 7 * 86400;" >/dev/null 2>&1 || exit 0
 
-# ─── prompt: the notes left since the last turn ──────────────────────────────
-# Same repository only, newest first, five at most; nothing at all when there
-# is nothing new. The limit is applied before the siblings are known (they cost
-# a git call, made only when there is a note to show), so it is wide: at 50, as
-# many newer notes from other repositories hid this one's.
-if [[ "$EVENT" == prompt && "$prev" == <-> ]] && ! $quiet; then
-  fresh=$(db_rows "SELECT session, key, value FROM notes
-                   WHERE session != $(sql_str "$me")
-                     AND updated_at > strftime('%Y-%m-%dT%H:%M:%SZ', $prev, 'unixepoch')
-                   ORDER BY updated_at DESC LIMIT 500" 2>/dev/null)
-  if [[ -n "$fresh" ]]; then
-    typeset -a sibs lines
-    sibs=("${(@f)$(db_repo_siblings "$me")}")
-    sibs=("${(@)sibs:#}")
-    lines=()
-    for row in "${(@ps:\x1e:)fresh}"; do
-      f3=("${(@ps:\x1f:)row}")
-      [[ -n "${f3[1]:-}" ]] || continue
-      (( ${sibs[(Ie)${f3[1]}]} )) || continue
-      lines+=("- ${f3[1]}/${f3[2]}: $(cut120 "${f3[3]:-}")")
-    done
-    if (( ${#lines} )); then
-      print -u3 -r -- "wts: new notes from the other sessions on this repository since your last turn:"
-      print -u3 -rl -- "${(@)lines[1,5]}"
-      (( ${#lines} > 5 )) && print -u3 -r -- "- (… $(( ${#lines} - 5 )) more: wts db notes --all)"
-    fi
-  fi
+# ─── prompt: the news, at the start of a turn ────────────────────────────────
+# db_init first: this hook may be the first wts code to open a database an
+# older wts left at schema 8, without the seen table. Its fast path is one
+# PRAGMA. When it fails, the turn goes on without news.
+if [[ "$EVENT" == prompt ]] && ! $quiet && db_init >/dev/null 2>&1; then
+  news=$(deliver_news)
+  [[ -n "$news" ]] && print -u3 -r -- "$news"
 fi
 
 # ─── Attention ───────────────────────────────────────────────────────────────

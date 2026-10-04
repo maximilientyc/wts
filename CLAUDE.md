@@ -53,6 +53,7 @@ docs/demo/                record.zsh + demo.tape (README GIF, make demo)
                           + things-done.zsh/.tape (a task done in Things leaves the switcher)
                           + agents-together.zsh/.tape (send and wait look at the agent first)
                           + db-browse.zsh/.tape (wts db browse: the tables, a table's rows, a record)
+                          + exact-delivery.zsh/.tape (notes, overlap and finished sessions, once each)
 ```
 
 Homebrew, `make install` and a git checkout share this tree, so `bin/wts` works
@@ -72,11 +73,12 @@ straight from the checkout. Scripts locate each other from their own path
   always exits 0: Claude Code adds a `UserPromptSubmit` hook's stdout to the
   conversation, and reads a non-zero `Stop` hook as "block the turn, hand
   stderr to the model". `wts-hook` does `exec 3>&1 >/dev/null` right after
-  reading its payload, and writes to fd 3 in exactly two places: the new notes
-  at a turn's start (`prompt`) and the overlap warning after an edit (`touch`,
-  as PostToolUse's `additionalContext` JSON), each only when there is something
-  new. `wts-context` is the hook whose stdout is the point. So is `wts log`:
-  its payload carries `version`, and the `outcome` vocabulary (`merged squashed
+  reading its payload, and writes to fd 3 in exactly two places: the news
+  (`deliver_news`: notes, overlaps, finished sessions) at a turn's start
+  (`prompt`) and after an edit (`touch`, as PostToolUse's `additionalContext`
+  JSON, one object), each only when there is something new. `wts-context` is
+  the hook whose stdout is the point. So is `wts log`: its payload carries
+  `version`, and the `outcome` vocabulary (`merged squashed
   remote-deleted removed abandoned in-progress unknown`) is closed — a seventh
   value breaks whatever agent is reading the corpus.
 - **An agent is a caller with no terminal.** Its Bash tool has no tty on stdin

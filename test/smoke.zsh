@@ -2196,8 +2196,8 @@ check "the base it was compared against is recorded" eval '
   [[ "$(q "select base from archive where session = '"'"'gcarch'"'"'")" == main ]]'
 check "the worktree really is gone" eval '[[ ! -e "$WT/gcarch" ]]'
 
-check "the schema is at version 8" eval '
-  [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 8 ]]'
+check "the schema is at version 9" eval '
+  [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 9 ]]'
 
 # ─── PR, CI and review state ─────────────────────────────────────────────────
 # gh is a stand-in: it answers from fixtures keyed by what it was asked (a
@@ -2728,7 +2728,16 @@ check "and how the task was linked" eval '
   out=$(cd "$WT/agent-a" && env -u TMUX -u TMUX_PANE "$CONTEXT")
   [[ "$out" == *"This session was linked"*"wts task link <id>"* ]]'
 
-# Notes reach the other agents at their next turn.
+# The first editor hears of the second at its next prompt: the warning used to
+# reach only the session that edited the file last.
+check "the first editor hears that a sibling edited its file too" eval '
+  out=$(cd "$WT/agent-a" && print -r -- "{\"session_id\":\"s\"}" | env -u TMUX_PANE "$HOOK" prompt)
+  [[ "$out" == *"src/api.ts was edited by session \`agent-b\` too (branch "* ]]'
+check "once" eval '
+  out=$(cd "$WT/agent-a" && print -r -- "{\"session_id\":\"s\"}" | env -u TMUX_PANE "$HOOK" prompt)
+  [[ "$out" != *"src/api.ts"* ]]'
+
+# Notes reach the other agents at their next turn, or at their next edit.
 prompt_as() { (cd "$WT/$1" && print -r -- '{"session_id":"s"}' | env -u TMUX_PANE "$HOOK" prompt) }
 note_as() { (cd "$WT/$1" && "$WTS" db set "$2" "$3" >/dev/null 2>&1) }
 # A first turn has no previous one to count from: it counts from the session's
@@ -2739,19 +2748,59 @@ note_as agent-a early "written before agent-b's first turn"
 check "a first turn carries the notes left since the session exists" eval '
   [[ "$(prompt_as agent-b)" == *"agent-a/early: written before"* ]]'
 check "a turn with nothing new adds nothing" eval '[[ -z "$(prompt_as agent-b)" ]]'
-sleep 1
 note_as agent-a api-contract "POST /login answers 422 on bad input"
 check "the next turn carries the note a sibling left" eval '
   out=$(prompt_as agent-b)
   [[ "$out" == *"new notes"*"agent-a/api-contract: POST /login answers 422"* ]]'
 check "and not twice" eval '[[ -z "$(prompt_as agent-b)" ]]'
+# Delivery used to compare updated_at with the last turn's start, both to the
+# second: a note rewritten in the second it was read was never delivered.
+note_as agent-a api-contract "POST /login answers 400 on bad input"
+check "a note rewritten in the same second is delivered again" eval '
+  [[ "$(prompt_as agent-b)" == *"agent-a/api-contract: POST /login answers 400"* ]]'
+q "INSERT OR REPLACE INTO notes (session, key, value, updated_at)
+   VALUES ('agent-a', 'raw', 'written by an older wts', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+check "a note written by plain SQL, as an older wts does, is delivered" eval '
+  [[ "$(prompt_as agent-b)" == *"agent-a/raw: written by an older wts"* ]]'
+q "DELETE FROM agent_events WHERE session = 'agent-b'"
+note_as agent-a after-sweep "still delivered"
+check "delivery does not depend on the agent's events" eval '
+  out=$(prompt_as agent-b); [[ "$out" == *"agent-a/after-sweep: still delivered"* && "$out" != *"agent-a/raw"* ]]'
+note_as agent-a mid-turn "heard at the next edit"
+check "an edit mid-turn carries a new note" eval '
+  touch_as agent-b src/other.ts | jq -e ".hookSpecificOutput.additionalContext | contains(\"agent-a/mid-turn: heard at the next edit\")"'
+check "and the next edit, with nothing new, says nothing" eval '[[ -z "$(touch_as agent-b src/other.ts)" ]]'
+check "nor the next turn" eval '[[ -z "$(prompt_as agent-b)" ]]'
+# Another repository's sessions cannot collide with this one: their notes stay
+# out, and are marked so they are not looked at again.
+mkdir -p "$SANDBOX/code/elsewhere"
+q "INSERT OR REPLACE INTO sessions (name, repo_root, worktree, branch, created_at)
+     VALUES ('elsewhere', '$SANDBOX/code/elsewhere', '$SANDBOX/code/elsewhere', 'x', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
+   INSERT OR REPLACE INTO notes (session, key, value, updated_at)
+     VALUES ('elsewhere', 'foreign', 'another repository', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+check "a note from another repository is never delivered" eval '[[ "$(prompt_as agent-b)" != *foreign* ]]'
+q "DELETE FROM sessions WHERE name = 'elsewhere'; DELETE FROM notes WHERE session = 'elsewhere'"
 check "WTS_CONTEXT_QUIET silences it" eval '
-  sleep 1; note_as agent-a other "x"
+  note_as agent-a other "x"
   [[ -z "$(cd "$WT/agent-b" && print -r -- "{}" | WTS_CONTEXT_QUIET=1 env -u TMUX_PANE "$HOOK" prompt)" ]]'
+check "SessionStart marks what it showed: the next turn does not repeat it" eval '
+  (cd "$WT/agent-b" && env -u TMUX -u TMUX_PANE "$CONTEXT" >/dev/null); [[ -z "$(prompt_as agent-b)" ]]'
 check "a Stop hook still prints nothing" eval '[[ -z "$(cd "$WT/agent-b" && print -r -- "{}" | "$HOOK" stop)" ]]'
-check "rm drops the session's touches and pane" eval '
+check "seen records who has read what" eval '
+  [[ "$(q "SELECT count(*) FROM seen WHERE session = '\''agent-b'\''")" == [1-9]* ]]'
+# A note dies with its author: the siblings hear that the session finished,
+# how, and what it had said.
+note_as agent-b handoff "schema 9 is mine"
+check "rm drops the session's touches, pane and marks" eval '
   "$WTS" rm agent-b -f >/dev/null
-  [[ "$(q "SELECT count(*) FROM touches WHERE session = '\''agent-b'\''") $(q "SELECT count(*) FROM agent_panes WHERE session = '\''agent-b'\''")" == "0 0" ]]'
+  [[ "$(q "SELECT count(*) FROM touches WHERE session = '\''agent-b'\''") $(q "SELECT count(*) FROM agent_panes WHERE session = '\''agent-b'\''") $(q "SELECT count(*) FROM seen WHERE session = '\''agent-b'\''")" == "0 0 0" ]]'
+# How: agent-b has no commit of its own, so its outcome is whatever rm made of
+# an empty branch; the line carries the archive's word for it.
+check "a sibling hears that it finished, how, and the notes it left" eval '
+  o=$(q "SELECT outcome FROM archive WHERE session = '\''agent-b'\'' ORDER BY id DESC LIMIT 1")
+  out=$(prompt_as agent-a)
+  [[ -n "$o" && "$out" == *"session \`agent-b\` finished ($o)"*"handoff: schema 9 is mine"* ]]'
+check "once" eval '[[ "$(prompt_as agent-a)" != *"agent-b"* ]]'
 
 # setup claude --install: six hooks, the read-only permissions, the skill.
 CS="$SANDBOX/claude-setup"
@@ -2859,7 +2908,19 @@ check "a pr_state from schema 7 gets head on the next command" eval '
   "$WTS" ls >/dev/null
   [[ "$(q "SELECT count(*) FROM pragma_table_info('"'"'pr_state'"'"') WHERE name = '"'"'head'"'"'")" == 1
      && "$(q "SELECT state || head FROM pr_state WHERE session = '"'"'old-pr'"'"'")" == open
-     && "$(q "PRAGMA user_version")" == 8 ]]'
+     && "$(q "PRAGMA user_version")" == 9 ]]'
+# Schema 9 is one table, seen: the prompt hook may be the first to open a
+# database an older wts left at 8, and it must create the table, not fail.
+env WTS_NO_ATTACH=1 "$WTS" schema8 smoke >/dev/null
+q "DROP TABLE seen; PRAGMA user_version = 8"
+check "the prompt hook on a schema-8 database exits 0 and prints nothing" eval '
+  out=$(cd "$WT/schema8" && print -r -- "{\"session_id\":\"s\"}" | env -u TMUX_PANE "$HOOK" prompt); (( $? == 0 )) && [[ -z "$out" ]]'
+check "and the database has seen afterwards" eval '
+  [[ "$(q "SELECT count(*) FROM sqlite_master WHERE name = '"'"'seen'"'"'") $(q "PRAGMA user_version")" == "1 9" ]]'
+q "DROP TABLE seen; PRAGMA user_version = 8"
+check "a database at schema 8 gets seen on the next command" eval '
+  "$WTS" ls >/dev/null; [[ "$(q "SELECT count(*) FROM sqlite_master WHERE name = '"'"'seen'"'"'")" == 1 ]]'
+"$WTS" rm schema8 -f >/dev/null 2>&1
 check "log, retro, doctor, keys, doc, stop and pr are info commands for wts-fresh" eval '
   line=$(grep -E "^  ls\|status\|" "$ROOT/libexec/wts/wts-fresh")
   for c in log retro doctor keys doc stop pr; do [[ "$line" == *"|$c|"* ]] || exit 1; done'

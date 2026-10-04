@@ -90,6 +90,32 @@ to happen now does.
   of them open the database read-only, in safe mode, and check a table name
   against `sqlite_master` before it reaches a query.
 
+Second part: what one agent shares reaches the others, exactly once.
+
+- **A note is delivered by what its reader was told, not by a clock.** A turn
+  carried the notes whose `updated_at` was later than the reader's previous
+  prompt, both to the second: a note rewritten in the second it was read was
+  never delivered (the tests slept a second around it), and the rule leaned
+  on `agent_events`, which are swept after a week. Each delivery is now
+  recorded per reader (author, key, the value delivered), read and marked in
+  one transaction: a note is new until its current value has been delivered,
+  whoever wrote it, an older wts with plain SQL included. `SessionStart`
+  marks the notes it shows.
+- **News reach a working agent at its next edit**, in the `PostToolUse`
+  result, and no longer only at its next turn.
+- **The first editor of a file hears that a sibling edited it too**, at its
+  next prompt or edit, once per session and file. Only the second editor was
+  told; the first learned of it after a `/clear`, if ever.
+- **A session that finishes is announced to its siblings**, with its outcome,
+  its PR and the notes it left: "session `x` finished (squashed, PR #37) — the
+  notes it left: …". A note is deleted with its author, usually at the moment
+  the change it announced lands, and the siblings never heard that it had;
+  the outcome says whether to rely on it (abandoned) or on `main` (squashed).
+- Schema 9: one table, `seen(session, stream, ref, mark, at)`, and no column
+  added to `notes` or `touches`, which an older wts sharing the database would
+  write without. The hooks run the migration themselves; `wts rm` and `wts gc`
+  drop a removed session's rows.
+
 ## 1.8.3 — 2026-10-04
 
 - **ctrl-e with no document picked goes straight back to the list.** Esc in

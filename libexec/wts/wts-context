@@ -38,6 +38,12 @@ source "$WTS_BIN/wts-db.zsh"
 db_available || exit 0
 [[ -s "$WTS_DB" ]] || exit 0
 me=$(db_current_session) || exit 0
+# This may be the first wts code to open a database an older wts left at
+# schema 8: the marks below need the seen table. Its fast path is one PRAGMA,
+# and a failure costs the marks only (the next turn repeats a note), never the
+# context.
+db_ready=false
+db_init >/dev/null 2>&1 && db_ready=true
 
 # The agent's Bash tool may not have wts on its PATH (a pane's login shell
 # rebuilds it): name it the way this hook was reached.
@@ -216,6 +222,17 @@ if (( ${#notes} )); then
   print -r -- ""
   print -r -- "Latest notes they left:"
   print -rl -- "${notes[@]}"
+fi
+# What this context carries counts as told: the next turn's hook (wts-hook,
+# deliver_news) delivers only what is newer. Every sibling note and not only
+# the five shown, as the hook does past its own five: the rest is one
+# `wts db notes --all` away. The finished sessions are not marked: this context
+# does not list them, and after a /clear one not yet delivered would be lost.
+if $db_ready; then
+  db_q "INSERT OR REPLACE INTO seen (session, stream, ref, mark, at)
+        SELECT $(sql_str "$me"), 'notes', session || char(31) || key, value,
+               CAST(strftime('%s', 'now') AS INTEGER)
+        FROM notes WHERE session IN $(sql_list "${sibling_names[@]}")" >/dev/null 2>&1
 fi
 
 # The files this session has already edited and a sibling has too — the exact
