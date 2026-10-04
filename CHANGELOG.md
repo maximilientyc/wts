@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- **A task completed in Things leaves the switcher again**, at the next
+  `wts task ls`. `wts task add <id>` and the Things half of `wts log` work from
+  a terminal again too. All three were broken since 1.6.0: the guard that keeps
+  an agent from reading Things wanted a terminal on stdin *and* stderr, and every
+  one of these callers runs the reader with stderr on `/dev/null`. So a person
+  was refused exactly as an agent was, the refusal was hidden, and `wts task ls`
+  printed the stale snapshot in which the task was still open. The guard now
+  tests stdin alone, which an agent's Bash tool still lacks. The tests did not
+  see it because they only reach Things through a stand-in or `WTS_NO_THINGS`,
+  and their one run of the real guard was the refusal. They now also run
+  `wts task ls` on a real terminal, against a Things database built in the
+  sandbox, through the real guard.
+
 ## 1.8.3 — 2026-10-04
 
 - **ctrl-e with no document picked goes straight back to the list.** Esc in

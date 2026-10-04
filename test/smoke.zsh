@@ -2373,6 +2373,59 @@ check "wts-things refuses to read Things without a terminal (exit 3)" eval '
   out=$(env -u WTS_THINGS_DB -u WTS_NO_THINGS "$ROOT/libexec/wts/wts-things" tasks </dev/null 2>&1)
   (( $? == 3 )) && [[ "$out" == *"from a terminal only"* ]]'
 check "and caches no verdict for it" eval '[[ "$(things_kv)" == "$kv_before" ]]'
+
+# A person at a terminal does get Things read, through every caller that hides
+# stderr. From 1.6.0 the guard tested stderr too, and `wts task ls` reads Things
+# with 2>/dev/null: refused for a person as for an agent, without a word, so a
+# task completed in Things never left the switcher. Every other check reaches
+# Things through a stub or WTS_NO_THINGS, which is why none saw it. So: the real
+# guard, the real glob under a HOME of its own, the real probe, on a real tty.
+TH_UUID="SmokeThingsGuard1"
+TH_DIR="$SANDBOX/thome/Library/Group Containers/JLMPQHK86H.com.culturedcode.ThingsMac/ThingsData-TEST/Things Database.thingsdatabase"
+mkdir -p "$TH_DIR"
+sqlite3 -init /dev/null "$TH_DIR/main.sqlite" "
+  CREATE TABLE TMTask (uuid TEXT PRIMARY KEY, title TEXT, notes TEXT, status INTEGER,
+    stopDate REAL, trashed INTEGER, type INTEGER, area TEXT, creationDate REAL,
+    userModificationDate REAL, startDate INTEGER);
+  CREATE TABLE TMArea (uuid TEXT PRIMARY KEY, title TEXT);
+  CREATE TABLE TMTag (uuid TEXT PRIMARY KEY, title TEXT);
+  CREATE TABLE TMTaskTag (tasks TEXT, tags TEXT);
+  INSERT INTO TMTask VALUES ('$TH_UUID', 'Guarded things task', '', 3,
+    1790000000, 0, 0, NULL, 1780000000, 1790000000, NULL);" >/dev/null
+th_kv=$(q "SELECT value FROM kv WHERE key = 'things.db'")
+th_had=$(things_kv)
+q "INSERT INTO tasks (id, source, title, status, synced_at)
+   VALUES ('$TH_UUID', 'things', 'Guarded things task', 'open', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))"
+check "an open Things snapshot is in the switcher" eval '
+  out=$("$SWITCH" --list 2>/dev/null); [[ "$out" == *"Guarded things task"* ]]'
+# A script, and only its path typed: a typed line past the tty's limit is cut.
+print -r -- "#!/bin/zsh -f
+unset WTS_THINGS_DB WTS_NO_THINGS WTS_THINGS_FROM_SCRIPT WTS_THINGS_BIN
+export PATH='$PATH' HOME='$SANDBOX/thome' XDG_STATE_HOME='$XDG_STATE_HOME'
+'$WTS' task ls --all >/dev/null
+print -r -- rc=\$?
+sqlite3 -init /dev/null '$DB' \"SELECT 'snapshot=' || status FROM tasks WHERE id = '$TH_UUID'\"" > "$SANDBOX/thingsls.sh"
+chmod +x "$SANDBOX/thingsls.sh"
+tmux new-session -d -s thingsls -x 160 -y 20 -c "$SANDBOX" "zsh -f -i"
+tmux send-keys -t "=thingsls:" "$SANDBOX/thingsls.sh" Enter
+check "wts task ls at a terminal reads Things through the real guard" pane_contains thingsls "snapshot=completed"
+check "and exits 0" pane_contains thingsls "rc=0"
+check "and the task completed in Things is completed in wts" eval '
+  [[ "$(q "SELECT status FROM tasks WHERE id = '\''$TH_UUID'\''")" == completed ]] &&
+  [[ -n "$(q "SELECT completed_at FROM tasks WHERE id = '\''$TH_UUID'\''")" ]]'
+check "so it leaves the switcher" eval '
+  out=$("$SWITCH" --list 2>/dev/null); [[ "$out" != *"Guarded things task"* ]]'
+check "without a terminal, stderr hidden, it is still refused (exit 3)" eval '
+  env -u WTS_THINGS_DB -u WTS_NO_THINGS -u WTS_THINGS_FROM_SCRIPT HOME="$SANDBOX/thome" \
+    "$ROOT/libexec/wts/wts-things" tasks </dev/null >/dev/null 2>/dev/null
+  (( $? == 3 ))'
+tmux kill-session -t "=thingsls" 2>/dev/null || true
+q "DELETE FROM tasks WHERE id = '$TH_UUID'"
+if [[ "$th_had" == 0 ]]; then
+  q "DELETE FROM kv WHERE key = 'things.db'"
+else
+  q "INSERT OR REPLACE INTO kv VALUES ('things.db', '$th_kv')"
+fi
 check "a task picker without a terminal names what to pass, exit 2" eval '
   out=$(env -u WTS_THINGS_DB "$WTS" task show </dev/null 2>&1)
   [[ "$out" == *"no terminal to pick a task in"*"wts task ls --json"* ]]'
