@@ -78,6 +78,18 @@ to happen now does.
   `stale` is a key of its own, not an `agent_state`. `docs/roadmap.md` has what
   the audit left open (section 2).
 
+- **`wts db tables`, `wts db row`, `wts db browse`, and `wts db schema <table>`.**
+  Finding a column meant reading the whole `.schema` and writing a SELECT.
+  `tables` lists every table with its row and column counts (`--json`: sqlite3's
+  own array, like `wts db sql --json`); `schema <table>` prints that table's
+  CREATE statements only; `row <table> <rowid>` prints one record, one field per
+  line, and exits 1 when it does not exist. `browse` is the same in fzf for a
+  human: the tables with the schema in the preview, then a table's rows newest
+  first with the record in the preview; `enter` prints it, `esc` goes back.
+  Without a terminal it exits 2 and names `wts db tables` and `wts db row`. All
+  of them open the database read-only, in safe mode, and check a table name
+  against `sqlite_master` before it reaches a query.
+
 ## 1.8.3 — 2026-10-04
 
 - **ctrl-e with no document picked goes straight back to the list.** Esc in

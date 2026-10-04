@@ -52,6 +52,7 @@ docs/demo/                record.zsh + demo.tape (README GIF, make demo)
                           + release-gc.zsh/.tape (gc on a squash a release rewrote, stand-in gh)
                           + things-done.zsh/.tape (a task done in Things leaves the switcher)
                           + agents-together.zsh/.tape (send and wait look at the agent first)
+                          + db-browse.zsh/.tape (wts db browse: the tables, a table's rows, a record)
 ```
 
 Homebrew, `make install` and a git checkout share this tree, so `bin/wts` works
@@ -263,6 +264,9 @@ straight from the checkout. Scripts locate each other from their own path
 - `${${(f)text}[1]}` is the first line only when there are several: a one-line
   text is not split, so `[1]` indexes the string and gives its first character
   (`⚠ registry not updated: d`). The first line is `${text%%$'\n'*}`.
+  `${${=text}[1]}` does the same with words: in `wts db browse` a row whose
+  columns are all empty lists as its rowid alone, and `14` gave `1`, the wrong
+  record. Split into an array first: `w=(${=text}); ${w[1]:-}`.
 - A smoke `check … eval '…'` runs in the test's own shell: an `exit` inside it
   ends the whole run, with no FAIL line, and the next checks silently never
   run. Do the setup and the cleanup outside the check, as plain statements.

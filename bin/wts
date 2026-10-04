@@ -30,7 +30,8 @@
 #        wts keys
 #        wts doctor [--json]
 #        wts setup tmux [--install] | git | claude [--install]
-#        wts db path | schema | sql "<SELECT>" | notes [--all] | get | set | del
+#        wts db path | tables | schema [<table>] | row <table> <rowid> | browse [<table>]
+#        wts db sql "<SELECT>" | notes [--all] | get | set | del
 #        wts help | wts version | wts <command> --help
 #
 #   <name>     : name of the worktree AND of the tmux session
@@ -107,7 +108,9 @@
 #                agent in a wts session about the others, the permissions for
 #                the read-only verbs, and (--install) the wts skill
 #   db         : the state database (SQLite): read anything, and notes the
-#                agents leave for each other (`wts db help`)
+#                agents leave for each other (`wts db help`). `tables` counts
+#                rows and columns, `schema <table>` gives one table's, `row`
+#                prints one record; `browse` picks a table, then a row, in fzf
 #
 # Examples:
 #   wts auth-form
@@ -1690,7 +1693,7 @@ if [[ "$1" == "db" ]]; then
   db_session=""
   db_json=0
   db_all=0
-  typeset -a db_args
+  typeset -a db_args db_words
   db_args=()
   while (( $# )); do
     case "$1" in
@@ -1737,12 +1740,163 @@ if [[ "$1" == "db" ]]; then
   else db_mode=(-tabs -header)
   fi
 
+  # The user tables, one name per line. Names come from wts's own schema, so a
+  # line split is safe; they still go through db_ident before reaching SQL.
+  db_table_names() {
+    _db -readonly -safe "$WTS_DB" \
+      "SELECT name FROM sqlite_master WHERE type = 'table'
+         AND name NOT LIKE 'sqlite\_%' ESCAPE '\' ORDER BY name"
+  }
+
+  # A double-quoted SQL identifier. Only called on a name db_need_table has
+  # found in sqlite_master: a table name typed by a caller is never trusted.
+  db_ident() {
+    local dq='"'
+    print -r -- "$dq${1//$dq/$dq$dq}$dq"
+  }
+
+  db_need_table() {
+    local n
+    n=$(_db -readonly -safe "$WTS_DB" \
+      "SELECT count(*) FROM sqlite_master WHERE type = 'table'
+         AND name NOT LIKE 'sqlite\_%' ESCAPE '\' AND name = $(sql_str "$1")")
+    if [[ "$n" != 1 ]]; then
+      echo "wts db: no table '$1' (wts db tables)" >&2
+      exit 1
+    fi
+  }
+
+  # One SELECT per table, joined: a count needs the table's name as an
+  # identifier, which no single query over sqlite_master can supply.
+  db_tables_sql() {
+    local t sql=""
+    for t in ${(f)"$(db_table_names)"}; do
+      sql+="${sql:+ UNION ALL }SELECT $(sql_str "$t") AS \"table\",
+        (SELECT count(*) FROM $(db_ident "$t")) AS \"rows\",
+        (SELECT count(*) FROM pragma_table_info($(sql_str "$t"))) AS \"columns\""
+    done
+    print -r -- "${sql:-SELECT NULL AS \"table\" WHERE 0} ORDER BY 1"
+  }
+
+  # The rows of a table for the picker, newest first: every column cut to 24
+  # characters on one line, so a prompt or a note does not break the list.
+  db_rows_sql() {
+    local c cols="rowid AS \"#\""
+    for c in ${(f)"$(_db -readonly -safe "$WTS_DB" \
+                      "SELECT name FROM pragma_table_info($(sql_str "$1")) ORDER BY cid")"}; do
+      cols+=", substr(replace(replace(coalesce(CAST($(db_ident "$c") AS TEXT), ''),
+               char(10), ' '), char(9), ' '), 1, 24) AS $(db_ident "$c")"
+    done
+    print -r -- "SELECT $cols FROM $(db_ident "$1") ORDER BY rowid DESC"
+  }
+
+  # One record, one field per line whatever stdout is: a box of one row and
+  # twenty columns is wider than any terminal.
+  # db_row <-line|-json> <table> <rowid>: the table already checked.
+  db_row() {
+    local out
+    out=$(_db -readonly -safe "$1" "$WTS_DB" \
+      "SELECT * FROM $(db_ident "$2") WHERE rowid = $3")
+    if [[ -z "$out" ]]; then
+      echo "wts db: no row $3 in '$2'" >&2
+      exit 1
+    fi
+    print -r -- "$out"
+  }
+
   case "$sub" in
     path)
       print -r -- "$WTS_DB" ;;
 
     schema)
-      _db -readonly "$WTS_DB" '.schema' ;;
+      if (( ${#db_args} > 1 )); then
+        echo "Usage: wts db schema [<table>]" >&2
+        exit 2
+      fi
+      if (( ${#db_args} == 0 )); then
+        _db -readonly "$WTS_DB" '.schema'
+      else
+        db_need_table "${db_args[1]}"
+        _db -readonly -safe "$WTS_DB" \
+          "SELECT sql FROM sqlite_master
+            WHERE tbl_name = $(sql_str "${db_args[1]}") AND sql IS NOT NULL"
+      fi ;;
+
+    tables)
+      if (( ${#db_args} )); then
+        echo "Usage: wts db tables [--json]" >&2
+        exit 2
+      fi
+      _db -readonly -safe "${db_mode[@]}" "$WTS_DB" "$(db_tables_sql)" ;;
+
+    row)
+      if (( ${#db_args} != 2 )); then
+        echo "Usage: wts db row <table> <rowid> [--json]" >&2
+        exit 2
+      fi
+      if [[ "${db_args[2]}" != <-> ]]; then
+        echo "wts db: rowid must be a number, not '${db_args[2]}'" >&2
+        exit 1
+      fi
+      db_need_table "${db_args[1]}"
+      if (( db_json )); then
+        db_row -json "${db_args[1]}" "${db_args[2]}"
+      else
+        db_row -line "${db_args[1]}" "${db_args[2]}"
+      fi ;;
+
+    browse)
+      if (( ${#db_args} > 1 )); then
+        echo "Usage: wts db browse [<table>]" >&2
+        exit 2
+      fi
+      # A picker needs a terminal to draw on and to read keys from; stdout may
+      # well be captured (the record picked is printed there).
+      if [[ ! -t 0 || ! -t 2 ]] || (( ! ${+commands[fzf]} )); then
+        echo "wts db browse: needs a terminal and fzf; without them use" \
+             "wts db tables, then wts db row <table> <rowid>" >&2
+        exit 2
+      fi
+      db_fixed="${db_args[1]:-}"
+      if [[ -n "$db_fixed" ]]; then
+        db_need_table "$db_fixed"
+      fi
+      # Two fzf calls in a loop, not one fzf with reload binds: going back is
+      # leaving the inner picker, and nothing runs in fzf's background group.
+      while true; do
+        if [[ -n "$db_fixed" ]]; then
+          db_table="$db_fixed"
+        else
+          db_pick=$(_db -readonly -safe -column -header "$WTS_DB" "$(db_tables_sql)" |
+            fzf --reverse --header-lines=2 --no-sort \
+                --header 'enter: rows of the table   esc: quit' \
+                --preview "${(q)WTS_SELF} db schema {1}" \
+                --preview-window=right,50%,wrap) || exit 0
+          # An array, then [1]: a one-word line split as ${${=x}[1]} stays a
+          # scalar, and [1] is its first character.
+          db_words=(${=db_pick})
+          db_table="${db_words[1]:-}"
+          db_need_table "$db_table"
+        fi
+        db_pick=$(_db -readonly -safe -column -header "$WTS_DB" "$(db_rows_sql "$db_table")" |
+          fzf --reverse --header-lines=2 --no-sort \
+              --header "${db_table}: enter prints the row   esc: back" \
+              --preview "${(q)WTS_SELF} db row ${(q)db_table} {1}" \
+              --preview-window=right,60%,wrap) || {
+          if [[ -n "$db_fixed" ]]; then
+            exit 0
+          fi
+          continue
+        }
+        # A row whose columns are all empty lists as its rowid alone: 14 read
+        # as ${${=x}[1]} is 1, and the wrong record would print.
+        db_words=(${=db_pick})
+        db_rowid="${db_words[1]:-}"
+        if [[ "$db_rowid" == <-> ]]; then
+          db_row -line "$db_table" "$db_rowid"
+          exit 0
+        fi
+      done ;;
 
     sql)
       if (( ${#db_args} != 1 )); then
@@ -1800,7 +1954,10 @@ if [[ "$1" == "db" ]]; then
     help|-h|--help)
       print -r -- 'Usage: wts db <command>
   path                          where the database is
-  schema                        its tables
+  tables [--json]               its tables, with their row and column counts
+  schema [<table>]              the CREATE statements (of one table)
+  row <table> <rowid> [--json]  one record, one field per line
+  browse [<table>]              pick a table, then a row, in fzf (a terminal only)
   sql "<SELECT ...>" [--json]   any read-only query, over every table
   notes [--all] [--json]        this session'"'"'s notes (--all: every session'"'"'s)
   get <key>                     one note of this session

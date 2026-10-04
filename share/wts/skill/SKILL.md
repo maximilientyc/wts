@@ -10,7 +10,8 @@ description: wts runs parallel Claude Code agents on this machine, one per git w
 Every command below works without a terminal: none asks a question or opens a
 picker without one (they exit 2 and say what to pass instead). Exit codes: 0
 done, 1 failed, 2 usage. JSON outputs are objects with `"version": 1`, except
-`wts status --json`, an array of sessions; keys are added, never renamed.
+`wts status --json`, an array of sessions, and `wts db sql|tables|row --json`,
+sqlite3's own array of rows; keys are added, never renamed.
 
 ## What is going on
 
@@ -20,8 +21,8 @@ done, 1 failed, 2 usage. JSON outputs are objects with `"version": 1`, except
 | `wts brief --cached --json` | each session's last "done / next" summary and its age — no model call |
 | `wts task ls --all --json`, `wts task show <id> --json` | tasks, their notes, documents, live sessions and previous attempts |
 | `wts doc ls --json`, `wts doc show <slug> --json` | the context documents and which sessions they are attached to |
-| `wts db notes --all` | the notes the agents left each other |
-| `wts db sql "<SELECT …>" --json` | anything else (read-only); `wts db schema` lists the tables |
+| `wts db notes --all` | the notes the agents left each other; `wts db row <table> <rowid>` prints one record of any table |
+| `wts db sql "<SELECT …>" --json` | anything else (read-only); find the table with `wts db tables` (row and column counts) and its columns with `wts db schema <table>`, rather than reading the whole `wts db schema` |
 | `wts log --since '-30 days'` | finished sessions, outcomes, retrospectives, tokens and cost per session and per task |
 | `wts doctor --json` | whether wts can work on this machine |
 
