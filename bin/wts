@@ -1705,7 +1705,9 @@ if [[ "$1" == "db" ]]; then
 
   # The session a note belongs to: --session, else the one this command runs in.
   # With `write`, --session may only name the caller's own session unless a
-  # person is typing (see above).
+  # person is typing (see above): a terminal on stdin, which is what an agent's
+  # Bash tool lacks. Not stderr too — a caller that hides it would refuse a
+  # person (the Things guard did, for three releases).
   db_need_session() {  # [write]
     local own
     if [[ -n "$db_session" ]]; then
@@ -1715,7 +1717,7 @@ if [[ "$1" == "db" ]]; then
       fi
       if [[ "${1:-}" == write ]]; then
         own=$(db_current_session) || own=""
-        if [[ "$db_session" != "$own" && ! ( -t 0 && -t 2 ) ]]; then
+        if [[ "$db_session" != "$own" && ! -t 0 ]]; then
           echo "wts db: '$db_session' is another session: its notes are written from its own worktree, or from a terminal" >&2
           exit 2
         fi

@@ -51,6 +51,7 @@ docs/demo/                record.zsh + demo.tape (README GIF, make demo)
                           + squash-gc.zsh/.tape (gc on a squash of several commits)
                           + release-gc.zsh/.tape (gc on a squash a release rewrote, stand-in gh)
                           + things-done.zsh/.tape (a task done in Things leaves the switcher)
+                          + agents-together.zsh/.tape (send and wait look at the agent first)
 ```
 
 Homebrew, `make install` and a git checkout share this tree, so `bin/wts` works
@@ -87,8 +88,8 @@ straight from the checkout. Scripts locate each other from their own path
   is blocked. `WTS_CLAUDE_ALLOW` in `wts-db.zsh` is what an agent may run
   without a prompt: read-only verbs and its own notes, nothing that acts on
   someone's work. A rule there covers every flag of its verb, so a flag that
-  deletes or writes as someone else takes a terminal (`wts db set --session
-  <other>`, `wts task note --clear`).
+  deletes or writes as someone else takes a terminal on stdin (`wts db set
+  --session <other>`, `wts task note --clear`).
 - The model is only called on explicit commands (`wts "<phrase>"`, `wts brief`,
   `wts doc add|sync`, `wts retro`, and `wts gc --apply`), never from `ls`, the
   switcher or hooks. `WTS_NO_LLM=1` disables it. `gc` is the widest of these and

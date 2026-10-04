@@ -92,11 +92,11 @@ cmd_send() {
       case "$state" in
         working|idle) ;;
         blocked)
-          die "'$name' is blocked${waiting:+ on: $waiting} — what you send would be typed into that question. Answer it: wts send $name --answer <choice>" ;;
+          die "'$name' is blocked${waiting:+ on: $waiting}"$'\n'"          what you send would be typed into that question. To answer it: wts send $name --answer <choice>" ;;
         *)
           local what="it is $state"
           [[ "$state" == unknown ]] && what="none is known there"
-          die "no agent is reading in '$name' ($what): its pane may be a shell, where the text would run as a command. wts restore $name starts it again; --force types anyway" ;;
+          die "no agent is reading in '$name' ($what)"$'\n'"          its pane may be a shell, where the text would run as a command. wts restore $name starts it again; --force types anyway" ;;
       esac
     fi
   fi
@@ -182,7 +182,8 @@ cmd_wait() {
     # "Call it again" was the only advice, and for a session no agent is known
     # in it is advice to loop: nothing there will ever report a state.
     if (( ${#nobody} )); then
-      print -u2 -r -- "wts wait: no agent known in ${(j:, :)nobody} (not started yet, or gone without a word for over 12 hours): waiting longer will not change it — wts status --json, wts restore <name>"
+      print -u2 -r -- "wts wait: no agent known in ${(j:, :)nobody} (not started yet, or gone without a word for over 12 hours)"
+      print -u2 -r -- "          waiting longer will not change it: wts status --json, wts restore <name>"
     else
       print -u2 -r -- "wts wait: not reached after ${timeout}s; call it again to keep waiting"
     fi
