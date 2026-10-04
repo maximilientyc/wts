@@ -9,7 +9,7 @@
 #        wts doc use <slug> [session] | tools
 #        wts ls [--wide] | wts status [--json|--table [--wide]|--fzf]
 #        wts brief [name...] | brief --cached [--json] [name...]
-#        wts send <session> <text...>
+#        wts send <session> [--answer | --force] <text...>
 #        wts wait <session>... [--until <state>,...] [--timeout <s>] [--json]
 #        wts tail <session> [-n <k>] [--json]
 #        wts restore [name...]
@@ -50,17 +50,20 @@
 #                JSON: name, branch, worktree, task (an array for `new`)
 #
 #   new        : create several sessions at once, then attach to the first
-#   ls         : list registered sessions and their state (agent, git delta);
-#                --wide: tokens, API-price cost and model too (as of the last
-#                `wts brief`, or the teardown)
+#   ls         : list registered sessions and their state (agent and since
+#                when, git delta); --wide: tokens, API-price cost and model
+#                too (as of the last `wts brief`, or the teardown), and what
+#                a blocked agent is waiting for
 #   status     : same collection, as JSON (--json), table (--table) or fzf lines (--fzf)
 #   brief      : where each session stands, "done / next", summarized by Claude;
 #                --cached: the last summaries, from the database, no model call
 #   send       : type a line into a session's agent and submit it (the agent's
-#                own pane; refused when it is not known)
+#                own pane; refused when it is not known, or when no agent is
+#                working or idle in it). --answer: the line answers the
+#                question the agent is blocked on; --force: whatever its state
 #   wait       : return once each session's agent is in one of the states
-#                (default: no longer working), or after --timeout (90 s); exit 1
-#                on timeout
+#                (default: no longer working, or stuck), or after --timeout
+#                (90 s); exit 1 on timeout
 #   tail       : the agent's last messages, from its transcript
 #   restore    : restart registered sessions missing from tmux (after a reboot)
 #                and pre-fill `claude --continue`
@@ -190,12 +193,17 @@ registry_put() {
 # notes their agent left, and the task they served. The archive row is NOT
 # touched — it is the one thing meant to outlive the session, and it carries the
 # task itself, so the durable link survives while the live one goes.
+#
+# Status 1, and sqlite3's reason on stderr, when nothing was deleted: this used
+# to end on `|| true`, so a locked database left the row and every side row in
+# place while `wts rm` said the session was gone — and the next session of that
+# name inherited its notes, its events and its PR state. gc already said so.
 registry_del() {
   registry_available || return 0
   [[ -s "$WTS_DB" ]] || return 0
-  local in
+  local in err
   in=$(sql_list "$@")
-  db_q "BEGIN IMMEDIATE;
+  if ! err=$(db_q "BEGIN IMMEDIATE;
         DELETE FROM sessions WHERE name IN $in;
         DELETE FROM briefs WHERE session IN $in;
         DELETE FROM notes WHERE session IN $in;
@@ -205,22 +213,48 @@ registry_del() {
         DELETE FROM touches WHERE session IN $in;
         DELETE FROM pr_state WHERE session IN $in;
         DELETE FROM merge_checks WHERE session IN $in;
-        COMMIT;" >/dev/null 2>&1 || true
+        DELETE FROM kv WHERE key IN $(sql_list "${@/#/teardown:}");
+        COMMIT;" 2>&1 >/dev/null); then
+    echo "⚠ registry not updated ($WTS_DB)${err:+: $(first_line "$err")} — still registered: $*. wts gc --apply clears what is left" >&2
+    return 1
+  fi
   db_q "$(usage_prune_sql)" >/dev/null 2>&1 || true
+  return 0
 }
 
-# Drop the entries whose worktree is gone. One DELETE for all of them: the
-# JSON registry was rewritten once per stale entry.
-registry_prune() {
+# What `wts-retro store` reads on stdin, for a session whose worktree is gone:
+# there is no folder to collect git facts from, so the record carries what the
+# registry knows, under <outcome>.
+# base outcome pr title commits files added removed commit_count file_count
+# transcript session_id bytes mtime — the record `wts-retro collect` writes.
+registry_bare_facts() {  # <outcome>
+  local -a rec
+  rec=("" "$1" "" "" "" "" 0 0 0 0 "" "" 0 0)
+  print -rn -- "${(pj:\x1f:)rec}"$'\x1e'
+}
+
+# Drop the entries whose worktree is gone — all of them, or the named ones. One
+# DELETE for all: the JSON registry was rewritten once per stale entry.
+#
+# Not the ones `wts rm` is tearing down right now (its `teardown:<name>` mark
+# in kv, for a minute): rm removes the worktree, then the branch, and only then
+# archives. A `wts ls` run in between — any agent may, without a prompt — saw a
+# row with no worktree, archived it `unknown` and deleted it, and rm's own
+# record, the one with the outcome, the diff and the transcript, was refused.
+registry_prune() {  # [<name>…]
   registry_available || return 0
   [[ -s "$WTS_DB" ]] || return 0
-  local name worktree
+  local name worktree only="1"
   local -a stale
   stale=()
+  (( $# )) && only="s.name IN $(sql_list "$@")"
   while IFS=$'\x1f' read -r -d $'\x1e' name worktree; do
     [[ -n "$name" ]] || continue
     [[ -d "$worktree" ]] || stale+=("$name")
-  done < <(db_rows "SELECT name, worktree FROM sessions" 2>/dev/null)
+  done < <(db_rows "SELECT s.name, s.worktree FROM sessions s
+                    WHERE $only AND NOT EXISTS (
+                      SELECT 1 FROM kv WHERE key = 'teardown:' || s.name
+                        AND CAST(value AS INTEGER) > CAST(strftime('%s', 'now') AS INTEGER) - 60)" 2>/dev/null)
   (( ${#stale} )) || return 0
   # Archived first. A worktree removed by hand — `rm -rf`, a `git worktree
   # remove` typed directly — took the registry row, the notes and the task link
@@ -228,18 +262,16 @@ registry_prune() {
   # heard of. There is no folder left to collect git facts from, so the record
   # carries what the registry knows, under the outcome `unknown`.
   if [[ -z "${WTS_NO_ARCHIVE:-}" && -x "$WTS_LIBEXEC/wts-retro" ]]; then
-    local -a rec
-    # base outcome pr title commits files added removed commit_count file_count
-    # transcript session_id bytes mtime — the record `wts-retro collect` writes.
-    rec=("" unknown "" "" "" "" 0 0 0 0 "" "" 0 0)
     for name in "${stale[@]}"; do
-      if print -rn -- "${(pj:\x1f:)rec}"$'\x1e' \
+      if registry_bare_facts unknown \
          | "$WTS_LIBEXEC/wts-retro" store "$name" 2>/dev/null; then
         print -u2 -r -- "→ $name: worktree gone, archived (wts log)"
       fi
     done
   fi
-  registry_del "${stale[@]}"
+  # `|| true`: a listing must not die of a housekeeping that failed, under
+  # `set -e`. registry_del has said why, and the next listing tries again.
+  registry_del "${stale[@]}" || true
   return 0
 }
 
@@ -900,7 +932,7 @@ if [[ "$1" == "ls" || "$1" == "status" ]]; then
   # `wts ls --json` printed the table and exited 0: the argument was dropped
   # without a word, and a script reading JSON got a box. `ls` takes nothing;
   # `status` is the one with formats.
-  # --wide is the one option: the same table with three more columns.
+  # --wide is the one option: the same table with four more columns.
   ls_wide=()
   if [[ "$sub" == ls && "${1:-}" == --wide ]]; then
     ls_wide=(--wide)
@@ -973,7 +1005,7 @@ if [[ "$1" == "brief" ]]; then
         if [[ -z "$bbody" ]]; then
           print -r -- "$bname  (no brief yet: wts brief $bname)"
         else
-          print -r -- "$bname  ($(( bage / 60 ))m ago)"
+          print -r -- "$bname  ($(age_ago "$bage"))"
           print -r -- "$bbody" | sed 's/^/  /'
         fi
       done < <(db_rows "SELECT s.name, coalesce(b.body, ''),
@@ -1091,10 +1123,8 @@ if [[ "$1" == "restore" ]]; then
     # rather than the agent's. Only an id whose transcript is still there, and
     # only the characters `--resume` and the layout's quoting expect.
     export WTS_RESUME_ID=""
-    resume_id=$(db_ro "SELECT claude_session FROM agent_events
-                       WHERE session = $(sql_str "$name") AND claude_session != ''
-                       ORDER BY at DESC, id DESC LIMIT 1" 2>/dev/null) || resume_id=""
-    if [[ "$resume_id" =~ '^[0-9a-f-]+$' \
+    resume_id=$(db_claude_session_of "$name") || resume_id=""
+    if [[ -n "$resume_id" \
           && -f "$(claude_project_dir "$workdir")/$resume_id.jsonl" ]]; then
       WTS_RESUME_ID="$resume_id"
       WTS_RESUME=1
@@ -1394,6 +1424,24 @@ if [[ "$1" == "rm" ]]; then
     echo "→ no tmux session '$SESSION'"
   fi
 
+  # -f is the caller saying the branch may go whatever it holds: abandoned,
+  # unless it did land.
+  if [[ -n "$LANDED" ]]; then
+    retro_outcome="$LANDED"
+  elif [[ "$FORCE" == true ]]; then
+    retro_outcome=abandoned
+  else
+    retro_outcome=removed
+  fi
+  RETRO_FACTS=""
+
+  # From here to the archive below, the row has no worktree: say that it is
+  # being torn down, so a listing run meanwhile leaves it alone (registry_prune).
+  if registry_has "$SESSION"; then
+    db_q "INSERT OR REPLACE INTO kv VALUES
+          ($(sql_str "teardown:$SESSION"), strftime('%s', 'now'))" >/dev/null 2>&1 || true
+  fi
+
   # 2. Remove the worktree (read its branch first)
   if [[ -d "$worktree_path" ]]; then
     BRANCH=$(git -C "$worktree_path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
@@ -1407,22 +1455,12 @@ if [[ "$1" == "rm" ]]; then
     # Every step here is guarded: this file runs under `set -e`, a missing
     # origin/HEAD is normal in a fresh repository, and losing `wts rm` to a
     # failed archive would be a poor trade.
-    RETRO_FACTS=""
     if [[ -z "${WTS_NO_ARCHIVE:-}" && -x "$WTS_LIBEXEC/wts-retro" ]]; then
       base_for_retro="${WTS_BASE_BRANCH:-}"
       if [[ -z "$base_for_retro" ]]; then
         base_for_retro=$(git -C "$repo_root" symbolic-ref --quiet --short \
                            refs/remotes/origin/HEAD 2>/dev/null || true)
         base_for_retro="${base_for_retro#origin/}"
-      fi
-      # -f is the caller saying the branch may go whatever it holds: abandoned,
-      # unless it did land.
-      if [[ -n "$LANDED" ]]; then
-        retro_outcome="$LANDED"
-      elif [[ "$FORCE" == true ]]; then
-        retro_outcome=abandoned
-      else
-        retro_outcome=removed
       fi
       RETRO_FACTS=$(mktemp "${TMPDIR:-/tmp}/wts-rm-retro.XXXXXX" 2>/dev/null || true)
       if [[ -n "$RETRO_FACTS" ]]; then
@@ -1463,6 +1501,17 @@ if [[ "$1" == "rm" ]]; then
     if [[ -d "$repo_root" ]]; then
       git -C "$repo_root" worktree prune 2>/dev/null || true
     fi
+    # Archived all the same, from what the registry knows: `wts ls` archives
+    # such a session before it drops the row, and this path dropped it with its
+    # notes, brief and task link unrecorded — whichever command came first
+    # decided whether the session left a trace.
+    if registry_has "$SESSION" && [[ -z "${WTS_NO_ARCHIVE:-}" && -x "$WTS_LIBEXEC/wts-retro" ]]; then
+      RETRO_FACTS=$(mktemp "${TMPDIR:-/tmp}/wts-rm-retro.XXXXXX" 2>/dev/null || true)
+      if [[ -n "$RETRO_FACTS" ]]; then
+        registry_bare_facts "$retro_outcome" > "$RETRO_FACTS" 2>/dev/null || true
+        RETRO_BARE=true
+      fi
+    fi
   fi
 
   # 3. Delete the branch
@@ -1502,7 +1551,11 @@ if [[ "$1" == "rm" ]]; then
   # deletes. This is the index `wts rm` used to destroy.
   if [[ -n "${RETRO_FACTS:-}" && -s "$RETRO_FACTS" ]]; then
     if store_err=$("$WTS_LIBEXEC/wts-retro" store "$SESSION" < "$RETRO_FACTS" 2>&1 >/dev/null); then
-      echo "→ archived (wts log) — retrospective pending: wts retro"
+      if [[ -n "${RETRO_BARE:-}" ]]; then
+        echo "→ archived (wts log), from the registry alone: the worktree was already gone"
+      else
+        echo "→ archived (wts log) — retrospective pending: wts retro"
+      fi
     else
       echo "⚠ not archived${store_err:+: $(first_line "$store_err")}"
     fi
@@ -1510,7 +1563,9 @@ if [[ "$1" == "rm" ]]; then
   if [[ -n "${RETRO_FACTS:-}" ]]; then
     rm -f "$RETRO_FACTS"
   fi
-  registry_del "$SESSION"
+  # Status 1 when the row is still there (registry_del has said why): the
+  # session is torn down, and wts still lists it.
+  registry_del "$SESSION" || exit 1
 
   exit 0
 fi
@@ -1621,6 +1676,9 @@ fi
 # you). Everything is readable; the only thing writable from here is `notes`,
 # keyed by the caller's session: the other tables are wts's own, and an agent
 # rewriting them would desynchronize the registry from the worktrees.
+# `--session <other>` writes as another session, from a terminal only: `wts db`
+# is a verb an agent runs without a prompt (WTS_CLAUDE_ALLOW), and with it any
+# agent could rewrite or delete what another one had left for the rest.
 
 if [[ "$1" == "db" ]]; then
   shift
@@ -1646,11 +1704,23 @@ if [[ "$1" == "db" ]]; then
   done
 
   # The session a note belongs to: --session, else the one this command runs in.
-  db_need_session() {
+  # With `write`, --session may only name the caller's own session unless a
+  # person is typing (see above).
+  db_need_session() {  # [write]
+    local own
     if [[ -n "$db_session" ]]; then
-      db_has_session "$db_session" && return 0
-      echo "wts db: '$db_session' is not a registered session (wts ls)" >&2
-      exit 1
+      if ! db_has_session "$db_session"; then
+        echo "wts db: '$db_session' is not a registered session (wts ls)" >&2
+        exit 1
+      fi
+      if [[ "${1:-}" == write ]]; then
+        own=$(db_current_session) || own=""
+        if [[ "$db_session" != "$own" && ! ( -t 0 && -t 2 ) ]]; then
+          echo "wts db: '$db_session' is another session: its notes are written from its own worktree, or from a terminal" >&2
+          exit 2
+        fi
+      fi
+      return 0
     fi
     db_session=$(db_current_session) && return 0
     echo "wts db: not inside a wts session; pass --session <name>" >&2
@@ -1675,7 +1745,7 @@ if [[ "$1" == "db" ]]; then
     sql)
       if (( ${#db_args} != 1 )); then
         echo 'Usage: wts db sql "<SELECT ...>" [--json]' >&2
-        exit 1
+        exit 2
       fi
       # -readonly: no write reaches wts's tables. -safe: no .shell, no ATTACH,
       # no readfile()/writefile(): a query stays a query.
@@ -1684,7 +1754,7 @@ if [[ "$1" == "db" ]]; then
     get)
       if (( ${#db_args} != 1 )); then
         echo "Usage: wts db get <key> [--session <name>]" >&2
-        exit 1
+        exit 2
       fi
       db_need_session
       db_ro "SELECT value FROM notes WHERE session = $(sql_str "$db_session")
@@ -1693,9 +1763,9 @@ if [[ "$1" == "db" ]]; then
     set)
       if (( ${#db_args} != 2 )); then
         echo "Usage: wts db set <key> <value|-> [--session <name>]" >&2
-        exit 1
+        exit 2
       fi
-      db_need_session
+      db_need_session write
       db_value="${db_args[2]}"
       [[ "$db_value" == - ]] && db_value="$(cat)"
       db_q "INSERT INTO notes (session, key, value, updated_at)
@@ -1708,9 +1778,9 @@ if [[ "$1" == "db" ]]; then
     del)
       if (( ${#db_args} != 1 )); then
         echo "Usage: wts db del <key> [--session <name>]" >&2
-        exit 1
+        exit 2
       fi
-      db_need_session
+      db_need_session write
       db_q "DELETE FROM notes WHERE session = $(sql_str "$db_session")
                                 AND key = $(sql_str "${db_args[1]}")" >/dev/null ;;
 
@@ -1734,11 +1804,12 @@ if [[ "$1" == "db" ]]; then
   get <key>                     one note of this session
   set <key> <value|->           write a note ('"'"'-'"'"' reads stdin)
   del <key>                     remove a note
-  --session <name>              act as another session (default: the one you are in)' ;;
+  --session <name>              another session'"'"'s notes (default: the one you are in);
+                                set and del as another session: from a terminal only' ;;
 
     *)
       echo "wts db: unknown command '$sub' (wts db help)" >&2
-      exit 1 ;;
+      exit 2 ;;
   esac
   exit 0
 fi
@@ -2281,6 +2352,19 @@ if registry_has "$SESSION"; then
       exit 1
     fi
   fi
+fi
+
+# A name the registry still holds for a worktree that is gone, about to get a
+# NEW branch: another piece of work under a name used before. Its row is
+# archived and dropped first (registry_prune). registry_put upserts on the name
+# alone, so the new session was born with the old one's creation date, notes,
+# events, brief, task link and PR state — and the transcript lookups, bounded
+# by that date, reached back into the previous conversations. When the branch
+# still exists the worktree is being brought back for the same work, and the
+# row is that work's: kept.
+if registry_has "$SESSION" && [[ ! -d "$worktree_path" ]] \
+   && ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+  registry_prune "$SESSION"
 fi
 
 # What the session needs to start, checked while nothing exists: tmuxinator was

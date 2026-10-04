@@ -9,14 +9,14 @@ description: wts runs parallel Claude Code agents on this machine, one per git w
 `wts` is on PATH in a wts pane; if your shell does not find it: `{{WTS}}`.
 Every command below works without a terminal: none asks a question or opens a
 picker without one (they exit 2 and say what to pass instead). Exit codes: 0
-done, 1 failed, 2 usage. JSON outputs carry `"version": 1`; keys are added,
-never renamed.
+done, 1 failed, 2 usage. JSON outputs are objects with `"version": 1`, except
+`wts status --json`, an array of sessions; keys are added, never renamed.
 
 ## What is going on
 
 | Command | What it answers |
 |---|---|
-| `wts status --json` | every session: `name`, `branch`, `worktree`, `agent_state` (blocked working idle done failed stopped), `agent_since`, `agent_waiting_for`, `task`, git delta, `merged` (squash included), `pr` (number, state, checks, review, as `wts pr --refresh` last cached them), `usage` (tokens and cost) |
+| `wts status --json` | every session: `name`, `branch`, `worktree`, `agent_state` (blocked working idle done failed stopped, or null: no agent known), `stale` (true: it says working and its pane no longer moves), `agent_since`, `agent_waiting_for`, `task`, git delta, `merged` (squash included), `pr` (number, state, checks, review, as `wts pr --refresh` last cached them), `usage` (tokens and cost) |
 | `wts brief --cached --json` | each session's last "done / next" summary and its age — no model call |
 | `wts task ls --all --json`, `wts task show <id> --json` | tasks, their notes, documents, live sessions and previous attempts |
 | `wts doc ls --json`, `wts doc show <slug> --json` | the context documents and which sessions they are attached to |
@@ -27,11 +27,12 @@ never renamed.
 
 ## Working next to other agents (inside a session)
 
-- When you edit a file another session of this repository edits too, wts tells
-  you in the tool result. Read their notes before going further.
+- The first time you edit a file another session of this repository has edited
+  too, wts tells you in the tool result. Read their notes before going further.
 - When your change affects another session (a migration, a shared model, an API
   contract), leave one line: `wts db set <key> "<one line>"` (also `get`, `del`).
-  New notes from the others reach you at the start of your next turn.
+  Your own notes only: `--session <other>` reads, it does not write. New notes
+  from the others reach you at the start of your next turn.
 - What you learn about the task outlives the session: `wts task note "<text>"`.
 
 ## Delegating to another agent
@@ -41,9 +42,16 @@ wts "<the task in one sentence>" --json        # new session, named for you; pri
 wts <name> "<the task>" --task <id> --doc <slug> --json   # with a name, a task, a document
 wts wait <name> --timeout 90                   # 0 once it is no longer working, 1 on timeout: call again
 wts status --json                              # blocked? .agent_waiting_for says on what
-wts send <name> "<answer>"                     # type into its agent and submit
+wts send <name> --answer <choice>              # answer the question it is blocked on
+wts send <name> "<a new prompt>"               # to a working or idle agent only
 wts tail <name> -n 3 --json                    # its last messages, from its transcript
 ```
+
+`wts wait` also returns on an agent that quit (`stopped`) or that is stuck
+(`"stale": true`). When it says no agent is known in a session (`unknown`),
+calling it again will not help: read `wts status --json`. `wts send` refuses a
+prompt to a blocked agent (it would be typed into the question) and anything to
+an agent that quit (its pane is a shell): it says which, and what to pass.
 
 A creation without a terminal (or with `--json`, or `--detach`) never attaches:
 the user's terminal stays where it is. `wts new --json a b c` creates several.

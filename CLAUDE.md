@@ -62,9 +62,10 @@ straight from the checkout. Scripts locate each other from their own path
 - **English** everywhere: messages, comments, JSON values, prompts.
 - Comments explain *why* (the failure that motivated the code), not what.
 - `wts status --json` is a public contract: keys and `agent_state` values
-  (`blocked working idle done failed stopped`, plus `stale`) do not change
-  without a version bump and a CHANGELOG entry (1.5.0 added `agent_since` and
-  `agent_source`; adding a key is fine that way, renaming one is not).
+  (`blocked working idle done failed stopped`, or null; `stale` is a key of
+  its own, a boolean) do not change without a version bump and a CHANGELOG
+  entry (1.5.0 added `agent_since` and `agent_source`; adding a key is fine
+  that way, renaming one is not).
 - A Claude Code hook never prints on stdout unless printing is its job, and
   always exits 0: Claude Code adds a `UserPromptSubmit` hook's stdout to the
   conversation, and reads a non-zero `Stop` hook as "block the turn, hand
@@ -81,9 +82,13 @@ straight from the checkout. Scripts locate each other from their own path
   name what to pass); no attach without a terminal (`detach_mode` in `bin/wts`);
   every listing has `--json` with `"version": 1`; nothing types into a pane
   wts cannot name as the agent's (`agent_pane_of` in `wts-db.zsh`, never the
-  session's active pane). `WTS_CLAUDE_ALLOW` in `wts-db.zsh` is what an agent
-  may run without a prompt: read-only verbs and its own notes, nothing that
-  acts on someone's work.
+  session's active pane), and `wts send` reads the agent's state before it
+  types: that pane is a shell once the agent has quit, and a question while it
+  is blocked. `WTS_CLAUDE_ALLOW` in `wts-db.zsh` is what an agent may run
+  without a prompt: read-only verbs and its own notes, nothing that acts on
+  someone's work. A rule there covers every flag of its verb, so a flag that
+  deletes or writes as someone else takes a terminal (`wts db set --session
+  <other>`, `wts task note --clear`).
 - The model is only called on explicit commands (`wts "<phrase>"`, `wts brief`,
   `wts doc add|sync`, `wts retro`, and `wts gc --apply`), never from `ls`, the
   switcher or hooks. `WTS_NO_LLM=1` disables it. `gc` is the widest of these and
@@ -126,6 +131,11 @@ straight from the checkout. Scripts locate each other from their own path
   new bind needs no knowledge of row kinds, but it must guard an empty name
   before passing it to a command. `wts rm ''` deletes by substring match and
   matches everything.
+- A session is its **name**, and a name comes back: every table but `archive`
+  and `usage` keys on it alone. A row left behind (a delete that failed, a
+  worktree removed by hand) is inherited by the next session of that name, so
+  `registry_del` says when it failed, and a creation prunes a row whose
+  worktree is gone before it writes its own.
 - State goes through `wts-db.zsh`, never a file of its own: `db_q` to write,
   `db_ro`/`db_rows` to read, every value through `sql_str`. The tables other
   than `notes` are written by wts only; `wts db` gives agents read access to all

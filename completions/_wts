@@ -367,8 +367,11 @@ _wts() {
         _wts_pr_targets
       elif [[ ${words[2]} == tail && $PREFIX == -* ]]; then
         _wts_offer options option "" "-n:how many messages" "--json:as JSON"
+      elif [[ ${words[2]} == send && CURRENT -eq 4 && $PREFIX == -* ]]; then
+        _wts_offer options option "" "--answer:the line answers the question the agent is blocked on" \
+          "--force:type whatever the agent's state"
       elif [[ ${words[2]} == send ]]; then
-        _wts_say "the line to type (free text)"
+        _wts_say "the line to type (free text); --answer for a blocked agent"
       else
         _wts_say "-n <k>, --json"
       fi ;;

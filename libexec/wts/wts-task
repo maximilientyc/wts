@@ -624,6 +624,13 @@ cmd_note() {
   set -- "${REPLY_ARGS[@]}"
 
   if [[ "${1:-}" == "--clear" ]]; then
+    # Every note of the task goes, whichever session wrote it, and `wts task
+    # note` is a verb an agent runs without a prompt (WTS_CLAUDE_ALLOW): what
+    # it may do there is add. Clearing is for the person at the terminal.
+    if [[ ! ( -t 0 && -t 2 ) ]]; then
+      print -u2 -r -- 'wts task note --clear: it deletes every note kept on the task — from a terminal only'
+      return 2
+    fi
     db_q "DELETE FROM task_notes WHERE task = $(sql_str "$id")" >/dev/null 2>&1
     print -r -- "→ notes cleared on “$(task_title "$id")”"
     return 0
@@ -632,7 +639,7 @@ cmd_note() {
   text="$*"
   if [[ -z "${text//[[:space:]]/}" ]]; then
     print -u2 -r -- 'wts task note: give it some text (or --clear)'
-    return 1
+    return 2
   fi
   db_q "INSERT INTO task_notes (task, body, added_at)
         VALUES ($(sql_str "$id"), $(sql_str "$text"), $(sql_str "$(now_iso)"))" \
