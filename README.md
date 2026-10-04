@@ -1058,18 +1058,30 @@ needed; `WTS_CONTEXT_QUIET=1` in the agent's environment keeps only the first
 line and the task's title.
 
 **The rest arrives when it happens.** Two hooks speak during the session, and
-only when there is something to say:
+only when there is something to say. Both deliver the same news, each item
+once, to each agent: what an agent was told is recorded in the `seen` table,
+so a note rewritten a second after it was read comes again and nothing comes
+twice.
 
 - **At the start of a turn** (`UserPromptSubmit`): the notes the same
-  repository's other agents left since this agent's last turn, five at most —
-  a note written an hour after `SessionStart` used to reach nobody who did not
-  poll. A first turn counts from the session's creation.
+  repository's other agents left or changed that this agent has not been told
+  (five at most; `SessionStart` counts as telling), the files it edited that a
+  sibling has edited too since, and the sessions of the repository that
+  finished, with how and the notes they left — a note is deleted with its
+  author, often at the moment the change it announced lands:
+
+  ```
+  wts: session `rate-limit` finished (squashed, PR #37) — the notes it left: api-contract: /login now answers 429
+  ```
+
 - **After an edit** (`PostToolUse` on `Edit`, `Write`, `MultiEdit`,
-  `NotebookEdit`): the first time the agent edits a file another session of the
-  repository has edited too, the tool result says which session, on which
-  branch, since when. Every path edited through those tools is recorded in the
-  `touches` table, relative to the worktree; a file changed from the shell
-  (`sed -i`, a formatter, `git mv`) is not.
+  `NotebookEdit`): the same news, in the tool result, so a working agent hears
+  of them before its turn is over. That includes the overlap the moment it
+  happens: editing a file another session of the repository has edited says
+  which session, on which branch, since when — and the session that edited it
+  first hears of it at its own next prompt or edit. Every path edited through
+  those tools is recorded in the `touches` table, relative to the worktree; a
+  file changed from the shell (`sed -i`, a formatter, `git mv`) is not.
 
 Anywhere else — a Claude started outside wts — the hooks print nothing. They
 read and write the database only: no `git status`, no model call, about 0.1 s.
@@ -1097,7 +1109,9 @@ writing or deleting as another session takes a terminal (exit 2 without one):
 not someone else's. `wts db sql`
 opens the database read-only and in sqlite3's safe mode (no `.shell`, no
 `ATTACH`, no `readfile`), so no query can damage the registry. `wts rm` and
-`wts gc` drop the notes of the sessions they remove.
+`wts gc` drop the notes of the sessions they remove, and what those sessions
+were told (`seen`); the notes stay readable in the archive (`wts log`), and
+the siblings are told the session finished.
 
 `wts db browse` is for you, in a terminal: the tables with their counts and, in
 the preview, the schema of the one under the cursor; `enter` lists its rows,

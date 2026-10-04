@@ -28,12 +28,14 @@ sqlite3's own array of rows; keys are added, never renamed.
 
 ## Working next to other agents (inside a session)
 
-- The first time you edit a file another session of this repository has edited
-  too, wts tells you in the tool result. Read their notes before going further.
+- When you edit a file another session of this repository has edited too, wts
+  tells you in the tool result; when a session edits one you edited first, you
+  hear of it at your next prompt or edit. Read their notes before going further.
 - When your change affects another session (a migration, a shared model, an API
   contract), leave one line: `wts db set <key> "<one line>"` (also `get`, `del`).
   Your own notes only: `--session <other>` reads, it does not write. New notes
-  from the others reach you at the start of your next turn.
+  from the others, and the sessions that finished with the notes they left,
+  reach you once each, at your next turn or your next edit, whichever comes first.
 - What you learn about the task outlives the session: `wts task note "<text>"`.
 
 ## Delegating to another agent

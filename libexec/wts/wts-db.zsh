@@ -29,7 +29,7 @@
 
 WTS_STATE_DIR="${WTS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wts}"
 WTS_DB="${WTS_DB:-$WTS_STATE_DIR/wts.db}"
-WTS_DB_SCHEMA=8
+WTS_DB_SCHEMA=9
 # Where the helpers are, for the few functions below that call one. Top level:
 # when this file is sourced, $0 is this file.
 WTS_DB_HOME="${0:A:h}"
@@ -93,6 +93,14 @@ _db_exists() {
 db_rows() {
   _db_exists || return 0
   _db -readonly -ascii "$WTS_DB" "$@"
+}
+
+# db_rows_rw <sql> — db_rows on a read-write connection, for a transaction that
+# reads and writes at once (wts-hook marks what it delivers in the same BEGIN
+# IMMEDIATE, so two hooks of one agent cannot both deliver). Split the same way.
+db_rows_rw() {
+  _db_exists || return 0
+  _db -ascii "$WTS_DB" "$@"
 }
 
 # A SQL string literal. SQLite has no backslash escapes, so doubling the single
@@ -492,6 +500,27 @@ CREATE TABLE IF NOT EXISTS usage (
   mtime       INTEGER NOT NULL DEFAULT 0,
   updated_at  INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (session, created_at, transcript, model, speed)
+);
+-- What each agent has been told of the others (schema 9), written by the
+-- hooks: wts-hook delivers what is new at a turn or an edit, wts-context marks
+-- what SessionStart showed. One row per reader, stream and ref:
+--   notes    ref = author || char(31) || key, mark = the value delivered
+--   overlap  ref = other session || char(31) || path, mark = '1'
+--   archive  ref = '', mark = the last archive id told about
+-- Delivery used to compare a note's updated_at with the reader's previous
+-- prompt, to the second: a note rewritten in the second it was read was lost,
+-- and a sweep of agent_events changed what counted as new. A mark is exact.
+-- A table of its own, no column on notes or touches: an older wts sharing the
+-- database writes rows without it. A mark older than its reader's session, or
+-- than the author's, is ignored: a name comes back, and an older wts removing
+-- a session leaves its marks behind. Dropped with the reader.
+CREATE TABLE IF NOT EXISTS seen (
+  session TEXT NOT NULL,
+  stream  TEXT NOT NULL,
+  ref     TEXT NOT NULL DEFAULT '',
+  mark    TEXT NOT NULL DEFAULT '',
+  at      INTEGER NOT NULL,
+  PRIMARY KEY (session, stream, ref)
 );
 $imports
 -- merge_checks is a cache of verdicts: a schema change may come with a new
@@ -1376,6 +1405,20 @@ usage_prune_sql() {
                     WHERE s.name = usage.session AND s.created_at = usage.created_at)
     AND NOT EXISTS (SELECT 1 FROM archive a
                     WHERE a.session = usage.session AND a.created_at = usage.created_at);"
+}
+
+# The seen rows of the sessions in <set> (a SQL list or subquery): those it
+# holds as a reader, and those others hold on its notes and files. With `not`,
+# of the sessions outside <set> (gc: whatever is no longer registered). Run
+# after, never inside, the transaction that deletes the sessions, for the
+# reason given at usage_prune_sql.
+seen_prune_sql() {  # <set> [not]
+  local op="IN"
+  [[ "${2:-}" == not ]] && op="NOT IN"
+  print -r -- "DELETE FROM seen
+  WHERE session $op $1
+     OR (stream IN ('notes', 'overlap')
+         AND substr(ref, 1, instr(ref, char(31)) - 1) $op $1);"
 }
 
 # What a task cost over every attempt, as a SQL expression yielding a JSON
