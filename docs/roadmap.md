@@ -97,3 +97,7 @@ you can hit.
   the same repository under another branch prefix or `WTS_WORKTREES_BASE`: the
   first worktree stays on disk, unregistered. `wts doc use` types into an
   agent's pane without looking at its state, as `wts send` did.
+- When `claude agents` does not list an agent and the events decide alone, an
+  agent started again in the same pane reads `stopped` until its first prompt:
+  `SessionStart` records no event, so the `end` of the previous conversation
+  is still the last word. `wts send` then needs `--force`.
