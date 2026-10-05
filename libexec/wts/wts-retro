@@ -20,7 +20,8 @@
 # a partial answer where wts-brief rejects one, and why the git facts are stored
 # in the row beside the retro rather than only summarized.
 #
-# Variables: WTS_MODEL (haiku), WTS_RETRO_TIMEOUT (60 s),
+# Variables: WTS_RETRO_MODEL ($WTS_MODEL when set, else haiku),
+#            WTS_RETRO_TIMEOUT (60 s),
 #            WTS_RETRO_JOBS (3 concurrent calls), WTS_NO_LLM=1 (no call),
 #            WTS_ARCHIVE_TRANSCRIPT=0 (do not keep a copy of the transcript)
 
@@ -39,7 +40,7 @@ export GIT_OPTIONAL_LOCKS=0
 WTS_BIN="${0:A:h}"
 source "$WTS_BIN/wts-db.zsh"
 
-MODEL="${WTS_MODEL:-haiku}"
+MODEL="$(retro_model)"
 TIMEOUT="${WTS_RETRO_TIMEOUT:-60}"
 JOBS="${WTS_RETRO_JOBS:-3}"
 # Keeps the model call bounded, and a review agent reads ~100 of these at once.

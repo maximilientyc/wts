@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **`WTS_RETRO_MODEL`: the retrospectives get a model of their own.** One
+  variable, `WTS_MODEL`, chose the model of naming, `wts brief` and the
+  retrospectives. The first two want Haiku's speed; a retrospective is written
+  once per finished session, kept for months as the only trace of how the work
+  went, and cheap whatever the model (20 KB of facts in, four lines out).
+  Measured on two archived sessions, same facts: Haiku got counts wrong (a
+  "300-line" page of 247, "10" guides of twelve) and reported a dropped
+  decision as `abandoned: -`; Sonnet and Opus got the facts right, Opus alone
+  kept every line within its limit, in 8 s for two in parallel. `wts-retro`
+  now uses `WTS_RETRO_MODEL`, else `WTS_MODEL`, else `haiku`, and the dry run
+  of `wts gc` names that model in the cost it announces. An empty value counts
+  as unset. The default does not change.
+
 - **The README is a landing page, and the reference is one guide per subject
   under `docs/`.** The README had grown to 1,400 lines, one release at a time:
   the same subject sat in several sections, and how a feature works was mixed

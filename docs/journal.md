@@ -58,8 +58,9 @@ resolved:  inverted the dependency with an event rather than a privacy exception
 abandoned: dropping the deprecated alias in the same PR — deferred a release
 ```
 
-`wts gc --apply` asks Haiku for these four lines, once per finished session and
-while the transcript is still there. `resisted` and `resolved` are the parts a
+`wts gc --apply` asks the model of `WTS_RETRO_MODEL`
+([configuration.md](configuration.md#the-model)) for these four lines, once per
+finished session and while the transcript is still there. `resisted` and `resolved` are the parts a
 task title can never carry, and they are read mostly from **your own
 corrections to the agent** ("no, that breaks idempotency", "revert that"),
 which is the only place friction is recorded.

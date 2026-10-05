@@ -796,7 +796,7 @@ if (( to_archive )); then
   print "To archive (kept for wts log): $to_archive session(s)"
   # Said before --apply, once: the dry run is where a cost can still be declined.
   if ! $APPLY && $RETRO && [[ -z "${WTS_NO_LLM:-}" ]] && command -v claude >/dev/null 2>&1; then
-    print "  --apply then asks Claude for $to_archive retrospective(s): one ${WTS_MODEL:-haiku} call each,"
+    print "  --apply then asks Claude for $to_archive retrospective(s): one $(retro_model) call each,"
     print "  ${WTS_RETRO_JOBS:-3} at a time, after the teardown (--no-retro: none now, wts retro later)"
   fi
   print ""

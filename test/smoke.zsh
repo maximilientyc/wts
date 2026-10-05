@@ -928,6 +928,15 @@ check "the dry run says --apply will ask Claude for the retrospectives" eval '
   out=$(WTS_NO_LLM= "$WTS" gc --no-fetch); [[ "$out" == *"asks Claude for 1 retrospective(s)"*"--no-retro"* ]]'
 refute "and not under --no-retro" eval '
   out=$(WTS_NO_LLM= "$WTS" gc --no-fetch --no-retro); [[ "$out" == *"asks Claude"* ]]'
+# The model it names is the one --apply will call. Every case passes
+# WTS_RETRO_MODEL, empty when it is the fallback under test: a ~/.zshenv that
+# exports a default would otherwise decide the outcome on this machine only.
+check "the dry run names the retrospectives' model" eval '
+  out=$(WTS_NO_LLM= WTS_RETRO_MODEL=opus WTS_MODEL=haiku "$WTS" gc --no-fetch)
+  [[ "$out" == *"one opus call each"* ]]'
+check "and WTS_MODEL's when WTS_RETRO_MODEL is empty" eval '
+  out=$(WTS_NO_LLM= WTS_RETRO_MODEL= WTS_MODEL=sonnet "$WTS" gc --no-fetch)
+  [[ "$out" == *"one sonnet call each"* ]]'
 
 "$WTS" gc --no-fetch --apply >/dev/null
 check "gc leaves a merged branch no wts session had" git show-ref --verify --quiet refs/heads/develop
@@ -1444,6 +1453,24 @@ check "a timeout says how long it waited" eval '
 retro_with "printf '%s\n' \"\$*\" > '$RSTUBS/args'; printf 'delivered: x\n'" >/dev/null
 check "the retro asks with thinking off" eval '
   grep -qF "\"alwaysThinkingEnabled\":false" "$RSTUBS/args"'
+# Its own model, so that a stronger one writes the retrospectives without
+# slowing naming or wts brief. WTS_RETRO_MODEL is always passed, empty for the
+# fallbacks: ~/.zshenv may export it, and every wts script reads it again.
+retro_model_of() { # [env=value...] — the --model the retro passed to claude
+  retro_with "printf '%s\n' \"\$*\" > '$RSTUBS/args'; printf 'delivered: x\n'" "$@" >/dev/null
+  local w=(${=$(<"$RSTUBS/args")}) i
+  for (( i = 1; i < $#w; i++ )); do
+    [[ "${w[i]}" == --model ]] && { print -r -- "${w[i+1]}"; return 0 }
+  done
+}
+check "the retro uses WTS_RETRO_MODEL" eval '
+  [[ "$(retro_model_of WTS_RETRO_MODEL=opus WTS_MODEL=)" == opus ]]'
+check "and WTS_MODEL when WTS_RETRO_MODEL is empty" eval '
+  [[ "$(retro_model_of WTS_RETRO_MODEL= WTS_MODEL=sonnet)" == sonnet ]]'
+check "and haiku with neither" eval '
+  [[ "$(retro_model_of WTS_RETRO_MODEL= WTS_MODEL=)" == haiku ]]'
+check "WTS_RETRO_MODEL wins over WTS_MODEL" eval '
+  [[ "$(retro_model_of WTS_RETRO_MODEL=opus WTS_MODEL=sonnet)" == opus ]]'
 long_tr="$SANDBOX/long-transcript.jsonl"
 big=$(printf "%04000d" 0)
 for i in {1..1500}; do

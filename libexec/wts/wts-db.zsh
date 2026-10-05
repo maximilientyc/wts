@@ -769,6 +769,16 @@ needs_human() {  # <notification_type>
   [[ "$1" == (permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input) ]]
 }
 
+# The model a retrospective is written with: wts-retro calls it, and gc's dry
+# run names it in the cost it announces, which must be the one --apply pays.
+# Not WTS_MODEL alone: naming and `wts brief` want Haiku's speed, a
+# retrospective is written once and kept for months, and Haiku got its counts
+# wrong where Opus did not. Empty counts as unset, so `WTS_RETRO_MODEL=` falls
+# back even where ~/.zshenv exports a default.
+retro_model() {
+  print -r -- "${WTS_RETRO_MODEL:-${WTS_MODEL:-haiku}}"
+}
+
 # "3h ago", from a number of seconds: one wording wherever an agent reads an
 # age. A note's was a raw ISO timestamp at SessionStart and nothing at all at a
 # turn's start, a brief's `1440m ago`.
