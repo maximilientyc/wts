@@ -69,6 +69,7 @@ docs/demo/                record.zsh + demo.tape (README GIF, make demo)
                           + agents-together.zsh/.tape (send and wait look at the agent first)
                           + db-browse.zsh/.tape (wts db browse: the tables, a table's rows, a record)
                           + exact-delivery.zsh/.tape (notes, overlap and finished sessions, once each)
+                          + retro-model.zsh/.tape (WTS_RETRO_MODEL, named by gc's dry run)
 ```
 
 Homebrew, `make install` and a git checkout share this tree, so `bin/wts` works

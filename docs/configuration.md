@@ -26,7 +26,8 @@ wts setup git
 
 | Variable            | Default  | Role |
 |---------------------|----------|------|
-| `WTS_MODEL`         | `haiku`  | model used for naming, `wts brief` and the retrospectives |
+| `WTS_MODEL`         | `haiku`  | model used for naming and `wts brief`, and the retrospectives' fallback |
+| `WTS_RETRO_MODEL`   | `$WTS_MODEL` when set, else `haiku` | model used for the retrospectives |
 | `WTS_NO_LLM`        | (none)   | `1`: never call the model |
 | `WTS_NAME_TIMEOUT`  | `30`     | naming timeout, seconds |
 | `WTS_BRIEF_TIMEOUT` | `45`     | timeout of one summary, seconds |
@@ -40,6 +41,13 @@ prefixed (`anthropic.claude-haiku-4-5`) or dated with an `@` there. Set
 `WTS_MODEL` to the id your platform accepts: an id `claude` does not recognize
 is answered in prose, which `wts` reports as
 `claude: [claude-code:unrecognized_model]` and falls back from.
+
+`WTS_RETRO_MODEL` gives the retrospectives a stronger model without slowing
+naming, which you wait on, or `wts brief`, which runs often: a retrospective is
+written once per finished session and kept for months, and on the same facts
+Haiku miscounted where Opus did not. Prefer an alias (`opus`, `sonnet`) to an
+id there: Claude Code resolves an alias on each platform, so one value serves
+a machine on the Claude API and one on Amazon Bedrock.
 
 ### Documents
 

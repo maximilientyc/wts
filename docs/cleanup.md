@@ -29,8 +29,8 @@ wts gc --json           # the dry run's plan: what would go and why
 - `--json` describes the dry run; it is never accepted with `--apply`.
 
 **What `--apply` costs is said before it.** Each session it archives gets a
-retrospective, one model call each (`WTS_MODEL`, `WTS_RETRO_JOBS` at a time,
-after every deletion). The dry run says how many, and `--no-retro` skips them;
+retrospective, one model call each (`WTS_RETRO_MODEL`, `WTS_RETRO_JOBS` at a
+time, after every deletion). The dry run says how many, and `--no-retro` skips them;
 `wts retro` writes them later ([journal.md](journal.md)).
 
 **A dry run writes nothing.** It announces `To archive (kept for wts log): 3
