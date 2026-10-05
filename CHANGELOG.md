@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.10.0 — 2026-10-05
 
 - **`WTS_RETRO_MODEL`: the retrospectives get a model of their own.** One
   variable, `WTS_MODEL`, chose the model of naming, `wts brief` and the
