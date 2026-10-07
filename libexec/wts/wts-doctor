@@ -286,6 +286,24 @@ else
     warn "Claude permissions: ${#noperm} of wts's read-only verbs missing, agents will ask (wts setup claude --install)"
   fi
 fi
+# The status line: optional, so never a warning when it is absent or someone
+# else's — only when it is wts's and points at another install, which stops
+# working the day that install goes.
+if [[ -s "$settings" ]] && command -v jq >/dev/null 2>&1; then
+  sl=$(jq -r '.statusLine // empty | if type == "object" then (.command // "") else tostring end' \
+         "$settings" 2>/dev/null)
+  if [[ -z "$sl" ]]; then
+    ok "Claude status line: not set (optional: wts setup claude --statusline)"
+  elif [[ "$sl" == "$libexec/wts-hook statusline" ]]; then
+    ok "Claude status line: wts's (context and rate limits in wts status --json)"
+  elif [[ "$sl" =~ '^[^ ]*/wts-hook statusline$' ]]; then
+    warn "Claude status line: wts's, from another install (wts setup claude --statusline)"
+  elif [[ "$sl" == *"/wts-hook statusline"* ]]; then
+    ok "Claude status line: your own, with wts's chained in"
+  else
+    ok "Claude status line: your own (optional: wts setup claude --statusline says how to chain wts's)"
+  fi
+fi
 # The skill: what lets a Claude started anywhere find wts, and what the hook
 # points every agent in a session to.
 skill="$CLAUDE_DIR/skills/wts/SKILL.md"

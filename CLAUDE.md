@@ -35,7 +35,9 @@ libexec/wts/wts-db.zsh     the state database (SQLite): schema, import, helpers;
                            label (db_pr_labels) and a session's transcript
 libexec/wts/wts-context    Claude Code SessionStart hook: tells an agent about the other sessions
 libexec/wts/wts-hook       Claude Code UserPromptSubmit/Stop/Notification/SessionEnd hooks:
-                           records agent_events, rings the bell, posts the banner
+                           records agent_events, rings the bell, posts the banner;
+                           and `statusline`, the opt-in statusLine command:
+                           agent_gauges, and the line it prints (one sqlite3 call)
 share/wts/layouts/         built-in layouts (default.yml)
 share/wts/skill/SKILL.md   the Claude Code skill `setup claude --install` writes
                            ({{WTS}} and {{VERSION}} filled in)

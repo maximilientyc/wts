@@ -49,6 +49,7 @@ would add when run without `--install`: read it first.
 ```sh
 wts setup tmux --install && tmux source-file ~/.tmux.conf   # the switcher, prefix+a, the status line
 wts setup claude --install   # hooks, permissions and skill for Claude Code (~/.claude)
+wts setup claude --statusline  # opt-in: wts as Claude Code's status line (context, who needs you)
 wts doctor                   # checks the dependencies and both integrations
 ```
 

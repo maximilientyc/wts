@@ -1,8 +1,8 @@
 # Watching your sessions
 
 What each agent is doing and since when, how wts tells you when one needs you,
-where each session stands (`wts brief`), what the agents cost, and the state of
-their pull requests. The popup that shows all of it is in
+where each session stands (`wts brief`), what the agents cost, how full their
+context is, and the state of their pull requests. The popup that shows all of it is in
 [switcher.md](switcher.md).
 
 ```
@@ -47,14 +47,16 @@ waiting longest. A merged session goes last, whatever its agent says.
 
 ```
 $ wts ls --wide
-SESSION      AGENT       BRANCH       DELTA        DIRTY  TMUX     TOKENS  COST    MODEL     WAITING           SUBJECT
-auth-form    blocked 4m  auth-form    +322/-0 ^4   no     running  13.6M   $5.64   opus-5-5  Bash: npm run db  Server-side email validation
-rate-limit   working 9m  rate-limit   +80/-2 ^1    yes    running  2M      $1.95   opus-5-5  -                 Rate-limit the public API
+SESSION      AGENT       BRANCH       DELTA        DIRTY  TMUX     TOKENS  COST    MODEL     CTX  WAITING           SUBJECT
+auth-form    blocked 4m  auth-form    +322/-0 ^4   no     running  13.6M   $5.64   opus-5-5  84%  Bash: npm run db  Server-side email validation
+rate-limit   working 9m  rate-limit   +80/-2 ^1    yes    running  2M      $1.95   opus-5-5  31%  -                 Rate-limit the public API
 ```
 
 `--wide` adds tokens, API-price cost and model ([Tokens and
-cost](#tokens-and-cost)), and a WAITING column: the permission or the question
-a blocked agent waits on.
+cost](#tokens-and-cost)), CTX, the share of the context window in use as the
+agent's [status line](#claude-codes-status-line) last reported it (`-`
+without one), and a WAITING column: the permission or the question a blocked
+agent waits on.
 
 ### `wts status --json`
 
@@ -70,6 +72,9 @@ The same data for scripts. Keys are added, never renamed.
 | `merged`            | see below |
 | `pr`                | see [Pull requests](#pull-requests) |
 | `usage`             | see [Tokens and cost](#tokens-and-cost) |
+| `context_pct`       | the share of the context window in use, 0 to 100, as the agent's [status line](#claude-codes-status-line) last reported it; `null` without one |
+| `rate_limits`       | `{five_hour, seven_day}`: the account's rate limits used, in percent, as that agent last saw them; `null` without a reading (an API key has none) |
+| `cost_reported_usd` | Claude Code's own running cost of the session's conversations, summed; `null` without a reading. `usage` stays the ledger |
 
 plus the git counters and the tmux state.
 
@@ -114,6 +119,49 @@ prints: `wts: 2 blocked · 1 idle`, and nothing at all when nobody needs you.
 `failed`, `idle`) and has waited longest, without a popup, and says why in the
 status line: *wts: auth-form — blocked 4m: Bash: rm -rf dist*. Pressing it again
 cycles through them.
+
+## Claude Code's status line
+
+```
+wts setup claude --statusline
+```
+
+An opt-in, apart from `wts setup claude --install`: it makes `wts-hook
+statusline` the `statusLine` of Claude Code's `settings.json`. In a wts session
+the line under the prompt reads
+
+```
+wts auth-form · Opus 5.5 · ctx 84% · 2 session(s) need you · 1 unseen note(s)
+```
+
+- **ctx** is the share of the context window in use: past 80% the agent is
+  close to compacting.
+- **need you**: the other sessions whose agent waits on a permission or an
+  answer, as their hooks last said (the reading `wts ls` makes when `claude
+  agents` cannot be asked), less than twelve hours old.
+- **unseen notes**: the notes the same repository's sessions left that this
+  agent has not been handed yet. Its next prompt will.
+
+A count of zero is left out. Outside a wts session the line is the model and
+the context alone, and nothing is recorded.
+
+**What it records.** At each refresh, the payload Claude Code hands the status
+line goes into the `agent_gauges` table: the context in use, the account's
+five-hour and seven-day rate limits, and Claude Code's own cost of the
+conversation. `wts status --json` reads it (`context_pct`, `rate_limits`,
+`cost_reported_usd`), `wts ls --wide` shows CTX, and the switcher the context
+in the preview and a `[ctx 84%]` mark on a row at 80% or more
+([switcher.md](switcher.md#what-is-on-screen)). The cost is Claude Code's figure, kept
+next to [the ledger](#tokens-and-cost), not in place of it.
+
+One sqlite3 process per refresh and nothing else, about 30 ms: the payload is
+parsed by SQLite, the session found from the working directory (or the name
+Claude Code was started with).
+
+**A status line of your own.** `--statusline` writes the setting only when
+there is none or it is wts's; otherwise it leaves yours and prints a command
+that runs both, one line each, to put in by hand. `wts doctor` reports which
+one is set, as optional.
 
 ## Where each session stands: `wts brief`
 

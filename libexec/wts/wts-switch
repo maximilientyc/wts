@@ -410,14 +410,18 @@ build_list() {
   extra=("$@")
   current=$(tmux display-message -p '#S' 2>/dev/null)
 
-  local since waiting pr repo meta=""
+  local since waiting pr repo ctx meta=""
   if [[ -x "$WTS_BIN/wts-status" ]] && command -v jq >/dev/null 2>&1; then
     # \x1f (not whitespace): keeps empty fields, unlike TAB.
-    while IFS=$'\x1f' read -r name agent branch delta dirty pane since waiting pr repo subject; do
+    while IFS=$'\x1f' read -r name agent branch delta dirty pane since waiting pr repo ctx subject; do
       [[ -n "$name" ]] || continue
       known+="$name"$'\n'
+      # A context window 80% full is the agent about to compact: the row says
+      # so ahead of its subject, in ASCII (emit pads to an exact width), and
+      # the preview's header gives the figure for any row.
+      [[ "$ctx" == <-> ]] && (( ctx >= 80 )) && subject="[ctx $ctx%] ${subject:-}"
       add_row "$name" "$agent" "$branch" "$delta" "${subject:-}" "${pane:-$name}" "" "${pr:-}" "${repo:-}"
-      meta+="$name"$'\x1f'"$agent"$'\x1f'"${since:-}"$'\x1f'"${waiting:-}"$'\x1e'
+      meta+="$name"$'\x1f'"$agent"$'\x1f'"${since:-}"$'\x1f'"${waiting:-}"$'\x1f'"${ctx:-}"$'\x1e'
     done < <("$WTS_BIN/wts-status" --fzf "${extra[@]}" 2>/dev/null)
   fi
   # Since-when and waiting-for are not list columns: the preview's header reads
@@ -959,20 +963,22 @@ age_of() { # <epoch>
   fi
 }
 
-# The line above a session's pane capture: its state, for how long, and what
-# it waits for ("blocked 4m: Bash: rm -rf dist"). Read from the file --list
-# writes, so the preview costs no collector call of its own.
+# The line above a session's pane capture: its state, for how long, the share
+# of its context window in use when its status line reported one, and what it
+# waits for ("blocked 4m · ctx 62%: Bash: rm -rf dist"). Read from the file
+# --list writes, so the preview costs no collector call of its own.
 preview_header() { # <session name>
-  local name="$1" row state since waiting
+  local name="$1" row state since waiting ctx
   [[ -n "$name" && -n "${WTS_SWITCH_META:-}" && -s "$WTS_SWITCH_META" ]] || return 1
   local -a f
   for row in "${(@ps:\x1e:)$(<"$WTS_SWITCH_META")}"; do
     f=("${(@ps:\x1f:)row}")
     [[ "${f[1]:-}" == "$name" ]] || continue
-    state="${f[2]:-}" since="${f[3]:-}" waiting="${f[4]:-}"
+    state="${f[2]:-}" since="${f[3]:-}" waiting="${f[4]:-}" ctx="${f[5]:-}"
     [[ -n "$state" && "$state" != - && "$state" != stopped ]] || return 1
     local head="$state"
     [[ "$since" == <-> ]] && head+=" $(age_of "$since")"
+    [[ "$ctx" == <-> ]] && head+=" · ctx $ctx%"
     [[ -n "$waiting" ]] && head+=": $waiting"
     print -r -- "$head"
     return 0

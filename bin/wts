@@ -29,7 +29,7 @@
 #        wts layouts
 #        wts keys
 #        wts doctor [--json]
-#        wts setup tmux [--install] | git | claude [--install]
+#        wts setup tmux [--install] | git | claude [--install | --statusline]
 #        wts db path | tables | schema [<table>] | row <table> <rowid> | browse [<table>]
 #        wts db sql "<SELECT>" | notes [--all] | get | set | del
 #        wts help | wts version | wts <command> --help
@@ -107,6 +107,10 @@
 #   setup claude : print (--install: add) the Claude Code hooks that tell every
 #                agent in a wts session about the others, the permissions for
 #                the read-only verbs, and (--install) the wts skill
+#                --statusline (never part of --install) makes wts Claude Code's
+#                status line: session, model, context in use, who needs you;
+#                and records the context, rate limits and cost it reports for
+#                `wts status --json`. Refused over a status line of your own
 #   db         : the state database (SQLite): read anything, and notes the
 #                agents leave for each other (`wts db help`). `tables` counts
 #                rows and columns, `schema <table>` gives one table's, `row`
@@ -227,6 +231,7 @@ registry_del() {
   # older wts left at schema 8 the table is missing, and inside the transaction
   # -bail would have aborted the whole deletion.
   db_q "$(seen_prune_sql "$in")" >/dev/null 2>&1 || true
+  db_q "$(gauges_prune_sql "$in")" >/dev/null 2>&1 || true
   return 0
 }
 
@@ -699,6 +704,49 @@ if [[ "$1" == "setup" ]]; then
     # same stable (opt/) prefix as the hooks.
     wts_cmd="${libexec:h:h}/bin/wts"
     allow_json=$(print -rl -- "${WTS_CLAUDE_ALLOW[@]}" | jq -Rsc 'split("\n") | map(select(. != ""))' 2>/dev/null)
+    # --statusline: Claude Code's status line, opt-in and apart from --install.
+    # A user has one status line, often a script of their own, and --install
+    # rewrites wts's entries on every upgrade: folded into it, an upgrade would
+    # have replaced that script. Written only when there is none or it is
+    # wts's own (any install path); otherwise left alone, with the command
+    # that shows both, for the user to put in by hand.
+    if [[ "${3:-}" == "--statusline" ]]; then
+      command -v jq >/dev/null 2>&1 || { echo "wts: jq is required for 'setup claude --statusline'" >&2; exit 1 }
+      sl_cmd="$event_cmd statusline"
+      mkdir -p "${claude_settings:h}"
+      [[ -s "$claude_settings" ]] || echo '{}' > "$claude_settings"
+      if ! cur=$(jq -r '.statusLine // empty | if type == "object" then (.command // "") else tostring end' \
+                   "$claude_settings" 2>/dev/null); then
+        echo "wts: $claude_settings is not valid JSON, left untouched" >&2
+        exit 1
+      fi
+      if [[ -n "$cur" && ! "$cur" =~ '^[^ ]*/wts-hook statusline$' ]]; then
+        inner="i=\$(cat); print -r -- \"\$i\" | $cur; print -r -- \"\$i\" | $sl_cmd"
+        echo "wts: $claude_settings already has a status line, not wts's: left untouched." >&2
+        echo "   its command: $cur" >&2
+        echo "   To show both (one line each), set statusLine to this by hand:" >&2
+        jq -n --arg c "zsh -c ${(qq)inner}" '{statusLine: {type: "command", command: $c}}' >&2
+        exit 1
+      fi
+      cp "$claude_settings" "$claude_settings.bak"
+      if jq --arg c "$sl_cmd" '.statusLine = {type: "command", command: $c, padding: 0}' \
+           "$claude_settings.bak" > "$claude_settings.tmp.$$"; then
+        mv "$claude_settings.tmp.$$" "$claude_settings"
+        echo "→ status line installed in $claude_settings (backup: settings.json.bak):"
+        echo "   $sl_cmd"
+        echo "   in a wts session: wts <session> · <model> · ctx N% · who needs you · unseen notes"
+        echo "   and wts status --json gains context_pct, rate_limits and cost_reported_usd"
+      else
+        rm -f "$claude_settings.tmp.$$"
+        echo "wts: could not write $claude_settings" >&2
+        exit 1
+      fi
+      exit 0
+    fi
+    if [[ -n "${3:-}" && "${3:-}" != "--install" ]]; then
+      print -u2 "usage: wts setup claude [--install | --statusline]"
+      exit 2
+    fi
     if [[ "${3:-}" != "--install" ]]; then
       cat <<EOF
 // ─── wts setup claude (wts $WTS_VERSION) ─────────────────────────────────────
@@ -720,6 +768,10 @@ if [[ "$1" == "setup" ]]; then
 //
 // --install also writes the wts skill to $skill_dir/SKILL.md:
 // the reference an agent loads when it needs it, inside a session or not.
+//
+// Not part of it: the status line (wts setup claude --statusline), which
+// shows the session, the model, the context in use and who needs you, and
+// records them for wts status --json. Opt-in, since you may have your own.
 //
 // Merge into $claude_settings, or let wts do it (backup kept):
 //   wts setup claude --install
@@ -822,7 +874,7 @@ EOF
     exit 0
   fi
   if [[ "${2:-}" != "tmux" ]]; then
-    print -u2 "usage: wts setup tmux [--install] | git | claude [--install]"
+    print -u2 "usage: wts setup tmux [--install] | git | claude [--install | --statusline]"
     exit 2
   fi
 

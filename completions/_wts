@@ -495,7 +495,8 @@ _wts() {
           "git:git settings that keep wts ls fast on a large repository" \
           "claude:Claude Code hook: each agent learns about the others"
       elif (( CURRENT == 4 )) && [[ ${words[3]} == claude ]]; then
-        _wts_offer flags option "" "--install:add it to Claude Code's settings.json"
+        _wts_offer flags option "" "--install:add it to Claude Code's settings.json" \
+          "--statusline:make wts Claude Code's status line (opt-in)"
       elif (( CURRENT == 4 )) && [[ ${words[3]} == tmux ]]; then
         _wts_offer flags option "" "--install:write it into tmux.conf, replacing an older one"
       else
