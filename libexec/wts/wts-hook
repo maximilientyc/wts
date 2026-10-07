@@ -1,7 +1,10 @@
 #!/usr/bin/env zsh
 # wts-hook — Claude Code hooks: what the agent reports about itself, recorded
 #
-# Installed by `wts setup claude --install` on five events, one verb each:
+# Installed by `wts setup claude --install` on six events, one verb each:
+#   SessionStart     -> wts-hook start          a conversation starts (next to
+#                                               wts-context): startup, resume,
+#                                               clear or compact, in `kind`
 #   UserPromptSubmit -> wts-hook prompt         a turn starts
 #   Stop             -> wts-hook stop           the turn is over
 #   Notification     -> wts-hook notification   waiting for a permission or an answer
@@ -14,7 +17,10 @@
 # state exact and timestamped: wts-status polls `claude agents --json` for the
 # state and reads these rows for since-when and waiting-for — and for the state
 # itself when claude cannot be asked. Until this existed the only clock wts had
-# was a pane hash for `working` agents, and "blocked" had no age.
+# was a pane hash for `working` agents, and "blocked" had no age. `start` is
+# what tells an agent started again in the same pane (or a /clear) from one that
+# quit: without it the `end` of the previous conversation was the last word, and
+# the agent read stopped until its first prompt.
 #
 # Outside a wts session it exits 0 without a word: the hook is user-wide.
 #
@@ -37,7 +43,10 @@
 #
 # Every event also records $TMUX_PANE in agent_panes: the hook runs in the
 # agent's own environment, so this is the one exact answer to "which pane is
-# the agent", which `wts send` and the switcher's reply type into.
+# the agent", which `wts send` and the switcher's reply type into. With it, the
+# payload's transcript_path: the transcript the brief, the retrospective, `wts
+# tail` and `wts pr` read, named by Claude Code rather than derived from the
+# worktree's path (db_session_transcript).
 #
 # Attention: a `notification` (permission, question) and a `stop` also ring the
 # pane's bell — tmux flags the window — and post a desktop banner, unless the
@@ -45,7 +54,7 @@
 # window active). WTS_NOTIFY=0 turns both off, `bell` or `banner` keeps one.
 # The banner names the wts session, which is what a generic notifier cannot do.
 #
-# Usage: wts-hook prompt|stop|notification|end|touch   (payload as JSON on stdin)
+# Usage: wts-hook start|prompt|stop|notification|end|touch   (payload as JSON on stdin)
 
 set -uo pipefail
 zmodload zsh/datetime 2>/dev/null
@@ -54,7 +63,7 @@ source "${0:A:h}/wts-db.zsh"
 
 EVENT="${1:-}"
 case "$EVENT" in
-  prompt|stop|notification|end|touch) ;;
+  start|prompt|stop|notification|end|touch) ;;
   *) exit 0 ;;
 esac
 
@@ -69,16 +78,21 @@ exec 3>&1 >/dev/null
 db_available || exit 0
 [[ -s "$WTS_DB" ]] || exit 0
 
-sid="" kind="" msg="" cwd="" file=""
+# transcript_path is in every payload; agent_id only in a subagent's tool call.
+sid="" kind="" msg="" cwd="" file="" transcript="" agent_id=""
 if [[ -n "$payload" ]] && command -v jq >/dev/null 2>&1; then
-  IFS=$'\x1f' read -r sid kind msg cwd file < <(print -r -- "$payload" | jq -r '
+  IFS=$'\x1f' read -r sid kind msg cwd file transcript agent_id < <(print -r -- "$payload" | jq -r '
     [ (.session_id // ""),
       (.notification_type // .reason // .source // ""),
       ((.message // "") | gsub("[\\t\\n\\r\u001f\u001e]"; " ")),
       (.cwd // ""),
-      ((.tool_input.file_path // .tool_input.notebook_path // "") | gsub("[\\t\\n\\r\u001f\u001e]"; " "))
+      ((.tool_input.file_path // .tool_input.notebook_path // "") | gsub("[\\t\\n\\r\u001f\u001e]"; " ")),
+      ((.transcript_path // "") | gsub("[\\t\\n\\r\u001f\u001e]"; " ")),
+      ((.agent_id // "") | tostring | gsub("[\\t\\n\\r\u001f\u001e]"; " "))
     ] | join("\u001f")' 2>/dev/null)
 fi
+# Only an absolute path to a transcript: it is read back as a file by name.
+[[ "$transcript" == /*.jsonl ]] || transcript=""
 # Claude Code runs a hook from the project directory, which is the worktree
 # (or its WTS_SUBDIR); the payload's cwd is the same thing, and wins when the
 # hook is run from elsewhere.
@@ -92,14 +106,34 @@ now=${EPOCHSECONDS:-$(date +%s)}
 quiet=false
 [[ -n "${WTS_CONTEXT_QUIET:-}" ]] && quiet=true
 
-# The agent's pane, from its own environment (see the header).
+# db_init first: this hook may be the first wts code to open a database an
+# older wts left at an earlier schema, without the seen table (9) or the
+# transcript column (10). Its fast path is one PRAGMA. When it fails, the pane
+# is still recorded the old way and the turn goes on without news.
+db_ready=false
+db_init >/dev/null 2>&1 && db_ready=true
+
+# The agent's pane, from its own environment, and its transcript (see the
+# header). An event without a transcript keeps the one already recorded.
 if [[ -n "${TMUX_PANE:-}" ]]; then
-  db_q "INSERT INTO agent_panes (session, claude_session, pane, at)
-        VALUES ($(sql_str "$me"), $(sql_str "$sid"), $(sql_str "$TMUX_PANE"), $now)
-        ON CONFLICT(session) DO UPDATE SET
-          claude_session = CASE WHEN excluded.claude_session = '' THEN agent_panes.claude_session
-                                ELSE excluded.claude_session END,
-          pane = excluded.pane, at = excluded.at" >/dev/null 2>&1
+  if $db_ready; then
+    db_q "INSERT INTO agent_panes (session, claude_session, pane, at, transcript)
+          VALUES ($(sql_str "$me"), $(sql_str "$sid"), $(sql_str "$TMUX_PANE"), $now,
+                  $(sql_str "$transcript"))
+          ON CONFLICT(session) DO UPDATE SET
+            claude_session = CASE WHEN excluded.claude_session = '' THEN agent_panes.claude_session
+                                  ELSE excluded.claude_session END,
+            transcript = CASE WHEN excluded.transcript = '' THEN agent_panes.transcript
+                              ELSE excluded.transcript END,
+            pane = excluded.pane, at = excluded.at" >/dev/null 2>&1
+  else
+    db_q "INSERT INTO agent_panes (session, claude_session, pane, at)
+          VALUES ($(sql_str "$me"), $(sql_str "$sid"), $(sql_str "$TMUX_PANE"), $now)
+          ON CONFLICT(session) DO UPDATE SET
+            claude_session = CASE WHEN excluded.claude_session = '' THEN agent_panes.claude_session
+                                  ELSE excluded.claude_session END,
+            pane = excluded.pane, at = excluded.at" >/dev/null 2>&1
+  fi
 fi
 
 cut120() {
@@ -222,7 +256,7 @@ deliver_news() {
 
   local -a notes overlap finished
   notes=() overlap=() finished=()
-  local what
+  local what sub
   for k in "${(@ps:\x1e:)got}"; do
     [[ "$k" == <-> ]] || continue
     f=("${(@ps:\x1f:)rows[k]}")
@@ -230,7 +264,12 @@ deliver_news() {
       notes)
         notes+=("- ${f[3]}/${f[4]}: $(cut120 "${f[5]:-}")") ;;
       overlap)
-        overlap+=("wts: ${f[4]} was edited by session \`${f[3]}\` too (branch ${f[5]:--}, first edited it $(age_ago "${f[6]:-}")).") ;;
+        # by_sub: the edit that ran this hook was a subagent's, and it is the
+        # file of this line. The agent reading the news did not make that edit
+        # itself, and may not know which file it was.
+        sub=""
+        [[ -n "$by_sub" && "${f[4]}" == "$by_sub" ]] && sub=" (by a subagent)"
+        overlap+=("wts: ${f[4]}$sub was edited by session \`${f[3]}\` too (branch ${f[5]:--}, first edited it $(age_ago "${f[6]:-}")).") ;;
       archive)
         what="${f[5]:-unknown}"
         if [[ "${f[6]:-}" =~ '/pull/([0-9]+)' ]]; then what+=", PR #${match[1]}"; fi
@@ -266,6 +305,9 @@ deliver_news() {
 # how a working agent hears of a note before its turn is over, and how the
 # first editor of a file hears that a sibling edited it too. The overlap itself
 # is one of the news, marked like the rest: once per sibling and file.
+# A subagent's edit carries agent_id: its path is kept in by_sub, and the
+# overlap line about it says "(by a subagent)".
+by_sub=""
 if [[ "$EVENT" == touch ]]; then
   if [[ -n "$file" ]]; then
     wt=$(db_session_field "$me" worktree)
@@ -280,11 +322,13 @@ if [[ "$EVENT" == touch ]]; then
     fi
     # Outside the worktree: not this repository's file, not recorded.
     if [[ -n "$rel" ]]; then
+      [[ -n "$agent_id" ]] && by_sub="$rel"
       db_q "INSERT OR IGNORE INTO touches (session, path, at)
             VALUES ($(sql_str "$me"), $(sql_str "$rel"), $now)" >/dev/null 2>&1
     fi
   fi
   $quiet && exit 0
+  $db_ready || exit 0
   text=$(deliver_news)
   [[ -n "$text" ]] || exit 0
   jq -cn --arg t "$text" \
@@ -298,10 +342,8 @@ db_q "INSERT INTO agent_events (session, claude_session, event, kind, message, a
       DELETE FROM agent_events WHERE at < $now - 7 * 86400;" >/dev/null 2>&1 || exit 0
 
 # ─── prompt: the news, at the start of a turn ────────────────────────────────
-# db_init first: this hook may be the first wts code to open a database an
-# older wts left at schema 8, without the seen table. Its fast path is one
-# PRAGMA. When it fails, the turn goes on without news.
-if [[ "$EVENT" == prompt ]] && ! $quiet && db_init >/dev/null 2>&1; then
+# Only once db_init succeeded (above): the marks need the seen table.
+if [[ "$EVENT" == prompt ]] && ! $quiet && $db_ready; then
   news=$(deliver_news)
   [[ -n "$news" ]] && print -u3 -r -- "$news"
 fi

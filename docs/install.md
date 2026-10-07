@@ -91,7 +91,7 @@ paths point to the stable `opt/wts` location and survive `brew upgrade`.
 
 ## The Claude Code integration
 
-Optional, recommended: six hooks, the permissions for wts's read-only verbs,
+Optional, recommended: seven hooks, the permissions for wts's read-only verbs,
 and a skill.
 
 ```sh
@@ -103,15 +103,16 @@ The hooks go user-wide, in `~/.claude/settings.json`:
 
 | Hook               | What it does |
 |--------------------|--------------|
-| `SessionStart`     | tells every agent started in a wts session about its task and the other sessions, again after `/clear`, `/compact` and a resume ([Agents share state](agents.md#agents-share-state-wts-db)) |
+| `SessionStart`     | two hooks. `wts-context` tells every agent started in a wts session about its task and the other sessions, again after `/clear`, `/compact` and a resume ([Agents share state](agents.md#agents-share-state-wts-db)); `wts-hook start` records that a conversation starts, and how (`startup`, `resume`, `clear`, `compact`) |
 | `UserPromptSubmit` | records that a turn starts; hands the agent the news since its last turn ([The news during a session](agents.md#the-news-during-a-session)) |
 | `Stop`             | records that the turn is over; rings when an agent needs you ([When an agent needs you](watching.md#when-an-agent-needs-you)) |
 | `Notification`     | records a permission or a question the agent waits on; rings |
 | `SessionEnd`       | records that the agent quits |
 | `PostToolUse`      | on `Edit`, `Write`, `MultiEdit`, `NotebookEdit`: records the file edited, and says when another session edits it too |
 
-The four in the middle are what dates the agent states in `wts ls` and the
-switcher ([The agent's own events](watching.md#the-agents-own-events)).
+`wts-hook start` and the four after it are what dates the agent states in `wts
+ls` and the switcher ([The agent's own events](watching.md#the-agents-own-events)).
+Every one of them also records the agent's pane and the path of its transcript.
 Anywhere outside a wts session every hook is silent. They read and write the
 wts database only: no git, no model.
 

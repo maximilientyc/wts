@@ -29,7 +29,7 @@
 
 WTS_STATE_DIR="${WTS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wts}"
 WTS_DB="${WTS_DB:-$WTS_STATE_DIR/wts.db}"
-WTS_DB_SCHEMA=9
+WTS_DB_SCHEMA=10
 # Where the helpers are, for the few functions below that call one. Top level:
 # when this file is sourced, $0 is this file.
 WTS_DB_HOME="${0:A:h}"
@@ -219,15 +219,18 @@ INSERT OR IGNORE INTO doc_cache
   # the column is missing, and a loser of a race between two first runs fails
   # harmlessly. Checked again after: the version is not raised over a table
   # still without it, and the next command tries again.
-  if [[ "$(db_q "SELECT count(*) FROM sqlite_master WHERE name = 'pr_state'" 2>/dev/null)" == 1 ]]; then
-    if [[ "$(db_q "SELECT count(*) FROM pragma_table_info('pr_state') WHERE name = 'head'" 2>/dev/null)" != 1 ]]; then
-      db_q "ALTER TABLE pr_state ADD COLUMN head TEXT NOT NULL DEFAULT ''" >/dev/null 2>&1
-      if [[ "$(db_q "SELECT count(*) FROM pragma_table_info('pr_state') WHERE name = 'head'" 2>/dev/null)" != 1 ]]; then
-        print -u2 -r -- "⚠ wts: could not add pr_state.head to $WTS_DB"
-        return 1
-      fi
+  # pr_state.head is schema 8, agent_panes.transcript schema 10.
+  local tc tbl col
+  for tc in pr_state:head agent_panes:transcript; do
+    tbl="${tc%%:*}" col="${tc#*:}"
+    [[ "$(db_q "SELECT count(*) FROM sqlite_master WHERE name = '$tbl'" 2>/dev/null)" == 1 ]] || continue
+    [[ "$(db_q "SELECT count(*) FROM pragma_table_info('$tbl') WHERE name = '$col'" 2>/dev/null)" == 1 ]] && continue
+    db_q "ALTER TABLE $tbl ADD COLUMN $col TEXT NOT NULL DEFAULT ''" >/dev/null 2>&1
+    if [[ "$(db_q "SELECT count(*) FROM pragma_table_info('$tbl') WHERE name = '$col'" 2>/dev/null)" != 1 ]]; then
+      print -u2 -r -- "⚠ wts: could not add $tbl.$col to $WTS_DB"
+      return 1
     fi
-  fi
+  done
 
   sql="BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS sessions (
@@ -415,12 +418,15 @@ CREATE INDEX IF NOT EXISTS archive_by_task   ON archive(task);
 -- agent's environment): exact, where the collector has to match a Claude
 -- session file to a pane and the pane's command is Claude Code's version
 -- number. What wts send and the switcher's reply type into. Kept with its
--- session, dropped with it.
+-- session, dropped with it. transcript (schema 10) is the transcript_path of
+-- the hook's payload: the file itself, where the project directory derived
+-- from the worktree is a guess Claude Code may stop matching.
 CREATE TABLE IF NOT EXISTS agent_panes (
   session        TEXT PRIMARY KEY,
   claude_session TEXT NOT NULL DEFAULT '',
   pane           TEXT NOT NULL,
-  at             INTEGER NOT NULL
+  at             INTEGER NOT NULL,
+  transcript     TEXT NOT NULL DEFAULT ''
 );
 -- Every file an agent edited (PostToolUse on Edit, Write, MultiEdit,
 -- NotebookEdit), relative to its worktree: two sessions of one repository
@@ -1182,10 +1188,24 @@ db_claude_project_dir() {  # <dir>
 # than the session: an older file belongs to a previous incarnation of the same
 # name (wts rm, then wts <name> again), whose work is unrelated.
 # wts-brief, wts-retro and wts-pr read the same file this way.
-db_session_transcript() {  # <worktree> <subdir> <created epoch> [<claude session id>]
-  local worktree="$1" subdir="$2" created="${3:-0}" sid="${4:-}" d f tr=""
+# With <session>, the transcript its hooks recorded comes first (agent_panes,
+# from the payload's transcript_path), when the file is still there and not
+# older than the session: Claude Code names it, wts no longer derives it. The
+# project-directory slug stays as the fallback, for an agent whose hooks
+# predate schema 10 and for a session whose row went with a teardown.
+db_session_transcript() {  # <worktree> <subdir> <created epoch> [<claude session id>] [<session>]
+  local worktree="$1" subdir="$2" created="${3:-0}" sid="${4:-}" session="${5:-}" d f tr=""
   integer m best=0
   local -a dirs
+  zmodload -F zsh/stat b:zstat 2>/dev/null
+  if [[ -n "$session" ]]; then
+    tr=$(db_ro "SELECT transcript FROM agent_panes WHERE session = $(sql_str "$session")" 2>/dev/null)
+    if [[ -n "$tr" && -f "$tr" ]] && (( $(zstat +mtime "$tr" 2>/dev/null || print 0) >= created )); then
+      print -r -- "$tr"
+      return 0
+    fi
+    tr=""
+  fi
   dirs=("$(db_claude_project_dir "$worktree")")
   [[ -n "$subdir" ]] && dirs+=("$(db_claude_project_dir "$worktree/$subdir")")
   if [[ -n "$sid" ]]; then
@@ -1196,7 +1216,6 @@ db_session_transcript() {  # <worktree> <subdir> <created epoch> [<claude sessio
       fi
     done
   fi
-  zmodload -F zsh/stat b:zstat 2>/dev/null
   for d in "${dirs[@]}"; do
     for f in "$d"/*.jsonl(N); do
       m=$(zstat +mtime "$f" 2>/dev/null) || continue

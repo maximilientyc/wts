@@ -40,6 +40,14 @@
   # below, where a stray quote would break the pane's zsh.
   doc = clean.(ENV['WTS_DOC'])
   doc = '' unless doc =~ %r{\A[A-Za-z0-9._/-]+\z}
+  # The session's name, as the conversation's name (`claude --name`): what
+  # Claude Code shows in /resume and its own agent list, where every wts
+  # session otherwise reads as its first prompt. Same check as the document,
+  # plus a first character that is not a dash (claude would read a flag). On
+  # creation only: a resumed conversation keeps the name it was given.
+  name = clean.(ENV['WTS_NAME'])
+  name = '' unless name =~ %r{\A[A-Za-z0-9][A-Za-z0-9._/-]*\z}
+  claude = name.empty? ? 'claude' : "claude --name #{name}"
   task = clean.(ENV['WTS_PROMPT']).sub(/;+\z/, '').strip
   unless doc.empty?
     task = task.empty? ?
@@ -54,11 +62,11 @@
   inner =
     if !prompt_file.empty?
       lead = doc.empty? ? '' : "Read @#{doc} first, it is the context for this task. "
-      yaml_sq.(%Q{claude "#{lead}$(cat #{prompt_file.shellescape})"})
+      yaml_sq.(%Q{#{claude} "#{lead}$(cat #{prompt_file.shellescape})"})
     elsif task.empty?
-      'claude'
+      claude
     else
-      "claude #{task.shellescape}"
+      "#{claude} #{task.shellescape}"
     end
   claude_cmd =
     if restore

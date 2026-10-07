@@ -223,16 +223,23 @@ the pane has not changed. The hashes are kept in the state database.
 
 `claude agents` says what state an agent is in, not since when nor what it is
 waiting on. The agent knows, and Claude Code says it through its hooks:
-`wts setup claude --install` puts `wts-hook` on `UserPromptSubmit`, `Stop`,
-`Notification` and `SessionEnd`, and each one writes a row to the
-`agent_events` table (kept a week).
+`wts setup claude --install` puts `wts-hook` on `SessionStart` (next to
+`wts-context`), `UserPromptSubmit`, `Stop`, `Notification` and `SessionEnd`,
+and each one writes a row to the `agent_events` table (kept a week). A start
+carries its source in `kind`: `startup`, `resume`, `clear` or `compact`.
 
 - The poll remains the word on the state. The events date it (the prompt for
-  `working`, the notification for `blocked`, the stop for `idle`) and supply
-  the question.
+  `working`, the notification for `blocked`, the stop or a start for `idle`)
+  and supply the question.
 - When claude cannot be asked, or does not list the agent, the last event
-  decides the state. An end reads `stopped`: the agent said it was leaving.
-  After a `/clear` it reads `idle`: the agent is still there.
+  decides the state. An end reads `stopped`: the agent said it was leaving. A
+  start after it reads `idle`, since that start: `/clear` (an end and a start
+  together), or `claude` run again in the same pane, which used to read
+  `stopped` until its first prompt. An end of kind `clear` with no start after
+  it reads `idle` too: the install has no start hook yet
+  (`wts setup claude --install` adds it).
+- A start of kind `compact` changes nothing: a compaction, often in the middle
+  of a turn, leaves the state what the events before it said.
 - Any other event older than twelve hours leaves no state: that is an agent
   that died without a word.
 
@@ -246,8 +253,11 @@ same isolation as naming a session.
 
 Each summary is cached in the state database (table `briefs`), keyed on HEAD,
 uncommitted changes and the transcript's size and date. The transcript used is
-the live agent's, else the most recent one of the worktree, never one older than
+the one the agent's hooks named (`transcript_path` in every payload, kept in
+`agent_panes.transcript`) while that file exists, else the live agent's, else
+the most recent one of the worktree's project directory, never one older than
 the session, which would belong to a previous session of the same name.
+`wts tail`, `wts pr` and the retrospective read the same file.
 
 ### How tokens are counted
 

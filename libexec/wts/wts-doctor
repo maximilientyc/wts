@@ -239,7 +239,8 @@ else
   ok "tmux server: not running (the snippet is read when it starts)"
 fi
 
-# The Claude hooks: six events, all pointing at this install, the permissions
+# The Claude hooks: seven of them on six events (SessionStart has two), all
+# pointing at this install, the permissions
 # that keep the first thing an agent does from being a prompt, and the skill.
 settings="$CLAUDE_DIR/settings.json"
 if [[ ! -s "$settings" ]]; then
@@ -247,17 +248,25 @@ if [[ ! -s "$settings" ]]; then
 elif ! command -v jq >/dev/null 2>&1; then
   warn "Claude hooks: jq needed to read $settings"
 else
-  typeset -a missing stale
-  missing=() stale=()
-  for ev cmd in SessionStart "$libexec/wts-context" UserPromptSubmit "$libexec/wts-hook prompt" \
+  typeset -a missing stale cmds
+  missing=() stale=() cmds=()
+  # Matched on the hook's own tail (`/wts-context`, `/wts-hook start`): an
+  # older install has wts-context alone on SessionStart, and that is
+  # the start hook missing, not an install of another path.
+  for ev cmd in SessionStart "$libexec/wts-context" SessionStart "$libexec/wts-hook start" \
+                UserPromptSubmit "$libexec/wts-hook prompt" \
                 Stop "$libexec/wts-hook stop" Notification "$libexec/wts-hook notification" \
                 SessionEnd "$libexec/wts-hook end" PostToolUse "$libexec/wts-hook touch"; do
-    cmds=$(jq -r --arg e "$ev" '.hooks[$e] // [] | .[] | .hooks // [] | .[] | .command // empty' \
-             "$settings" 2>/dev/null | grep -E '/wts-(context|hook)( |$)')
-    if [[ -z "$cmds" ]]; then
-      missing+=("$ev")
-    elif ! print -r -- "$cmds" | grep -qxF -- "$cmd"; then
-      stale+=("$ev")
+    suffix="/${cmd:t}"
+    label="$ev"
+    [[ "$cmd" == *" start" ]] && label="SessionStart (wts-hook start)"
+    cmds=("${(@f)$(jq -r --arg e "$ev" '.hooks[$e] // [] | .[] | .hooks // [] | .[] | .command // empty' \
+                     "$settings" 2>/dev/null)}")
+    cmds=("${(@M)cmds:#*"$suffix"}")
+    if (( ! ${#cmds} )); then
+      missing+=("$label")
+    elif (( ! ${cmds[(Ie)$cmd]} )); then
+      stale+=("$label")
     fi
   done
   perms=$(jq -r '.permissions.allow // [] | .[]' "$settings" 2>/dev/null)
@@ -266,14 +275,14 @@ else
   for p in "${WTS_CLAUDE_ALLOW[@]}"; do
     print -r -- "$perms" | grep -qxF -- "$p" || noperm+=("$p")
   done
-  if (( ${#missing} == 6 )); then
+  if (( ${#missing} == 7 )); then
     warn "Claude hooks: not installed (wts setup claude --install)"
   elif (( ${#missing} + ${#stale} )); then
     warn "Claude hooks: ${missing:+missing ${(j:, :)missing}}${missing:+${stale:+; }}${stale:+${(j:, :)stale} from another install} (wts setup claude --install)"
   else
-    ok "Claude hooks: the six events, from this install"
+    ok "Claude hooks: all seven, from this install"
   fi
-  if (( ${#noperm} && ${#missing} < 6 )); then
+  if (( ${#noperm} && ${#missing} < 7 )); then
     warn "Claude permissions: ${#noperm} of wts's read-only verbs missing, agents will ask (wts setup claude --install)"
   fi
 fi

@@ -15,6 +15,11 @@
   # by the tty's line limit (see default.yml).
   prompt_file = ENV['WTS_PROMPT_FILE'].to_s.dup.force_encoding('UTF-8')
   prompt_file = '' unless prompt_file.valid_encoding? && File.file?(prompt_file)
+  # The session's name as the conversation's (`claude --name`), on creation
+  # only, checked like default.yml does.
+  name = clean.(ENV['WTS_NAME'])
+  name = '' unless name =~ %r{\A[A-Za-z0-9][A-Za-z0-9._/-]*\z}
+  claude = name.empty? ? 'claude' : "claude --name #{name}"
   claude_cmd =
     if restore
       if ENV['WTS_RESUME_ID'].to_s =~ /\A[0-9a-f-]+\z/
@@ -25,11 +30,11 @@
         %q{" print -z claude"}
       end
     elsif !prompt_file.empty?
-      "'" + %Q{claude "$(cat #{prompt_file.shellescape})"}.gsub("'", "''") + "'"
+      "'" + %Q{#{claude} "$(cat #{prompt_file.shellescape})"}.gsub("'", "''") + "'"
     elsif task.empty?
-      'claude'
+      claude
     else
-      "claude #{task.shellescape}"
+      "#{claude} #{task.shellescape}"
     end
 %>
 name: <%= ENV['WTS_NAME'] %>

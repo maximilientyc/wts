@@ -144,7 +144,7 @@ refresh_one() { # <name> <repo_root> <worktree> <branch> <subdir> <created epoch
   if [[ -z "$branch" || ! -d "$root" ]]; then
     print -r -- "no branch or repository in the registry" > "$errf"
   else
-    tr=$(db_session_transcript "$worktree" "$subdir" "$created") || tr=""
+    tr=$(db_session_transcript "$worktree" "$subdir" "$created" "" "$name") || tr=""
     url=$(db_transcript_pr_url "$tr")
     if [[ -n "$url" ]] && out=$(gh_view "$root" "$url" 2>"$errf"); then
       f=("${(@ps:\x1f:)$(print -r -- "$out" | jq -r "$SUMMARY" 2>/dev/null)}")

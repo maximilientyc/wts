@@ -87,7 +87,35 @@ you can hit.
   the same repository under another branch prefix or `WTS_WORKTREES_BASE`: the
   first worktree stays on disk, unregistered. `wts doc use` types into an
   agent's pane without looking at its state, as `wts send` did.
-- When `claude agents` does not list an agent and the events decide alone, an
+- ~~When `claude agents` does not list an agent and the events decide alone, an
   agent started again in the same pane reads `stopped` until its first prompt:
   `SessionStart` records no event, so the `end` of the previous conversation
-  is still the last word. `wts send` then needs `--force`.
+  is still the last word. `wts send` then needs `--force`.~~ Shipped:
+  `wts-hook start` on `SessionStart` records a `start` event, which reads
+  `idle` after an `end`.
+
+## Claude Code features considered
+
+Looked at while adding `--name`, `transcript_path` and the `start` hook, and
+not adopted. Each one would be revisited if the reason stops holding.
+
+- **`--bare`** for the headless calls (`wts-name`, `wts-brief`, `wts-retro`):
+  with it, `claude --help` says, "Anthropic auth is strictly ANTHROPIC_API_KEY
+  or apiKeyHelper via --settings (OAuth and keychain are never read)", so on a
+  subscription account those calls would get no answer. In the agent's pane it
+  would also skip the hooks, which are what wts reads an agent's state, pane and
+  news from.
+- **`--worktree`**: Claude Code would create a worktree of its own, beside the
+  one wts made, registered and will gc; one worktree has one owner.
+- **Agent teams**: the members live inside one Claude Code process and share
+  its checkout; wts's unit is a worktree and a pane each, which you can attach
+  to, review and clean up on their own.
+- **`--bg` and the Agent SDK**: an agent with no pane has nowhere to ask for a
+  permission where you will see it, and `wts send`, `reply` and the switcher
+  preview all work on the pane.
+- **A blocking `Stop` hook** (exit 2, to keep a turn going until the notes are
+  read or the tests pass): a wts hook always exits 0 (CLAUDE.md), and one that
+  decides when an agent may stop takes the turn from you, and loops it on a bug.
+- **Plugin packaging** of the hooks and the skill: they point at the install's
+  own `libexec` (`opt/wts` under Homebrew) and `wts doctor` checks that; a
+  plugin is a second channel, versioned apart from the formula.

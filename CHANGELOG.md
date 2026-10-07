@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased
+
+- **A conversation start is an event: an agent started again reads `idle`,
+  not `stopped`.** A seventh hook, `wts-hook start`, runs on `SessionStart`
+  next to `wts-context` and records an `agent_events` row `event = start`,
+  `kind` = its source (`startup`, `resume`, `clear`, `compact`), with the pane,
+  the conversation id and the transcript. When `claude agents` does not list
+  the agent, a start newer than the last end reads `idle` (since the start);
+  a `compact` start leaves the state as it was. Before, an agent quit and run
+  again in the same pane read `stopped` until its first prompt, and `wts send`
+  refused it without `--force`. An `end` of reason `clear` with no start after
+  it still reads `idle`, so `/clear` keeps working on an install upgraded
+  before the hook is added. Run `wts setup claude --install` to add it;
+  `wts doctor` names it when it is missing.
+
+- **The transcript is the one Claude Code names.** Every hook reads
+  `transcript_path` from its payload and keeps it in a new column,
+  `agent_panes.transcript` (schema 10, added by `ALTER TABLE` on the next
+  command). `wts brief`, `wts tail`, `wts pr` and the retrospective read that
+  file while it exists and is not older than the session; the path derived
+  from the worktree stays as the fallback.
+
+- **The conversation carries the session's name.** The built-in and example
+  layouts start Claude with `--name <session>` on creation (not on restore,
+  where the resumed conversation keeps its own), so `/resume` and Claude
+  Code's agent list show the session rather than the first prompt. The name is
+  checked like `WTS_DOC` before it reaches the pane's command line.
+
+- **An overlap found at a subagent's edit says so.** `wts-hook touch` reads
+  `agent_id`, and the news line about the file reads
+  `wts: <path> (by a subagent) was edited by session …`.
+
+- `docs/roadmap.md` lists the Claude Code features considered and not adopted
+  (`--bare`, `--worktree`, agent teams, `--bg` and the SDK, a blocking `Stop`
+  hook, plugin packaging), with the reason for each.
+
 ## 1.10.1 — 2026-10-07
 
 - **The document picker waits for its whole list before reading keys**
