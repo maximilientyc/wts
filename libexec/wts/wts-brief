@@ -154,7 +154,13 @@ collect() {
     recs=$(grep -F -e '"type":"ai-title"' -e '"type":"pr-link"' -e '"type":"last-prompt"' "$tr" 2>/dev/null)
     title=$(print -r -- "$recs" | grep -F '"type":"ai-title"' | tail -n 1 | jq -r '.aiTitle // empty' 2>/dev/null)
     pr=$(print -r -- "$recs" | grep -F '"type":"pr-link"' | tail -n 1 | jq -r '.prUrl // empty' 2>/dev/null)
-    last_prompt=$(print -r -- "$recs" | grep -F '"type":"last-prompt"' | tail -n 1 | jq -r '.lastPrompt // empty' 2>/dev/null)
+    # The author's, not a sibling's: a message from another session
+    # (SendMessage) is a prompt to Claude Code, and may be the last one.
+    last_prompt=$(print -r -- "$recs" | grep -F '"type":"last-prompt"' | jq -Rrn '
+      [inputs | fromjson? | .lastPrompt // empty | strings
+       | select(startswith("<cross-session-message") or startswith("[Cross-session ")
+                or startswith("Another Claude session sent a message") | not)]
+      | last // empty' 2>/dev/null)
     texts=$(tail -n 300 "$tr" | jq -Rrn '
       [inputs | fromjson? | select(.type == "assistant" and (.isSidechain | not))
        | .message.content[]? | select(.type == "text") | .text]
@@ -162,9 +168,8 @@ collect() {
     # Not history.jsonl for the starting task: pasted content is replaced there
     # by "[Pasted text #1]".
     if [[ -z "$prompt" ]]; then
-      prompt=$(head -n 200 "$tr" | jq -Rrn '
-        first(inputs | fromjson? | select(.type == "user")
-              | .message.content | select(type == "string" and (startswith("<") | not)))
+      prompt=$(head -n 200 "$tr" | jq -Rrn "$JQ_AUTHORED"'
+        first(inputs | fromjson? | select(.type == "user" and authored) | .message.content)
         // ""' 2>/dev/null)
     fi
   fi

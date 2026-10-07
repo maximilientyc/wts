@@ -5,7 +5,8 @@
 #   SessionStart     -> wts-hook start          a conversation starts (next to
 #                                               wts-context): startup, resume,
 #                                               clear or compact, in `kind`
-#   UserPromptSubmit -> wts-hook prompt         a turn starts
+#   UserPromptSubmit -> wts-hook prompt         a turn starts (kind = message
+#                                               when another session sent it)
 #   Stop             -> wts-hook stop           the turn is over
 #   Notification     -> wts-hook notification   waiting for a permission or an answer
 #   SessionEnd       -> wts-hook end            the agent is gone
@@ -194,17 +195,19 @@ exec 3>&1 >/dev/null
 db_available || exit 0
 [[ -s "$WTS_DB" ]] || exit 0
 
-# transcript_path is in every payload; agent_id only in a subagent's tool call.
-sid="" kind="" msg="" cwd="" file="" transcript="" agent_id=""
+# transcript_path is in every payload; agent_id only in a subagent's tool call;
+# prompt (its head: enough for the sender's name) only in UserPromptSubmit's.
+sid="" kind="" msg="" cwd="" file="" transcript="" agent_id="" prompt_head=""
 if [[ -n "$payload" ]] && command -v jq >/dev/null 2>&1; then
-  IFS=$'\x1f' read -r sid kind msg cwd file transcript agent_id < <(print -r -- "$payload" | jq -r '
+  IFS=$'\x1f' read -r sid kind msg cwd file transcript agent_id prompt_head < <(print -r -- "$payload" | jq -r '
     [ (.session_id // ""),
       (.notification_type // .reason // .source // ""),
       ((.message // "") | gsub("[\\t\\n\\r\u001f\u001e]"; " ")),
       (.cwd // ""),
       ((.tool_input.file_path // .tool_input.notebook_path // "") | gsub("[\\t\\n\\r\u001f\u001e]"; " ")),
       ((.transcript_path // "") | gsub("[\\t\\n\\r\u001f\u001e]"; " ")),
-      ((.agent_id // "") | tostring | gsub("[\\t\\n\\r\u001f\u001e]"; " "))
+      ((.agent_id // "") | tostring | gsub("[\\t\\n\\r\u001f\u001e]"; " ")),
+      ((.prompt // "") | tostring | .[0:400] | gsub("[\\t\\n\\r\u001f\u001e]"; " "))
     ] | join("\u001f")' 2>/dev/null)
 fi
 # Only an absolute path to a transcript: it is read back as a file by name.
@@ -450,6 +453,16 @@ if [[ "$EVENT" == touch ]]; then
   jq -cn --arg t "$text" \
     '{hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext: $t}}' >&3 2>/dev/null
   exit 0
+fi
+
+# A prompt that another Claude session sent (SendMessage), or Claude Code's
+# notice about one (notify_when_idle): kind = message, and the sender as the
+# message. It starts a turn like the author's own and is recorded as a prompt,
+# so the state reads working; the kind is what tells the two apart for whoever
+# reads the events.
+if [[ "$EVENT" == prompt ]] && peer=$(claude_peer_prompt "$prompt_head"); then
+  kind=message
+  if [[ "$peer" == notice ]]; then msg="$prompt_head"; else msg="from $peer"; fi
 fi
 
 db_q "INSERT INTO agent_events (session, claude_session, event, kind, message, at)

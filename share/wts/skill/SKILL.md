@@ -50,6 +50,25 @@ wts send <name> "<a new prompt>"               # to a working or idle agent only
 wts tail <name> -n 3 --json                    # its last messages, from its transcript
 ```
 
+**Prefer Claude Code's own messages when the other agent is listed.** Claude
+Code 2.1.224 and later delivers messages between the sessions of this machine:
+if `ListAgents` lists the agent (its row's `tmux` column starts with the wts
+session's name; the session context says "reach `<name>` with SendMessage"),
+
+- `SendMessage` to that name instead of `wts send`: it reaches the agent
+  whether it is working (read at its next tool call) or idle (it starts a
+  turn), never types into a question it is blocked on, and the answer comes
+  back to you as a message;
+- `SendMessage` with `notify_when_idle: true` instead of `wts wait`: one notice
+  arrives when it next finishes a turn (or exits). Do not poll for it.
+
+A wts session started with a name is listed under that name; one started by a
+layout without `--name` gets `<session>-<two hex digits>`: send the name
+exactly as listed, a prefix is refused. `wts send` and `wts wait` stay for an
+agent `ListAgents` does not list (an older Claude Code, messages refused by
+its `crossSessionInbound` setting, a remote machine) and for scripts and
+terminals, which have no SendMessage. `wts doctor` says which applies here.
+
 `wts wait` also returns on an agent that quit (`stopped`) or that is stuck
 (`"stale": true`). When it says no agent is known in a session (`unknown`),
 calling it again will not help: read `wts status --json`. `wts send` refuses a

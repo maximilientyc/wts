@@ -163,6 +163,18 @@ if (( ${+commands[claude]} )); then
   else
     warn "claude agents --json does not answer: agent states come from the hooks only"
   fi
+  # Claude Code's messages between sessions (SendMessage, notify_when_idle):
+  # what the skill tells agents to use before wts send and wts wait. The
+  # current repository's own settings count too, when there is one. Not
+  # stored: doctor writes nothing.
+  top=$(git rev-parse --show-toplevel 2>/dev/null) || top=""
+  m=$(claude_messaging --no-store "$top")
+  case "$m" in
+    available) ok "messages between sessions: available (agents use SendMessage before wts send)" ;;
+    old\ *)    ok "messages between sessions: needs claude >= $WTS_CLAUDE_MESSAGING_MIN (this is ${m#old }): agents use wts send and wts wait" ;;
+    refuse\ *) warn "messages between sessions: refused by crossSessionInbound in ${m#refuse }: agents use wts send and wts wait" ;;
+    hold\ *)   warn "messages between sessions: held by crossSessionInbound in ${m#hold } (each one waits for your approval)" ;;
+  esac
 else
   warn "claude not found: no agent in the layouts, no naming, brief, retro or doc fetch"
 fi

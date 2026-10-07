@@ -42,7 +42,7 @@ Other agents work in parallel on this repository, one per wts session (a git
 worktree + a tmux session each). Their shared state is a SQLite database: …/wts.db
 
 Sessions on this repository (newest first):
-- rate-limit (feature/rate-limit): rate-limit the public API per key — brief, 2h ago: done: … / next: …
+- rate-limit (feature/rate-limit): rate-limit the public API per key — brief, 2h ago: done: … / next: … — reach `rate-limit` with SendMessage
 - csv-export (feature/csv-export): export users as csv
 
 Latest notes they left:
@@ -66,6 +66,12 @@ agent — is in the wts skill (or: wts help).
   repository's cannot collide with this worktree, so they are not listed. Eight
   sessions at most, with their five latest notes and the files both sessions
   have edited.
+- **"reach `<name>` with SendMessage"** ends the line of a sibling whose agent
+  is running, when Claude Code's messages between sessions work on this
+  machine ([below](#claude-codes-messages-between-sessions)). The name is the
+  one Claude Code lists that agent under, read from its session file: the wts
+  name when the layout passes `--name` (the built-in ones do), else one
+  Claude Code derived. `csv-export` above has no agent running.
 - An agent alone on its repository gets one line instead.
 - `WTS_CONTEXT_QUIET=1` in the agent's environment keeps only the first line and
   the task's title.
@@ -169,6 +175,59 @@ wts send cors --answer 1                         # answer the question it is blo
 wts send cors "also cover the OPTIONS preflight" # a new prompt: to a working or idle agent only
 wts tail cors -n 3 --json                        # what it said last, from its transcript
 ```
+
+### Claude Code's messages between sessions
+
+Claude Code 2.1.224 and later delivers messages between the sessions of one
+machine, over a socket per session: `ListAgents` lists the others,
+`SendMessage` sends to one by name, and `SendMessage` with `notify_when_idle`
+asks for one notice when it next finishes a turn. Between two wts agents these
+do what `wts send` and `wts wait` do, without the pane:
+
+- **A message to a working agent** is read at its next tool call, in the same
+  turn; one to an idle agent starts a turn. Either way it is never typed into
+  a question the agent is blocked on.
+- **The answer comes back as a message**, and the idle notice as a turn of
+  its own, so the asking agent does not poll.
+
+So the skill tells an agent to use them for a sibling `ListAgents` lists, and
+`wts send` and `wts wait` otherwise: for an agent that is not listed (an older
+Claude Code, a session whose agent has quit) and for anything that has no
+`SendMessage` — you in a terminal, a script. `wts send` keeps typing into the
+pane: no command line posts into another session's socket.
+
+A message arrives as a prompt: the `UserPromptSubmit` hook fires for it, in an
+idle agent and in a working one alike. `wts-hook` records it with `kind =
+message` and the sender, so the events tell it from the author's own prompts,
+and `wts brief` and the retrospective leave it out of what the author asked:
+
+```
+$ wts db sql "select event, kind, message from agent_events where kind = 'message'"
+prompt|message|from rate-limit
+```
+
+`wts doctor` says whether it works here (Optional section):
+
+| Line | Meaning |
+|------|---------|
+| `messages between sessions: available` | SendMessage reaches the other agents |
+| `… needs claude >= 2.1.224` | this Claude Code is older |
+| `… refused by crossSessionInbound` | a settings file sets it to `refuse`: nothing arrives |
+| `… held by crossSessionInbound` | `hold`: each message waits for your approval in the receiving session |
+
+The verdict (the version, the user and managed settings) is cached in the
+`kv` table under `claude.messaging`, and computed again when Claude Code or
+one of those settings files changes. A repository's own
+`.claude/settings.json` can tighten the setting too, and is read every time.
+
+Two things to know:
+
+- **An agent in another permission mode** (one in auto mode, another asking
+  for each permission) holds a message from it for its user's approval, in
+  its own pane: that one is not delivered by itself.
+- **A layout that does not pass `--name`** starts agents whose name is
+  derived (`auth-form-3c`): send the name `ListAgents` shows, exactly. The
+  context line already gives it.
 
 ### `wts send`
 
