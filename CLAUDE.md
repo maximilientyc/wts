@@ -72,6 +72,7 @@ docs/demo/                record.zsh + demo.tape (README GIF, make demo)
                           + retro-model.zsh/.tape (WTS_RETRO_MODEL, named by gc's dry run)
                           + claude-hooks.zsh/.tape (start hook, transcript_path, subagent, --name)
                           + worktreeinclude.zsh/.tape (.worktreeinclude copied into a new worktree)
+                          + structured-cost.zsh/.tape (brief's JSON answer, its cost under wts:brief)
 ```
 
 Homebrew, `make install` and a git checkout share this tree, so `bin/wts` works
