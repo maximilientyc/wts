@@ -29,7 +29,7 @@
 
 WTS_STATE_DIR="${WTS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wts}"
 WTS_DB="${WTS_DB:-$WTS_STATE_DIR/wts.db}"
-WTS_DB_SCHEMA=10
+WTS_DB_SCHEMA=11
 # Where the helpers are, for the few functions below that call one. Top level:
 # when this file is sourced, $0 is this file.
 WTS_DB_HOME="${0:A:h}"
@@ -219,13 +219,18 @@ INSERT OR IGNORE INTO doc_cache
   # the column is missing, and a loser of a race between two first runs fails
   # harmlessly. Checked again after: the version is not raised over a table
   # still without it, and the next command tries again.
-  # pr_state.head is schema 8, agent_panes.transcript schema 10.
-  local tc tbl col
-  for tc in pr_state:head agent_panes:transcript; do
-    tbl="${tc%%:*}" col="${tc#*:}"
+  # pr_state.head is schema 8, agent_panes.transcript schema 10, usage.cost_usd
+  # schema 11 (what claude -p reported for one of wts's own calls, by
+  # usage_add_call; NULL on the rows summed from transcripts). An entry is
+  # table:column[:type], the type TEXT NOT NULL DEFAULT '' when it has none.
+  local tc tbl col typ
+  local -a tcf
+  for tc in pr_state:head agent_panes:transcript usage:cost_usd:REAL; do
+    tcf=("${(@s.:.)tc}")
+    tbl="${tcf[1]}" col="${tcf[2]}" typ="${tcf[3]:-TEXT NOT NULL DEFAULT ''}"
     [[ "$(db_q "SELECT count(*) FROM sqlite_master WHERE name = '$tbl'" 2>/dev/null)" == 1 ]] || continue
     [[ "$(db_q "SELECT count(*) FROM pragma_table_info('$tbl') WHERE name = '$col'" 2>/dev/null)" == 1 ]] && continue
-    db_q "ALTER TABLE $tbl ADD COLUMN $col TEXT NOT NULL DEFAULT ''" >/dev/null 2>&1
+    db_q "ALTER TABLE $tbl ADD COLUMN $col $typ" >/dev/null 2>&1
     if [[ "$(db_q "SELECT count(*) FROM pragma_table_info('$tbl') WHERE name = '$col'" 2>/dev/null)" != 1 ]]; then
       print -u2 -r -- "⚠ wts: could not add $tbl.$col to $WTS_DB"
       return 1
@@ -487,7 +492,11 @@ CREATE TABLE IF NOT EXISTS merge_checks (
 -- an unchanged file is not read again.
 --
 -- Tokens and not dollars: prices change and are the reader's business, so the
--- cost is computed at read time (usage_cost_sql below). A table of its own
+-- cost is computed at read time (usage_cost_sql below). The exception is wts's
+-- own headless calls (usage_add_call), one row per verb under the transcript
+-- 'wts:name', 'wts:brief' or 'wts:retro': claude -p reports their cost itself,
+-- kept in cost_usd (schema 11), which prices a model the table below does not
+-- know. NULL everywhere else. A table of its own
 -- rather than columns on archive, because db_init only ever runs CREATE TABLE
 -- IF NOT EXISTS: a new column would never appear on an existing database.
 CREATE TABLE IF NOT EXISTS usage (
@@ -505,6 +514,7 @@ CREATE TABLE IF NOT EXISTS usage (
   bytes       INTEGER NOT NULL DEFAULT 0,
   mtime       INTEGER NOT NULL DEFAULT 0,
   updated_at  INTEGER NOT NULL DEFAULT 0,
+  cost_usd    REAL,
   PRIMARY KEY (session, created_at, transcript, model, speed)
 );
 -- What each agent has been told of the others (schema 9), written by the
@@ -1306,6 +1316,8 @@ usage_store() {  # <session> <created_at> <file> [<key>]
   # No status test: under pipefail, grep finding no usage at all fails the
   # pipeline, and that file is exactly the one to remember as empty.
 
+  # Columns named in the INSERT: the table grew one (cost_usd, schema 11), and a
+  # positional list would fail on every database created before or after it.
   local sql row n
   local -a f
   sql="BEGIN IMMEDIATE; DELETE FROM usage WHERE $where;"
@@ -1316,7 +1328,9 @@ usage_store() {  # <session> <created_at> <file> [<key>]
     (( ${#f} == 8 )) || continue
     (( n++ ))
     sql+="
-INSERT OR REPLACE INTO usage VALUES ($(sql_str "$session"), $(sql_str "$created"),
+INSERT OR REPLACE INTO usage (session, created_at, transcript, model, speed, input,
+  output, cache_write, cache_write_1h, cache_read, messages, bytes, mtime, updated_at)
+  VALUES ($(sql_str "$session"), $(sql_str "$created"),
   $(sql_str "$key"), $(sql_str "${f[1]}"), $(sql_str "${f[2]}"),
   ${${f[3]//[^0-9]/}:-0}, ${${f[4]//[^0-9]/}:-0}, ${${f[5]//[^0-9]/}:-0},
   ${${f[6]//[^0-9]/}:-0}, ${${f[7]//[^0-9]/}:-0}, ${${f[8]//[^0-9]/}:-0},
@@ -1331,6 +1345,60 @@ INSERT OR REPLACE INTO usage (session, created_at, transcript, bytes, mtime, upd
   sql+="
 COMMIT;"
   print -r -- "$sql" | db_q >/dev/null 2>&1
+  return 0
+}
+
+# Add one of wts's own headless calls to the usage table: <verb> is name, brief
+# or retro, and stdin is what `claude -p --output-format json` printed. The
+# tokens come from its usage, the model from modelUsage (the one that cost the
+# most), the cost from total_cost_usd, which is Claude Code's own list price:
+# usage_cost_sql has no price for a model released after it was written, and
+# Haiku is the one these calls use. One row per session incarnation, verb and
+# model, under the transcript 'wts:<verb>', that each call adds to; messages
+# counts the calls. usage_store deletes only rows keyed by a file path, so
+# usage_refresh leaves these alone, and they go with the incarnation like the
+# rest (usage_prune_sql). An empty <created_at> is the registered session's: a
+# brief, or a name recorded right after registry_put.
+usage_add_call() {  # <session> <created_at|''> <verb> ; JSON on stdin
+  local session="$1" created="$2" verb="$3" row
+  [[ -n "$session" && -n "$verb" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  row=$(jq -r 'select(type == "object" and (.usage | type) == "object")
+      | [ ((.modelUsage // {}) | to_entries | max_by(.value.costUSD // 0) | .key? // ""),
+          (.usage.speed // ""),
+          (.usage.input_tokens // 0), (.usage.output_tokens // 0),
+          (.usage.cache_creation_input_tokens // 0),
+          (.usage.cache_creation.ephemeral_1h_input_tokens // 0),
+          (.usage.cache_read_input_tokens // 0),
+          (.total_cost_usd // "") ]
+      | map(tostring) | join("\u001f")' 2>/dev/null) || return 0
+  [[ -n "$row" ]] || return 0
+  local -a f
+  f=("${(@ps:\x1f:)row}")
+  (( ${#f} == 8 )) || return 0
+  local c cost="${f[8]}"
+  if [[ -n "$created" ]]; then
+    c=$(sql_str "$created")
+  else
+    c="(SELECT created_at FROM sessions WHERE name = $(sql_str "$session"))"
+  fi
+  # A number or NULL, never text: it goes into the SQL unquoted.
+  [[ "$cost" =~ '^[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$' ]] || cost="NULL"
+  db_init 2>/dev/null || return 0
+  db_q "INSERT INTO usage (session, created_at, transcript, model, speed, input, output,
+          cache_write, cache_write_1h, cache_read, messages, cost_usd, updated_at)
+        VALUES ($(sql_str "$session"), $c, $(sql_str "wts:$verb"),
+          $(sql_str "${f[1]}"), $(sql_str "${f[2]}"),
+          ${${f[3]//[^0-9]/}:-0}, ${${f[4]//[^0-9]/}:-0}, ${${f[5]//[^0-9]/}:-0},
+          ${${f[6]//[^0-9]/}:-0}, ${${f[7]//[^0-9]/}:-0}, 1, $cost, unixepoch())
+        ON CONFLICT (session, created_at, transcript, model, speed) DO UPDATE SET
+          input = usage.input + excluded.input, output = usage.output + excluded.output,
+          cache_write = usage.cache_write + excluded.cache_write,
+          cache_write_1h = usage.cache_write_1h + excluded.cache_write_1h,
+          cache_read = usage.cache_read + excluded.cache_read,
+          messages = usage.messages + 1,
+          cost_usd = usage.cost_usd + excluded.cost_usd,
+          updated_at = excluded.updated_at" >/dev/null 2>&1
   return 0
 }
 
@@ -1365,7 +1433,9 @@ usage_refresh() {  # [<session>...]
 # is one edit here rather than a migration. First match wins: specific first.
 usage_cost_sql() {  # <alias>
   local a="$1"
-  print -r -- "(SELECT ($a.input * p.column3 + $a.output * p.column4
+  # cost_usd first: the price claude -p reported for wts's own calls
+  # (usage_add_call). NULL on every row summed from a transcript.
+  print -r -- "coalesce($a.cost_usd, (SELECT ($a.input * p.column3 + $a.output * p.column4
       + ($a.cache_write - $a.cache_write_1h) * p.column3 * 1.25
       + $a.cache_write_1h * p.column3 * 2 + $a.cache_read * p.column5)
       * (CASE $a.speed WHEN 'fast' THEN 2 ELSE 1 END) / 1000000.0
@@ -1383,7 +1453,7 @@ usage_cost_sql() {  # <alias>
       (11, 'claude-3-7-sonnet*',   3,  15,  0.3),
       (12, 'claude-haiku-4-5*',    1,   5,  0.1),
       (13, 'claude-3-5-haiku*',  0.8,   4,  0.08)) p
-    WHERE $a.model GLOB p.column2 ORDER BY p.column1 LIMIT 1)"
+    WHERE $a.model GLOB p.column2 ORDER BY p.column1 LIMIT 1))"
 }
 
 # The usage of one session incarnation as a SQL expression yielding a JSON

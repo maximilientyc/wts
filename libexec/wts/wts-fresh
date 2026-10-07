@@ -189,15 +189,20 @@ base=$(detect_default_branch) || \
 
 name_file=""
 name_pid=""
+# The naming call's JSON result: wts records its cost under the session it
+# creates (WTS_NAME_USAGE, read by both wts-name and wts).
+usage_file=""
 cleanup_name() {
   [[ -n "$name_pid" ]] && kill "$name_pid" 2>/dev/null
   [[ -n "$name_file" ]] && rm -f "$name_file"
+  [[ -n "$usage_file" ]] && rm -f "$usage_file"
 }
 trap cleanup_name EXIT
 
 if [[ "$1" == *[[:space:]]* && -x "$WTS_HELPERS/wts-name" ]]; then
   name_file=$(mktemp "${TMPDIR:-/tmp}/wts-name.XXXXXX")
-  "$WTS_HELPERS/wts-name" "$1" > "$name_file" &
+  usage_file=$(mktemp "${TMPDIR:-/tmp}/wts-name-usage.XXXXXX" 2>/dev/null) || usage_file=""
+  WTS_NAME_USAGE="$usage_file" "$WTS_HELPERS/wts-name" "$1" > "$name_file" &
   name_pid=$!
   print -r -- "→ naming (during the fetch)"
 fi
@@ -305,6 +310,7 @@ if [[ -n "$name_pid" ]]; then
   rm -f "$name_file"
   name_file=""
   [[ -n "$hint" ]] && hint_env=("WTS_NAME_HINT=$hint")
+  [[ -n "$hint" && -n "$usage_file" ]] && hint_env+=("WTS_NAME_USAGE=$usage_file")
 fi
 
 # The window does not see the calling pane's environment and sources no shell:

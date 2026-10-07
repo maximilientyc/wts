@@ -205,8 +205,12 @@ type:
 | `wts gc --apply`, `wts retro` | per finished session: the task as asked, the commit subjects, the diffstat, the files touched, whether it shipped, and the exchange between you and the agent from its transcript, for a four-line retrospective |
 
 - `wts ls`, the switcher and the hooks never call it. Neither does `wts rm`.
-- Naming, `wts brief` and the retrospectives run with MCP and tools off.
-  `wts doc` is the exception, since reading a page is its job.
+- Naming, `wts brief` and the retrospectives run with MCP and tools off, and
+  ask for a JSON answer against a schema. What each call cost is counted with
+  the session's usage (`wts ls --wide`, [Tokens and
+  cost](docs/watching.md#tokens-and-cost)).
+- `wts doc` is the exception, since reading a page is its job: each fetch is
+  capped at `WTS_DOC_BUDGET_USD` (1 USD) and `WTS_DOC_MAX_TURNS` (8 turns).
 - `WTS_NO_LLM=1` never calls the model: names are derived locally, `wts brief`
   shows the raw facts, documents stay pointers, retrospectives are skipped.
 - Things is read only by a command you type in a terminal (or with

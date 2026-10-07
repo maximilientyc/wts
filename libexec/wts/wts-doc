@@ -36,7 +36,9 @@
 # Everything else is kept from wts-name: cwd outside any worktree (otherwise
 # wts-status joins the call's cwd to a session and shows a phantom agent), the
 # URL on stdin (--allowedTools is variadic and would read a positional URL as a
-# tool name), `perl alarm` for the timeout, and no transcript.
+# tool name), `perl alarm` for the timeout, and no transcript. Not its JSON
+# result and schema: the answer here is a whole document, which a JSON string
+# field would only make the model escape, line by line.
 #
 # When nothing can read the document — no connector, no model, offline — the
 # entry degrades to a POINTER: the session's context file carries the URL and
@@ -48,7 +50,13 @@
 #            per document, and its only job is not to paraphrase; latency is the
 #            wrong thing to optimize here), WTS_DOC_TOOLS (pinned allow
 #            patterns), WTS_DOC_TOOLS_TTL (86400 s), WTS_DOC_MAX_BYTES (200000),
+#            WTS_DOC_BUDGET_USD (1), WTS_DOC_MAX_TURNS (8),
 #            WTS_NO_LLM=1 (never fetch a URL: cache only)
+#
+# The timeout bounds the time, not the spend: a call with every connector of
+# the machine and sonnet can loop on a tool that pages through a large
+# document. --max-budget-usd and --max-turns bound the rest, and either limit
+# reached is a failed fetch (WTS-FETCH-FAILED, named), never half a document.
 
 set -uo pipefail
 
@@ -270,20 +278,36 @@ If no tool of yours can read that URL, or every tool refuses, answer exactly one
 line: WTS-FETCH-FAILED: <one short reason>"
 
 fetch_url() {  # <url> -> the raw answer on stdout
-  local url="$1"
-  print -r -- "$url" | (
+  local url="$1" out code
+  out=$(print -r -- "$url" | (
     cd "$WTS_STATE_DIR" 2>/dev/null || cd /
     perl -e 'alarm shift; exec @ARGV' "${WTS_DOC_TIMEOUT:-90}" \
       claude -p --model "${WTS_DOC_MODEL:-${WTS_MODEL:-sonnet}}" \
         --no-session-persistence --settings '{"disableAllHooks":true}' \
         --disable-slash-commands --permission-prompts none \
+        --max-budget-usd "${WTS_DOC_BUDGET_USD:-1}" \
+        --max-turns "${WTS_DOC_MAX_TURNS:-8}" \
         --tools WebFetch \
         --allowedTools "${ALLOW[@]}" \
         --disallowedTools Bash Write Edit NotebookEdit \
           'mcp__*create*' 'mcp__*update*' 'mcp__*delete*' 'mcp__*write*' \
           'mcp__*send*' 'mcp__*upload*' 'mcp__*move*' 'mcp__*spawn*' \
         --system-prompt "$SYSTEM_PROMPT"
-  ) 2>/dev/null
+  ) 2>/dev/null)
+  code=$?
+  # A limit reached exits 1 with its reason on stdout, in text mode ("Error:
+  # Reached max turns (8)", "Error: Exceeded USD budget (1)"): read as the
+  # document, that was "answer too short", which named neither the limit nor
+  # the variable that raises it.
+  if (( code != 0 )); then
+    case "$out" in
+      "Error: Reached max turns"*)
+        print -r -- "WTS-FETCH-FAILED: ${${out#Error: }%%$'\n'*} (WTS_DOC_MAX_TURNS)"; return 0 ;;
+      "Error: Exceeded USD budget"*)
+        print -r -- "WTS-FETCH-FAILED: ${${out#Error: }%%$'\n'*} (WTS_DOC_BUDGET_USD)"; return 0 ;;
+    esac
+  fi
+  print -r -- "$out"
 }
 
 typeset -g PARSED_TITLE="" PARSED_BODY="" PARSED_ERROR=""
