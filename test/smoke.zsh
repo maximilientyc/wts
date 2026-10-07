@@ -865,7 +865,9 @@ tmux kill-session -t "=ctrleprobe" 2>/dev/null || true
 tmux new-session -d -s ctrleprobe -x 100 -y 20 "$SANDBOX/bin/ctrl-e-probe"
 pane_contains ctrleprobe "doc>" || true
 tmux send-keys -t "=ctrleprobe:" contra
-pane_contains ctrleprobe "1/" || true
+# 1/2, not 1/: while fzf still reads the list, the first row alone counts 1/1,
+# unfiltered, and an enter then picks it -- spec, not contract (seen on CI).
+pane_contains ctrleprobe "1/2" || true
 tmux send-keys -t "=ctrleprobe:" Enter
 check "ctrl-e: a document picked by its slug is attached, then a key is awaited" \
   eval 'pane_contains ctrleprobe "press any key" && [[ "$(reg_field docsess docs)" == *contract* ]]'
