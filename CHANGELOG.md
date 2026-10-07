@@ -36,6 +36,17 @@
   (`--bare`, `--worktree`, agent teams, `--bg` and the SDK, a blocking `Stop`
   hook, plugin packaging), with the reason for each.
 
+- **`.worktreeinclude`: untracked files copied into every new worktree.**
+  Claude Code's own convention, now honoured by `wts`: a `.worktreeinclude` at
+  the root of the main checkout lists, in `.gitignore` syntax, untracked files
+  a session needs and git does not bring (`.env`, local settings). Right after
+  `git worktree add`, the main checkout's untracked files, ignored ones
+  included, that the file's rules match are copied (`cp -p`), and one line
+  gives the count. The rules are matched in an empty scratch repository: in
+  the real one `.gitignore` is consulted too. Without the file nothing
+  happens; an existing worktree is never copied into again. See
+  [Sessions](docs/sessions.md#untracked-files-worktreeinclude).
+
 ## 1.10.1 — 2026-10-07
 
 - **The document picker waits for its whole list before reading keys**

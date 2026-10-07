@@ -115,6 +115,14 @@ exists, since that is what branches are cut from: the delta and `^ahead` in
 Your local copy of the base is usually behind, and against it a branch with no
 commits of its own is credited with everything the base was missing.
 
+## Files copied into every worktree: `.worktreeinclude`
+
+Untracked files a session needs (`.env`, local settings) are listed per
+repository in `<repo>/.worktreeinclude`, in `.gitignore` syntax; `wts` copies
+the matching ones from the main checkout into each new worktree. No variable:
+the file is the setting, and without it nothing is copied. See [Untracked
+files](sessions.md#untracked-files-worktreeinclude).
+
 ## Monorepo: `WTS_SUBDIR`
 
 When you always work in a subdirectory, set `WTS_SUBDIR` and every pane starts
