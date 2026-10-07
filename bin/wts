@@ -2426,9 +2426,19 @@ fi
 # (layout, repo, base): the model is never called for a creation bound to fail.
 # wts-fresh computes it during its fetch and passes it through WTS_NAME_HINT.
 
+# The naming call's JSON result (its usage and cost) lands in NAME_USAGE, and is
+# recorded under the session once registry_put has created its row. wts-fresh,
+# which names during its fetch, passes its own file through WTS_NAME_USAGE.
+NAME_USAGE="${WTS_NAME_USAGE:-}"
 if [[ -z "$NAME" ]]; then
   slug="${WTS_NAME_HINT:-}"
   if [[ ! "$slug" =~ '^[a-z0-9][a-z0-9-]*$' ]]; then
+    # Removed after the recording below; the trap covers a creation that dies
+    # before it, and is lifted there (the flow ends in an exec, which runs none).
+    NAME_USAGE=$(mktemp "${TMPDIR:-/tmp}/wts-name-usage.XXXXXX" 2>/dev/null || true)
+    if [[ -n "$NAME_USAGE" ]]; then
+      trap 'rm -f "$NAME_USAGE"' EXIT
+    fi
     # Up to WTS_NAME_TIMEOUT (30 s) behind one line, and Ctrl-C used to abort
     # the whole creation — the one key anybody presses while waiting. Now it
     # cuts the wait short: the terminal's SIGINT reaches wts-name and its
@@ -2442,7 +2452,7 @@ if [[ -z "$NAME" ]]; then
     else
       echo "→ naming…"
     fi
-    slug=$("$WTS_LIBEXEC/wts-name" "$PROMPT") || slug=""
+    slug=$(WTS_NAME_USAGE="$NAME_USAGE" "$WTS_LIBEXEC/wts-name" "$PROMPT") || slug=""
     if (( _naming_cut )) || [[ -z "$slug" ]]; then
       slug=$(WTS_NO_LLM=1 "$WTS_LIBEXEC/wts-name" "$PROMPT" 2>/dev/null) || slug=""
       # A line of its own: the terminal has just echoed `^C` where the cursor was.
@@ -2693,6 +2703,15 @@ if (( ${#DOC_SLUGS} )); then
 fi
 registry_put "$SESSION" "$PROFILE" "$repo_root" "$worktree_path" "$BRANCH" \
   "${WTS_SUBDIR:-}" "$CONTEXT" "$PROMPT" "$DOCS_JSON"
+
+# What naming cost, now that the session has a row to attach it to.
+if [[ -n "$NAME_USAGE" ]]; then
+  if [[ -s "$NAME_USAGE" ]]; then
+    usage_add_call "$SESSION" "" name < "$NAME_USAGE"
+  fi
+  rm -f "$NAME_USAGE"
+  trap - EXIT
+fi
 
 # After registry_put: task_links references the session row. Idempotent, so an
 # `wts <name> --task <id>` re-run on a live session just repoints the link.

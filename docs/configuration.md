@@ -39,8 +39,16 @@ wts setup git
 the Claude API; behind Amazon Bedrock or Google Vertex AI it need not: ids are
 prefixed (`anthropic.claude-haiku-4-5`) or dated with an `@` there. Set
 `WTS_MODEL` to the id your platform accepts: an id `claude` does not recognize
-is answered in prose, which `wts` reports as
+gets an error result instead of an answer, which `wts` reports as
 `claude: [claude-code:unrecognized_model]` and falls back from.
+
+Naming, `wts brief` and the retrospectives ask for a JSON result checked
+against a schema (`--output-format json --json-schema`), and read its fields:
+`name`; `done` and `next`; `delivered`, `resisted`, `resolved` and
+`abandoned`. What each call cost is recorded with the session's usage
+([Tokens and cost](watching.md#tokens-and-cost)). They do not run with
+`--bare`, which would skip more of the user's setup: `--bare` never reads
+OAuth, and a subscription account has nothing else to sign in with.
 
 `WTS_RETRO_MODEL` gives the retrospectives a stronger model without slowing
 naming, which you wait on, or `wts brief`, which runs often: a retrospective is
@@ -60,6 +68,14 @@ a machine on the Claude API and one on Amazon Bedrock.
 | `WTS_DOC_TOOLS`     | (enumerated)              | pinned allow patterns for the fetch, space-separated |
 | `WTS_DOC_TOOLS_TTL` | `86400`                   | seconds the `claude mcp list` enumeration is cached |
 | `WTS_DOC_MAX_BYTES` | `200000`                  | cap on a document, and on all of them together |
+| `WTS_DOC_BUDGET_USD`| `1`                       | most one fetch may spend, in USD at list price (`claude --max-budget-usd`) |
+| `WTS_DOC_MAX_TURNS` | `8`                       | most turns one fetch may take (`claude --max-turns`) |
+
+The timeout bounds a fetch's time; the budget and the turn limit bound what it
+spends, since it runs with your connectors and a stronger model. A fetch that
+reaches either fails like one no tool could read, and says which limit
+(`Reached max turns (8) (WTS_DOC_MAX_TURNS)`): the document stays a pointer,
+or keeps its cached body.
 
 ### Tasks and Things
 

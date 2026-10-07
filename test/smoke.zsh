@@ -311,25 +311,71 @@ check "a tmuxinator that fails in silence is reported by its status" eval '
 # claude reads stdin first: the real one does, and a stub that exits on a full
 # pipe would fail the pipeline rather than the call.
 
+# stub_claude <dir> <sh-body> — a stand-in claude in <dir> whose answer is
+# what <sh-body> prints, run with claude's arguments and its stdin. With
+# `--output-format json` (what wts-name, wts-brief and wts-retro pass) it
+# answers as the real one does: one JSON result, the text turned into
+# .structured_output — its "label: value" lines as fields, or else its first
+# line as {name} — with a usage and a cost (0.0004 on claude-haiku-5-5, a
+# model usage_cost_sql has no price for). Without the flag the text comes back
+# as is, which no caller can read any more. A body that prints a JSON object
+# answers that object, for the error shapes.
+stub_claude() {
+  local dir="$1" body="$2"
+  mkdir -p "$dir"
+  print -r -- "$body" > "$dir/answer"
+  cat > "$dir/claude" <<'STUB'
+#!/bin/sh
+input=$(cat)
+out=$(printf '%s\n' "$input" | sh "$(dirname "$0")/answer" "$@"); rc=$?
+case " $* " in
+  *" --output-format json "*) ;;
+  *) [ -n "$out" ] && printf '%s\n' "$out"; exit $rc ;;
+esac
+[ -n "$out" ] || exit $rc
+case "$out" in
+  "{"*) printf '%s\n' "$out"; exit $rc ;;
+esac
+jq -cn --arg t "$out" '
+  ($t | split("\n") | map(capture("^(?<key>[a-z]+): (?<value>.*)$")?) | from_entries) as $o
+  | {type: "result", subtype: "success", is_error: false, result: $t,
+     structured_output: (if ($o | length) > 0 then $o else {name: ($t | split("\n")[0])} end),
+     total_cost_usd: 0.0004,
+     usage: {input_tokens: 10, output_tokens: 20, cache_creation_input_tokens: 100,
+             cache_read_input_tokens: 0, cache_creation: {ephemeral_1h_input_tokens: 100},
+             speed: "standard"},
+     modelUsage: {"claude-haiku-5-5": {costUSD: 0.0004}}}'
+exit $rc
+STUB
+  chmod +x "$dir/claude"
+}
+
 NAME="$ROOT/libexec/wts/wts-name"
 STUBS="$SANDBOX/name-stubs"
-mkdir -p "$STUBS"
 name_with() { # <sh-body> [env=value...] — wts-name against that stand-in claude
-  local body="$1"; shift
-  print -r -- "#!/bin/sh
-cat >/dev/null
-$body" > "$STUBS/claude"
-  chmod +x "$STUBS/claude"
+  stub_claude "$STUBS" "$1"; shift
   env PATH="$STUBS:$PATH" WTS_NO_LLM= "$@" "$NAME" "export users as csv" 2>&1
 }
 
 check "an answer that is a name becomes the slug" eval '
   [[ "$(name_with "echo fix-csv-export")" == "fix-csv-export" ]]'
-check "a rejected model never becomes a branch name" eval '
+check "the name is asked as JSON, against a schema" eval '
+  name_with "printf \"%s\n\" \"\$*\" > \"$STUBS/args\"; echo fix-csv-export" >/dev/null
+  args=$(<"$STUBS/args")
+  [[ "$args" == *"--output-format json"* && "$args" == *"--json-schema"*"\"name\""* ]]'
+check "a sentence in the name field never becomes a branch name" eval '
   out=$(name_with "echo \"There is an issue with the selected model, sorry\"
         echo \"[claude-code:unrecognized_model] {}\" >&2")
   [[ "$out" == *"claude: [claude-code:unrecognized_model]"* \
      && "$out" == *export-users-csv* && "$out" != *selected* ]]'
+# What the real one answers for a model it does not know: exit 1, is_error, the
+# reason in .result, nothing on stderr when --verbose is off.
+check "an error result names the reason claude gave" eval '
+  out=$(name_with "echo '"'"'{\"type\":\"result\",\"is_error\":true,\"result\":\"There is an issue with the selected model (x).\",\"structured_output\":null}'"'"'; exit 1")
+  [[ "$out" == *"claude: There is an issue with the selected model (x)."* && "$out" == *export-users-csv ]]'
+check "and so does a budget reached" eval '
+  out=$(name_with "echo '"'"'{\"type\":\"result\",\"is_error\":true,\"subtype\":\"error_max_budget_usd\",\"errors\":[\"Reached maximum budget\"]}'"'"'; exit 1")
+  [[ "$out" == *"claude: Reached maximum budget"* ]]'
 check "a failing claude reports what it wrote" eval '
   [[ "$(name_with "echo boom >&2; exit 1")" == *"claude: boom"* ]]'
 check "a silent failure reports its status" eval '
@@ -341,6 +387,18 @@ check "without claude the warning says so" eval '
      == *"claude not found in PATH"* ]]'
 check "WTS_NO_LLM stays silent" eval '
   [[ "$("$NAME" "export users as csv" 2>&1)" == "export-users-csv" ]]'
+
+# The call's cost, attached to the session the name creates: wts-name runs
+# before the row exists, so wts records it right after registry_put.
+stub_claude "$STUBS" "echo price-the-name"
+env PATH="$STUBS:$PATH" WTS_NO_LLM= WTS_NO_ATTACH=1 "$WTS" "count what naming costs" smoke >/dev/null 2>&1
+check "naming records its cost under the session it named" eval '
+  [[ "$(q "SELECT model || '\''|'\'' || cost_usd || '\''|'\'' || messages || '\''|'\'' || output
+           FROM usage WHERE session = '\''price-the-name'\'' AND transcript = '\''wts:name'\''")" \
+     == "claude-haiku-5-5|0.0004|1|20" ]]'
+check "and status --json counts it, at the price claude reported" eval '
+  "$WTS" status --json price-the-name | jq -e ".[0].usage | .cost_usd == 0.0004 and .cost_complete"'
+"$WTS" rm price-the-name -f >/dev/null 2>&1
 
 # Ctrl-C while the model names the session: the name comes from the phrase and
 # the creation goes on. It used to abort everything. A real Ctrl-C, typed into a
@@ -779,6 +837,27 @@ check "the same source is reused, not twinned" \
 check "a URL with no model becomes a pointer" \
   "$WTS" doc add https://example.invalid/page --name ptr
 check "the pointer says so" jq -e '.docs.ptr.kind == "pointer"' "$XDG_CONFIG_HOME/wts/docs.json"
+
+# A fetch bounded by turns and spend: both limits are passed, and reaching one
+# (claude prints it on stdout and exits 1) is a failed fetch that names it.
+DSTUBS="$SANDBOX/doc-stubs"
+doc_with() { # <sh-body> <slug> — wts doc add of a URL against that stand-in
+  stub_claude "$DSTUBS" "$1"
+  env PATH="$DSTUBS:$PATH" WTS_NO_LLM= WTS_DOC_TOOLS=WebFetch \
+    "$WTS" doc add "https://example.invalid/$2" --name "$2" 2>&1
+}
+check "the fetch passes its budget and its turn limit" eval '
+  doc_with "printf \"%s\n\" \"\$*\" > \"$DSTUBS/args\"; echo WTS-FETCH-FAILED: offline" lim0 >/dev/null
+  args=$(<"$DSTUBS/args")
+  [[ "$args" == *"--max-budget-usd 1 "* && "$args" == *"--max-turns 8 "* ]]'
+check "a turn limit reached is a failed fetch that says so" eval '
+  out=$(doc_with "printf \"Error: Reached max turns (8)\"; exit 1" lim1)
+  [[ "$out" == *"Reached max turns (8) (WTS_DOC_MAX_TURNS)"* \
+     && "$(q "SELECT error FROM doc_cache WHERE slug = '"'"'lim1'"'"'")" == *WTS_DOC_MAX_TURNS* ]]'
+check "and so is a budget reached" eval '
+  out=$(doc_with "printf \"Error: Exceeded USD budget (1)\"; exit 1" lim2)
+  [[ "$out" == *"Exceeded USD budget (1) (WTS_DOC_BUDGET_USD)"* ]]'
+for d in lim0 lim1 lim2; do "$WTS" doc forget "$d" >/dev/null 2>&1; done
 
 WTS_NO_ATTACH=1 "$WTS" docsess smoke --doc spec >/dev/null
 check "--doc writes the context file" test -s "$WT/docsess/.wts/context.md"
@@ -1443,28 +1522,35 @@ env WTS_NO_ARCHIVE=1 "$WTS" rm noarch -f >/dev/null
 check "WTS_NO_ARCHIVE keeps the capture out" eval '
   [[ "$(q "select count(*) from archive where session = '\''noarch'\''")" == 0 ]]'
 
-# The retrospective. Same stand-in shape as the naming stubs: it reads stdin
-# first, because the real claude does and a stub that exits on a full pipe would
-# fail the pipeline rather than the call.
+# The retrospective, against the same stand-in as naming (stub_claude): the
+# "label: value" lines its body prints are the fields of the JSON answer.
 RSTUBS="$SANDBOX/retro-stubs"
-mkdir -p "$RSTUBS"
 retro_with() { # <sh-body> [env=value...] — wts retro against that stand-in
-  local body="$1"; shift
-  print -r -- "#!/bin/sh
-cat >/dev/null
-$body" > "$RSTUBS/claude"
-  chmod +x "$RSTUBS/claude"
+  stub_claude "$RSTUBS" "$1"; shift
   env PATH="$RSTUBS:$PATH" WTS_NO_LLM= "$@" "$WTS" retro --force archsess 2>&1
 }
+archsess_usage() { # the wts:retro row of archsess's archived incarnation
+  q "SELECT u.messages || '|' || u.cost_usd FROM usage u JOIN archive a
+       ON a.session = u.session AND a.created_at = u.created_at
+     WHERE a.session = 'archsess' AND u.transcript = 'wts:retro'"
+}
 
-check "a four-line answer is stored field by field" eval '
+check "a four-field answer is stored field by field" eval '
   retro_with "printf \"delivered: the bucket shipped\nresisted: a flaky spec\nresolved: pinned the clock\nabandoned: -\n\"" >/dev/null
   [[ "$(q "select retro_delivered from archive where session = '\''archsess'\''")" == "the bucket shipped" \
   && "$(q "select retro_resisted from archive where session = '\''archsess'\''")" == "a flaky spec" \
   && "$(q "select retro_resolved from archive where session = '\''archsess'\''")" == "pinned the clock" ]]'
-check "bold labels are tolerated" eval '
-  retro_with "printf \"**delivered:** shipped it\n\"" >/dev/null
-  [[ "$(q "select retro_delivered from archive where session = '\''archsess'\''")" == "shipped it" ]]'
+check "the retro is asked as JSON, against its four fields" eval '
+  retro_with "printf \"%s\n\" \"\$*\" > \"$RSTUBS/args\"; printf \"delivered: x\n\"" >/dev/null
+  args=$(<"$RSTUBS/args")
+  [[ "$args" == *"--output-format json"* && "$args" == *"--json-schema"*"\"abandoned\""* ]]'
+check "its cost goes to the archived incarnation" eval '
+  [[ "$(archsess_usage)" == 2\|0.0008 ]]'
+# The prose of a model that ignored the schema, which the regex used to fish
+# for: no structured_output, so nothing is stored but the reason.
+check "an answer without its fields is an error, not a retro" eval '
+  retro_with "echo '"'"'{\"type\":\"result\",\"is_error\":true,\"result\":\"There is an issue with the selected model (x).\"}'"'"'; exit 1" >/dev/null
+  [[ "$(q "select retro_error from archive where session = '\''archsess'\''")" == *"selected model (x)"* ]]'
 # A transcript is deleted within 30 days, so a partial answer is worth more than
 # an error whose evidence is gone: the opposite rule from wts-brief.
 check "a partial answer is kept, not rejected" eval '
@@ -1511,10 +1597,8 @@ for i in {1..1500}; do
 done > "$long_tr"
 old_tr=$(q "select transcript from archive where session = 'archsess'")
 q "UPDATE archive SET transcript = '$long_tr' WHERE session = 'archsess'"
-print -r -- "#!/bin/sh
-wc -c > '$RSTUBS/facts-bytes'
-printf 'delivered: long\n'" > "$RSTUBS/claude"
-chmod +x "$RSTUBS/claude"
+stub_claude "$RSTUBS" "wc -c > '$RSTUBS/facts-bytes'
+printf 'delivered: long\n'"
 env PATH="$RSTUBS:$PATH" WTS_NO_LLM= "$WTS" retro --force archsess >/dev/null 2>&1
 check "a transcript of several MB gives at most 20 KB of facts" eval '
   (( $(wc -c < "$long_tr") > 5000000 && $(tr -d " " < "$RSTUBS/facts-bytes") <= 20000 )) \
@@ -2297,8 +2381,8 @@ check "the base it was compared against is recorded" eval '
   [[ "$(q "select base from archive where session = '"'"'gcarch'"'"'")" == main ]]'
 check "the worktree really is gone" eval '[[ ! -e "$WT/gcarch" ]]'
 
-check "the schema is at version 10" eval '
-  [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 10 ]]'
+check "the schema is at version 11" eval '
+  [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 11 ]]'
 
 # ─── PR, CI and review state ─────────────────────────────────────────────────
 # gh is a stand-in: it answers from fixtures keyed by what it was asked (a
@@ -3021,10 +3105,29 @@ check "wts task show says what the task cost" eval '
 check "and task show --json has it" eval '
   "$WTS" task show t-usage --json </dev/null | jq -e ".usage.sessions == 1 and .usage.tokens > 0"'
 check "the table is in the schema" eval '[[ "$("$WTS" db schema)" == *"CREATE TABLE usage"* ]]'
+# The brief's own call, through the stand-in that answers JSON: its two fields
+# are the summary, and its cost a row of its own that the transcript refresh
+# (usage_store, which deletes and rewrites a transcript's rows) leaves alone.
+BSTUBS="$SANDBOX/brief-stubs"
+stub_claude "$BSTUBS" "printf '%s\n' \"\$*\" > '$BSTUBS/args'; printf 'done: wired the stub\nnext: ship it\n'"
+q "DELETE FROM briefs WHERE session = 'agent-a'"
+check "wts brief reads its two fields from the JSON answer" eval '
+  out=$(env PATH="$BSTUBS:$PATH" WTS_NO_LLM= "$WTS" brief agent-a </dev/null 2>&1)
+  [[ "$out" == *"done: wired the stub"* && "$out" == *"next: ship it"* \
+     && "$(<"$BSTUBS/args")" == *"--json-schema"*"\"next\""* ]]'
+check "and records the call under wts:brief" eval '
+  [[ "$(q "SELECT messages || '\''|'\'' || cost_usd FROM usage WHERE session = '\''agent-a'\'' AND transcript = '\''wts:brief'\''")" == "1|0.0004" ]]'
+print -r -- '{"type":"assistant","message":{"id":"msg_D","model":"claude-opus-5-5","usage":{"input_tokens":1,"output_tokens":1},"content":[]}}' \
+  >> "$proj_a/0123abcd-ef01-2345-6789-abcdef0000bb.jsonl"
+"$WTS" brief agent-a </dev/null >/dev/null 2>&1
+check "which a transcript refresh does not drop" eval '
+  [[ "$(q "SELECT count(*) FROM usage WHERE session = '\''agent-a'\'' AND transcript = '\''wts:brief'\''")" == 1 \
+     && "$(q "SELECT sum(output) FROM usage WHERE session = '\''agent-a'\'' AND model = '\''claude-opus-5-5'\''")" == 302 ]]'
+q "DELETE FROM usage WHERE transcript = 'wts:brief'"
 "$WTS" rm agent-a -f >/dev/null
 check "the usage outlives the session, with its archive row" eval '
   "$WTS" log --no-things --since 2020-01-01 \
-    | jq -e "[.work[].sessions[] | select(.name == \"agent-a\" and .state == \"archived\")][0].usage.output == 1301"'
+    | jq -e "[.work[].sessions[] | select(.name == \"agent-a\" and .state == \"archived\")][0].usage.output == 1302"'
 env WTS_NO_ATTACH=1 "$WTS" noarch2 smoke >/dev/null
 q "INSERT INTO usage (session, created_at, transcript, model, output)
    SELECT name, created_at, 'y', 'claude-opus-5-5', 7 FROM sessions WHERE name = 'noarch2'"
@@ -3044,7 +3147,7 @@ check "a pr_state from schema 7 gets head on the next command" eval '
   "$WTS" ls >/dev/null
   [[ "$(q "SELECT count(*) FROM pragma_table_info('"'"'pr_state'"'"') WHERE name = '"'"'head'"'"'")" == 1
      && "$(q "SELECT state || head FROM pr_state WHERE session = '"'"'old-pr'"'"'")" == open
-     && "$(q "PRAGMA user_version")" == 10 ]]'
+     && "$(q "PRAGMA user_version")" == 11 ]]'
 # Schema 10 is a column on agent_panes: a table from schema 9 gets transcript,
 # and its rows stay.
 q "INSERT OR REPLACE INTO agent_panes (session, claude_session, pane, at) VALUES ('old-pane', '', '%1', 1);
@@ -3053,8 +3156,21 @@ check "an agent_panes from schema 9 gets transcript on the next command" eval '
   "$WTS" ls >/dev/null
   [[ "$(q "SELECT count(*) FROM pragma_table_info('"'"'agent_panes'"'"') WHERE name = '"'"'transcript'"'"'")" == 1
      && "$(q "SELECT pane || transcript FROM agent_panes WHERE session = '"'"'old-pane'"'"'")" == "%1"
-     && "$(q "PRAGMA user_version")" == 10 ]]'
+     && "$(q "PRAGMA user_version")" == 11 ]]'
 q "DELETE FROM agent_panes WHERE session = 'old-pane'"
+# Schema 11 is a column, usage.cost_usd: a usage table from schema 9 or 10
+# gets it, and keeps its rows. From 10 is the case the fast path of db_init
+# would skip if the version had not moved.
+for from in 9 10; do
+  q "INSERT INTO usage (session, created_at, transcript, model, output) VALUES ('old-u', 'c', 't', 'm', 3);
+     ALTER TABLE usage DROP COLUMN cost_usd; PRAGMA user_version = $from"
+  check "a usage table from schema $from gets cost_usd on the next command" eval '
+    "$WTS" ls >/dev/null
+    [[ "$(q "SELECT count(*) FROM pragma_table_info('"'"'usage'"'"') WHERE name = '"'"'cost_usd'"'"'")" == 1
+       && "$(q "SELECT output FROM usage WHERE session = '"'"'old-u'"'"'")" == 3
+       && "$(q "PRAGMA user_version")" == 11 ]]'
+  q "DELETE FROM usage WHERE session = 'old-u'"
+done
 # Schema 9 is one table, seen: the prompt hook may be the first to open a
 # database an older wts left at 8, and it must create the table, not fail.
 env WTS_NO_ATTACH=1 "$WTS" schema8 smoke >/dev/null
@@ -3062,7 +3178,7 @@ q "DROP TABLE seen; PRAGMA user_version = 8"
 check "the prompt hook on a schema-8 database exits 0 and prints nothing" eval '
   out=$(cd "$WT/schema8" && print -r -- "{\"session_id\":\"s\"}" | env -u TMUX_PANE "$HOOK" prompt); (( $? == 0 )) && [[ -z "$out" ]]'
 check "and the database has seen afterwards" eval '
-  [[ "$(q "SELECT count(*) FROM sqlite_master WHERE name = '"'"'seen'"'"'") $(q "PRAGMA user_version")" == "1 10" ]]'
+  [[ "$(q "SELECT count(*) FROM sqlite_master WHERE name = '"'"'seen'"'"'") $(q "PRAGMA user_version")" == "1 11" ]]'
 q "DROP TABLE seen; PRAGMA user_version = 8"
 check "a database at schema 8 gets seen on the next command" eval '
   "$WTS" ls >/dev/null; [[ "$(q "SELECT count(*) FROM sqlite_master WHERE name = '"'"'seen'"'"'")" == 1 ]]'

@@ -47,6 +47,35 @@
   happens; an existing worktree is never copied into again. See
   [Sessions](docs/sessions.md#untracked-files-worktreeinclude).
 
+- **Naming, `wts brief` and the retrospectives read a JSON answer, not
+  prose.** The three calls pass `--output-format json --json-schema` and read
+  `.structured_output`: `{name}`, `{done, next}`, and the retrospective's four
+  fields. The regexes they replace tolerated bold labels and still lost an
+  answer whose label the model reworded. The guards stay: a name is
+  kebab-cased, cut at 40 characters, and refused past six words (a sentence in
+  the field is still not a branch name); every failure still names its cause,
+  now also the reason in the result itself (an unknown model, a budget
+  reached). No `--bare`: it never reads OAuth, which a subscription account
+  needs.
+
+- **What wts's own calls cost is counted with the session.** Each call's
+  `usage` and `total_cost_usd` go to the `usage` table under the transcript
+  `wts:name`, `wts:brief` or `wts:retro`, through `usage_add_call`, so
+  `wts ls --wide`, `wts status --json` and `wts log` include them. The cost is
+  the one Claude Code reported, kept in a new column, `usage.cost_usd`
+  (schema 11, added to an existing database on the next command): the
+  price table has no entry for the model these calls now get. A transcript
+  refresh rewrites only that transcript's rows, so these stay. A wts older
+  than this one cannot write transcript usage into a schema-11 database (its
+  insert names no columns); upgrade both together.
+
+- **`wts doc` fetches are capped in spend and turns.** `--max-budget-usd`
+  (`WTS_DOC_BUDGET_USD`, 1) and `--max-turns` (`WTS_DOC_MAX_TURNS`, 8) bound a
+  call that runs with every connector and Sonnet, where the timeout only
+  bounded its time. Reaching either is a failed fetch that names the limit
+  (`WTS-FETCH-FAILED: Reached max turns (8) (WTS_DOC_MAX_TURNS)`), instead of
+  "answer too short".
+
 ## 1.10.1 — 2026-10-07
 
 - **The document picker waits for its whole list before reading keys**

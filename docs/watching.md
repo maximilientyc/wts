@@ -139,8 +139,8 @@ at a time, 2 from the cache`. Up to `WTS_BRIEF_JOBS` calls run at a time.
   `wts brief --cached [--json]` prints the last summaries, from the database,
   with no model call.
 - **Without the model.** Without `claude`, with `WTS_NO_LLM=1`, or when the
-  answer is malformed, the raw facts are shown, under the reason the summary is
-  missing.
+  answer lacks its `done` or `next` field, the raw facts are shown, under the
+  reason the summary is missing.
 - The model is never called by `wts ls` or the switcher.
 
 What it sends is in [What is sent to the
@@ -164,6 +164,10 @@ API, not what a subscription bills.
   fast mode at 2x.
 - A model the price table does not know counts its tokens but not their price,
   and the cost then reads `~$`.
+- wts's own calls count too, under the session they were about: naming it,
+  each `wts brief` summary, its retrospective. Their cost is the one
+  `claude -p` reported (`total_cost_usd`), so a model the table does not know
+  is priced all the same.
 
 ## Pull requests
 
@@ -265,6 +269,13 @@ The count is `message.usage` of every transcript of the worktree no older than
 the session: the one after each `/clear` and each subagent's included. Every
 message is counted once, although Claude Code repeats its usage on each of its
 records. An unchanged transcript is not read again.
+
+wts's own calls are not in any transcript (they run with
+`--no-session-persistence`): each one adds its `usage` and `total_cost_usd`,
+from the JSON result, to a row whose transcript is `wts:name`, `wts:brief` or
+`wts:retro` (`usage_add_call`), with `messages` counting the calls. Reading a
+transcript again rewrites only that transcript's rows, so these stay. The
+`cost_usd` column holds that price, and is empty on the transcript rows.
 
 The cost is computed when it is read from the table, in `usage_cost_sql`
 (`libexec/wts/wts-db.zsh`).

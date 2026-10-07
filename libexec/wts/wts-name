@@ -18,6 +18,10 @@
 #   --strict-mcp-config           no MCP server to start
 #   --no-session-persistence      no transcript, nothing for `claude --continue`
 #   --tools ""                    no tools: a text answer, nothing else
+#   --output-format json          one JSON result: the answer, its usage and
+#   --json-schema {name}          cost; the schema makes the answer a field
+#                                 (.structured_output.name) rather than prose
+#                                 whose first line had to be guessed at
 #   cwd = wts state directory     never a worktree, otherwise wts-status could
 #                                 attach the call to a session
 # The phrase goes through stdin: `--tools` is variadic and would swallow a
@@ -29,6 +33,13 @@
 # error returned by claude, answer that is not a name): every one of them used
 # to read the same, so a rejected model id on a colleague's machine was
 # indistinguishable from a slow answer.
+#
+# Not --bare, though it would skip more: its help says it never reads OAuth,
+# and a subscription account has nothing else.
+#
+# The call's JSON result is written to $WTS_NAME_USAGE when it is set: the
+# session does not exist yet, so `wts` records the cost (usage_add_call in
+# wts-db.zsh) once it has registered the session under the chosen name.
 #
 # Variables: WTS_MODEL (haiku), WTS_NAME_TIMEOUT (30 s),
 #            WTS_NO_LLM=1 (local fallback right away: offline, tests)
@@ -44,8 +55,10 @@ fi
 WTS_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wts"
 
 SYSTEM_PROMPT="You name git branches from a task description. \
-Answer with the name only: in English, kebab-case, 2 to 4 words, no prefix \
+The name is in English, kebab-case, 2 to 4 words, no prefix \
 (neither feature/ nor fix/), no punctuation, no explanation."
+SCHEMA='{"type":"object","properties":{"name":{"type":"string","description":"kebab-case, 2 to 4 words"}},"required":["name"],"additionalProperties":false}'
+
 
 # kebab <text> — accents stripped, lowercase, [a-z0-9] words joined by dashes,
 # no length limit. Not iconv: the macOS one drops letters around accents
@@ -109,6 +122,8 @@ slug="" reason=""
 if [[ -z "${WTS_NO_LLM:-}" ]]; then
   if ! command -v claude >/dev/null 2>&1; then
     reason="claude not found in PATH"
+  elif ! command -v jq >/dev/null 2>&1; then
+    reason="jq not found in PATH"
   else
     mkdir -p "$WTS_STATE_DIR" 2>/dev/null
     timeout="${WTS_NAME_TIMEOUT:-30}"
@@ -123,30 +138,44 @@ if [[ -z "${WTS_NO_LLM:-}" ]]; then
             perl -e 'alarm shift; exec @ARGV' "$timeout" \
               claude -p --model "${WTS_MODEL:-haiku}" --safe-mode --strict-mcp-config \
                 --no-session-persistence --settings '{"disableAllHooks":true,"alwaysThinkingEnabled":false}' \
-                --tools "" --system-prompt "$SYSTEM_PROMPT"
+                --tools "" --system-prompt "$SYSTEM_PROMPT" \
+                --output-format json --json-schema "$SCHEMA"
           ) 2>"${err:-/dev/null}")
     code=$?
+    # The cost is recorded whatever the answer: a rejected one was paid too.
+    if [[ -n "${WTS_NAME_USAGE:-}" ]] && print -r -- "$raw" | jq -e 'type == "object"' >/dev/null 2>&1; then
+      print -r -- "$raw" > "$WTS_NAME_USAGE" 2>/dev/null
+    fi
 
-    # A model claude does not recognize is NOT an error it exits on: it answers
-    # in prose ("There's an issue with the selected model…") with status 0, and
-    # that sentence kebab'd and cut to 40 characters looks like a perfectly good
-    # branch name. The prompt asks for 2 to 4 words, so a longer first line is
-    # not a name, whatever it says.
-    first=${raw%%$'\n'*}
+    # Even with a schema the name is a string the model chose, and a model that
+    # misread the task fills it with a sentence: kebab'd and cut to 40
+    # characters, that looks like a perfectly good branch name. The prompt asks
+    # for 2 to 4 words, so a longer answer is not a name, whatever it says.
+    first=$(print -r -- "$raw" | jq -r '.structured_output.name? // empty | strings' 2>/dev/null)
+    first=${first%%$'\n'*}
     words=(${=first})
     slug=$(cap40 "$(kebab "$first")")
     (( ${#slug} >= 3 && ${#words} <= 6 )) || slug=""
 
     if [[ -z "$slug" ]]; then
-      msg=""
+      msg="" said=""
       [[ -n "$err" && -s "$err" ]] && msg=$(oneline "$(<"$err")")
+      # A model claude does not recognize exits 1 with is_error and its reason
+      # in .result ("There's an issue with the selected model…"); a budget or
+      # turn limit puts it in .errors.
+      said=$(print -r -- "$raw" | jq -r 'select(type == "object")
+               | (.errors? // [] | map(strings) | first) // (.result | strings) // empty' 2>/dev/null)
       if (( code == 142 )); then          # perl's alarm: 128 + SIGALRM
         reason="no answer in ${timeout}s"
       elif [[ -n "$msg" ]]; then
         # Where claude wrote its own diagnosis, status 0 included.
         reason="claude: $msg"
+      elif [[ -n "$said" && -z "$first" ]]; then
+        reason="claude: $(oneline "$said")"
       elif (( code != 0 )); then
         reason="claude exited with status $code"
+      elif [[ -n "$first" ]]; then
+        reason="unusable answer: $(oneline "$first")"
       else
         reason="unusable answer: $(oneline "$raw")"
       fi

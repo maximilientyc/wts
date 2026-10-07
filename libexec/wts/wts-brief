@@ -46,11 +46,14 @@ JOBS="${WTS_BRIEF_JOBS:-4}"
 zmodload -F zsh/stat b:zstat 2>/dev/null
 
 SYSTEM_PROMPT="You summarize the progress of a development session for its \
-author, who is coming back to it after a break. Answer in English, exactly two \
-lines and nothing else:
-done: <what has been accomplished, concrete, 100 characters at most>
-next: <what remains to be done, or the decision the author must make, 100 characters at most>
-If nothing indicates what remains, write \"next: nothing identified\"."
+author, who is coming back to it after a break. Answer in English with two \
+fields: done, what has been accomplished, concrete, 100 characters at most; \
+next, what remains to be done, or the decision the author must make, 100 \
+characters at most. If nothing indicates what remains, next is \"nothing identified\"."
+# The answer as two fields (.structured_output) rather than two lines of prose
+# found by regex, which tolerated bold labels and still missed a reworded one.
+SCHEMA='{"type":"object","properties":{"done":{"type":"string","description":"what has been accomplished, 100 characters at most"},"next":{"type":"string","description":"what remains, or the decision to make, 100 characters at most"}},"required":["done","next"],"additionalProperties":false}'
+
 
 command -v jq >/dev/null 2>&1 || { print -u2 "wts-brief: jq is required"; exit 1 }
 [[ -x "$WTS_BIN/wts-status" ]] || { print -u2 "wts-brief: $WTS_BIN/wts-status not found"; exit 1 }
@@ -62,8 +65,9 @@ fi
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
-# Headless call: same options, for the same reasons, as wts-name.
-# Thinking off: see ask_claude in wts-retro (45 s of it for four lines).
+# Headless call: same options, for the same reasons, as wts-name, JSON result
+# and schema included. Thinking off: see ask_claude in wts-retro (45 s of it
+# for four lines).
 # ask_claude <errfile> — stderr goes to that file rather than /dev/null: a
 # rejected model id and a timeout used to leave the same silence, impossible to
 # diagnose on someone else's machine.
@@ -73,20 +77,26 @@ ask_claude() {
     perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" \
       claude -p --model "$MODEL" --safe-mode --strict-mcp-config \
         --no-session-persistence --settings '{"disableAllHooks":true,"alwaysThinkingEnabled":false}' \
-        --tools "" --system-prompt "$SYSTEM_PROMPT"
+        --tools "" --system-prompt "$SYSTEM_PROMPT" \
+        --output-format json --json-schema "$SCHEMA"
   ) 2>"$1"
 }
 
-# why <idx> <exit-code> — why that session has no summary, on one line.
+# why <idx> <exit-code> <answer> — why that session has no summary, on one line.
 why() {
-  local idx="$1" code="$2" msg="" l
+  local idx="$1" code="$2" out="${3:-}" msg="" said="" l
   [[ -s "$tmpdir/$idx.err" ]] && msg=$(oneline "$(<"$tmpdir/$idx.err")")
+  # An unrecognized model, a budget: is_error, and the reason in .errors or
+  # .result of the JSON result.
+  said=$(print -r -- "$out" | jq -r 'select(type == "object" and .is_error == true)
+           | (.errors? // [] | map(strings) | first) // (.result | strings) // empty' 2>/dev/null)
   if (( code == 142 )); then              # perl's alarm: 128 + SIGALRM
     l="no answer in ${TIMEOUT}s"
   elif [[ -n "$msg" ]]; then
-    # Where claude wrote its own diagnosis. Status 0 included: an unrecognized
-    # model is answered in prose, not with a failure.
+    # Where claude wrote its own diagnosis, status 0 included.
     l="claude: $msg"
+  elif [[ -n "$said" ]]; then
+    l="claude: $(oneline "$said")"
   elif (( code != 0 )); then
     l="claude exited with status $code"
   else
@@ -94,6 +104,13 @@ why() {
   fi
   (( ${#l} > 100 )) && l="${l[1,99]}…"
   print -r -- "$l"
+}
+
+# field <key> <answer> — one field of the structured answer, on one line.
+field() {
+  local v
+  v=$(print -r -- "$2" | jq -r --arg k "$1" '.structured_output[$k]? // empty | strings' 2>/dev/null)
+  oneline "$v"
 }
 
 # oneline <text> — on one line, whitespace squeezed.
@@ -229,16 +246,16 @@ summarize() {
   local idx="$1" out code done_line next_line name
   out=$(ask_claude "$tmpdir/$idx.err" < "$tmpdir/$idx.facts")
   code=$?
-  done_line=$(print -r -- "$out" | grep -m1 -iE '^[[:space:]*_]*done[[:space:]*_]*:' \
-              | sed -E 's/^[^:]*:[[:space:]*_]*//; s/[*_[:space:]]+$//')
-  next_line=$(print -r -- "$out" | grep -m1 -iE '^[[:space:]*_]*next[[:space:]*_]*:' \
-              | sed -E 's/^[^:]*:[[:space:]*_]*//; s/[*_[:space:]]+$//')
+  name=${"$(<"$tmpdir/$idx.head")"%%$'\x1f'*}
+  # Paid whether or not the answer is usable.
+  print -r -- "$out" | usage_add_call "$name" "" brief
+  done_line=$(field done "$out")
+  next_line=$(field next "$out")
   if [[ -z "$done_line" || -z "$next_line" ]]; then
-    why "$idx" "$code" > "$tmpdir/$idx.why"
+    why "$idx" "$code" "$out" > "$tmpdir/$idx.why"
     return 1
   fi
 
-  name=${"$(<"$tmpdir/$idx.head")"%%$'\x1f'*}
   printf 'done: %s\nnext: %s\n' "$done_line" "$next_line" > "$tmpdir/$idx.brief"
   # Parallel jobs write here at once: the database serializes them.
   db_q "INSERT OR REPLACE INTO briefs VALUES ($(sql_str "$name"),

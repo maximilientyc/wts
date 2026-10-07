@@ -55,14 +55,18 @@ for its author, who will reuse it in six months to write a performance \
 self-assessment. You are given the facts of the session: the task as it was \
 asked, the commits, the diffstat, the files touched, whether it shipped, and \
 the exchange between the author and the coding agent. Answer in English, \
-exactly four lines and nothing else:
-delivered: <what shipped, concretely, in domain terms, 160 characters at most>
-resisted: <what was hard or went wrong: a wrong assumption, a constraint found late, a flaky test. Write 'nothing notable' if the session was plain. 140 at most>
-resolved: <how it was overcome: the decision or technique that unblocked it. Write '-' if nothing resisted. 140 at most>
-abandoned: <what was dropped, deferred or decided against. Write '-' unless something was explicitly dropped. 100 at most>
+with four fields:
+delivered: what shipped, concretely, in domain terms, 160 characters at most.
+resisted: what was hard or went wrong: a wrong assumption, a constraint found late, a flaky test. 'nothing notable' if the session was plain. 140 at most.
+resolved: how it was overcome: the decision or technique that unblocked it. '-' if nothing resisted. 140 at most.
+abandoned: what was dropped, deferred or decided against. '-' unless something was explicitly dropped. 100 at most.
 Write facts, not praise, and never invent: if the facts do not say, write \
 'unknown'. The author's own corrections to the agent are the best evidence of \
 what resisted."
+# The four fields as JSON (.structured_output) rather than four lines of prose
+# found by regex. Only delivered is required, for the reason given in retro_one.
+SCHEMA='{"type":"object","properties":{"delivered":{"type":"string","description":"what shipped, 160 characters at most"},"resisted":{"type":"string","description":"what was hard or went wrong, 140 characters at most"},"resolved":{"type":"string","description":"how it was overcome, 140 characters at most"},"abandoned":{"type":"string","description":"what was dropped or deferred, 100 characters at most"}},"required":["delivered","resisted","resolved","abandoned"],"additionalProperties":false}'
+
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -87,7 +91,8 @@ num() {
 # 45 to 63 s, past the 60 s timeout, from 4 KB of facts. The input was never
 # the problem (FACTS_MAX bounds it, and the transcript is reduced to the
 # author's messages and the last agent text); the same facts without thinking
-# answer in 3 s, with the same four lines. wts-brief and wts-name do the same.
+# answer in 3 s, with the same four lines. wts-brief and wts-name do the same,
+# JSON result and schema included.
 # ask_claude <errfile>
 ask_claude() {
   (
@@ -95,21 +100,25 @@ ask_claude() {
     perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" \
       claude -p --model "$MODEL" --safe-mode --strict-mcp-config \
         --no-session-persistence --settings '{"disableAllHooks":true,"alwaysThinkingEnabled":false}' \
-        --tools "" --system-prompt "$SYSTEM_PROMPT"
+        --tools "" --system-prompt "$SYSTEM_PROMPT" \
+        --output-format json --json-schema "$SCHEMA"
   ) 2>"$1"
 }
 
-# why <errfile> <exit-code> — why that session has no retro, on one line.
-# Same diagnosis table as wts-brief's why().
+# why <errfile> <exit-code> <answer> — why that session has no retro, on one
+# line. Same diagnosis table as wts-brief's why().
 why() {
-  local errfile="$1" code="$2" msg="" l
+  local errfile="$1" code="$2" out="${3:-}" msg="" said="" l
   [[ -s "$errfile" ]] && msg=$(oneline "$(<"$errfile")")
+  said=$(print -r -- "$out" | jq -r 'select(type == "object" and .is_error == true)
+           | (.errors? // [] | map(strings) | first) // (.result | strings) // empty' 2>/dev/null)
   if (( code == 142 )); then              # perl's alarm: 128 + SIGALRM
     l="no answer in ${TIMEOUT}s (WTS_RETRO_TIMEOUT)"
   elif [[ -n "$msg" ]]; then
-    # Where claude wrote its own diagnosis. Status 0 included: an unrecognized
-    # model is answered in prose, not with a failure.
+    # Where claude wrote its own diagnosis, status 0 included.
     l="claude: $msg"
+  elif [[ -n "$said" ]]; then
+    l="claude: $(oneline "$said")"
   elif (( code != 0 )); then
     l="claude exited with status $code"
   else
@@ -129,13 +138,13 @@ read_transcript() {
   fi
 }
 
-# field <label> <answer> <max> — one retro line, unwrapped and capped. Same
-# tolerant shape as wts-brief: models like to bold their own labels.
+# field <key> <answer> <max> — one field of the structured answer, on one line
+# and capped: the schema asks for a length, it cannot enforce one.
 field() {
-  local label="$1" out="$2" l
+  local key="$1" out="$2" l
   integer max="$3"
-  l=$(print -r -- "$out" | grep -m1 -iE "^[[:space:]*_]*${label}[[:space:]*_]*:" \
-      | sed -E 's/^[^:]*:[[:space:]*_]*//; s/[*_[:space:]]+$//')
+  l=$(print -r -- "$out" | jq -r --arg k "$key" '.structured_output[$k]? // empty | strings' 2>/dev/null)
+  l=$(oneline "$l")
   (( ${#l} > max )) && l="${l[1,max-1]}…"
   print -r -- "$l"
 }
@@ -336,6 +345,14 @@ retro_one() {
   err="$tmpdir/$idx.err"
   out=$(ask_claude "$err" < "$tmpdir/$idx.facts")
   code=$?
+  # Under the archived incarnation, paid whether or not the answer is usable.
+  local who
+  local -a w
+  who=$(db_rows "SELECT session, created_at FROM archive WHERE id = $(sql_str "${ids[$idx]}")" 2>/dev/null)
+  w=("${(@ps:\x1f:)${who%$'\x1e'}}")
+  if [[ -n "${w[1]:-}" && -n "${w[2]:-}" ]]; then
+    print -r -- "$out" | usage_add_call "${w[1]}" "${w[2]}" retro
+  fi
   delivered=$(field delivered "$out" 160)
   resisted=$(field resisted "$out" 140)
   resolved=$(field resolved "$out" 140)
@@ -346,7 +363,7 @@ retro_one() {
   # facts that are still there, while the transcript behind this one is deleted
   # within 30 days. A three-line answer beats an error whose source is gone.
   if [[ -z "$delivered" ]]; then
-    db_q "UPDATE archive SET retro_error = $(sql_str "$(why "$err" "$code")"),
+    db_q "UPDATE archive SET retro_error = $(sql_str "$(why "$err" "$code" "$out")"),
             retro_model = $(sql_str "$MODEL"), retro_at = unixepoch()
           WHERE id = $(sql_str "${ids[$idx]}")" >/dev/null 2>&1
     return 1
@@ -369,14 +386,16 @@ retro_one() {
 # Archive rows from before the usage table existed: their kept transcript, while
 # it is there, still holds every usage record. One pass each, then never again
 # (usage_store remembers the file). The main transcript only: that is all the
-# archive kept.
+# archive kept. A row of wts's own calls (wts:retro, wts:name) says nothing
+# about the transcript, so it does not count as summed.
 usage_backfill() {
   local out row
   local -a f
   out=$(db_rows "SELECT session, created_at, transcript FROM archive a
                  WHERE transcript != '' AND NOT EXISTS (
                    SELECT 1 FROM usage u
-                   WHERE u.session = a.session AND u.created_at = a.created_at)" 2>/dev/null)
+                   WHERE u.session = a.session AND u.created_at = a.created_at
+                     AND u.transcript NOT LIKE 'wts:%')" 2>/dev/null)
   for row in "${(@ps:\x1e:)out}"; do
     f=("${(@ps:\x1f:)row}")
     [[ -n "${f[3]:-}" && -f "${f[3]}" ]] || continue
@@ -423,8 +442,11 @@ cmd_write() {
     print -u2 -r -- "  The facts are archived: run wts retro again when one is."
     return 0
   fi
-  command -v jq >/dev/null 2>&1 \
-    || print -u2 -r -- "⚠ jq not found: the retro will miss the conversation"
+  # The answer is JSON: without jq it could not be read, so do not pay for it.
+  if ! command -v jq >/dev/null 2>&1; then
+    print -u2 -r -- "⚠ ${#ids} retrospective(s) pending, jq not found to read the answer"
+    return 0
+  fi
 
   tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/wts-retro.XXXXXX") || return 1
   trap 'rm -rf "$tmpdir"' EXIT
