@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.10.1 — 2026-10-07
 
 - **The document picker waits for its whole list before reading keys**
   (`ctrl-e` in the switcher, `wts doc use` without a slug). A slug typed and
