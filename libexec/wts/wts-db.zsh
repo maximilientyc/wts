@@ -548,17 +548,18 @@ CREATE TABLE IF NOT EXISTS seen (
 -- conversations is cost_reported_usd. A reading, not a ledger: the usage
 -- table and the price table stay what the cost is computed from. NULL when
 -- the payload did not say (no context before the first answer, no rate
--- limits for an API key). Rows older than their session are a former session
+-- limits for an API key). NUMERIC, not REAL: a 41 stays 41 in the JSON,
+-- not 41.0. Rows older than their session are a former session
 -- of the same name and are ignored by the readers; dropped with the session.
 -- Schema 11 is usage.cost_usd; no column is added here, a table is.
 CREATE TABLE IF NOT EXISTS agent_gauges (
   session        TEXT NOT NULL,
   claude_session TEXT NOT NULL DEFAULT '',
   model          TEXT NOT NULL DEFAULT '',
-  cost_usd       REAL,
-  context_pct    REAL,
-  rate_5h        REAL,
-  rate_7d        REAL,
+  cost_usd       NUMERIC,
+  context_pct    NUMERIC,
+  rate_5h        NUMERIC,
+  rate_7d        NUMERIC,
   at             INTEGER NOT NULL,
   PRIMARY KEY (session, claude_session)
 );

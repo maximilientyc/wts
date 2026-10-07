@@ -3199,7 +3199,7 @@ check "statusline prints the session, the model and the context" eval '
   && [[ "$out" == "wts gauge-a · Opus 5.5 · ctx 84%" ]]'
 check "and writes one row into agent_gauges" eval '
   [[ "$(q "SELECT claude_session, model, cost_usd, context_pct, rate_5h, rate_7d FROM agent_gauges WHERE session = '"'"'gauge-a'"'"'")" \
-     == "sl-0001|claude-opus-5-5|1.25|83.6|12.0|40.5" ]]'
+     == "sl-0001|claude-opus-5-5|1.25|83.6|12|40.5" ]]'
 check "a refresh overwrites it, one row per conversation" eval '
   (cd "$WT/gauge-a" && print -r -- "$SL_PAYLOAD" | "$HOOK" statusline >/dev/null)
   [[ "$(q "SELECT count(*) FROM agent_gauges WHERE session = '"'"'gauge-a'"'"'")" == 1 ]]'

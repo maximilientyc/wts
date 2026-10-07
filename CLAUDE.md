@@ -75,6 +75,7 @@ docs/demo/                record.zsh + demo.tape (README GIF, make demo)
                           + claude-hooks.zsh/.tape (start hook, transcript_path, subagent, --name)
                           + worktreeinclude.zsh/.tape (.worktreeinclude copied into a new worktree)
                           + structured-cost.zsh/.tape (brief's JSON answer, its cost under wts:brief)
+                          + statusline-gauges.zsh/.tape (setup claude --statusline, the line, the gauges)
 ```
 
 Homebrew, `make install` and a git checkout share this tree, so `bin/wts` works

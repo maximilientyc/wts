@@ -126,6 +126,8 @@ cycles through them.
 wts setup claude --statusline
 ```
 
+![wts setup claude --statusline, the line it prints, and the gauges in wts status, wts ls --wide and the switcher](statusline-gauges.gif)
+
 An opt-in, apart from `wts setup claude --install`: it makes `wts-hook
 statusline` the `statusLine` of Claude Code's `settings.json`. In a wts session
 the line under the prompt reads
