@@ -200,8 +200,7 @@ printf '%s' "\$*" > "$SANDBOX/claude-arg"
 exec sleep 3600
 EOF
 chmod +x "$SANDBOX/claude-logger"
-sed -e "s#{claude #{$SANDBOX/claude-logger #; s#\"claude #\"$SANDBOX/claude-logger #" \
-    -e "s#? 'claude' :#? '$SANDBOX/claude-logger' :#" \
+sed -e "s#? 'claude' : \"claude #? '$SANDBOX/claude-logger' : \"$SANDBOX/claude-logger #" \
     -e 's#^name: #tmux_options: -f /dev/null\nname: #' \
     "$ROOT/share/wts/layouts/default.yml" > "$XDG_CONFIG_HOME/wts/layouts/longp.yml"
 long=$(perl -e 'print join(" ", map { "step $_: keep the \$HOME, the `ticks` and \"quotes\" (it'"'"'s fine);" } 1..30)')
@@ -215,14 +214,15 @@ claude_got() { # <text> — the stand-in was started with exactly that argument
 }
 check "the long phrase is over the tty's 1024-byte line" eval '(( ${#long} > 1024 ))'
 EDITOR=true WTS_NO_ATTACH=1 "$WTS" longp "$long" longp >/dev/null
-check "a long phrase reaches claude whole" claude_got "$long"
+# The session's name comes first, as the conversation's (--name).
+check "a long phrase reaches claude whole, after the session's name" claude_got "--name longp $long"
 "$WTS" rm longp -f >/dev/null
 rm -f "$SANDBOX/claude-arg"
 # The line each layout types, replayed in a shell: a path with a space and a
 # quote, and the context document's lead sentence before the phrase.
 mkdir -p "$SANDBOX/pf dir"
 print -r -- "it's a \$HOME test; ok" > "$SANDBOX/pf dir/it's"
-typed_arg() { # <layout> [env=value...] — what the claude pane receives as its argument
+typed_arg() { # <layout> [env=value...] — what the claude pane receives as its arguments
   local layout="$1" out line
   shift
   out=$(env WTS_NAME=render WTS_ROOT="$SANDBOX" WTS_WORKDIR="$SANDBOX" WTS_RESTORE= WTS_DOC= \
@@ -236,10 +236,10 @@ typed_arg() { # <layout> [env=value...] — what the claude pane receives as its
 }
 check "the default layout reads the phrase file, after the document's lead" eval '
   [[ "$(typed_arg "$ROOT/share/wts/layouts/default.yml" WTS_DOC=.wts/context.md)" \
-     == "Read @.wts/context.md first, it is the context for this task. it'"'"'s a \$HOME test; ok" ]]'
+     == "--name render Read @.wts/context.md first, it is the context for this task. it'"'"'s a \$HOME test; ok" ]]'
 for ex in feature sentry; do
   check "examples/$ex reads the phrase file" eval '
-    [[ "$(typed_arg "$ROOT/examples/layouts/$ex.yml")" == "it'"'"'s a \$HOME test; ok" ]]'
+    [[ "$(typed_arg "$ROOT/examples/layouts/$ex.yml")" == "--name render it'"'"'s a \$HOME test; ok" ]]'
 done
 
 # tmux makes `v1.2` a session `v1_2`: `has-session -t "=v1.2"` then never
@@ -516,7 +516,7 @@ check "a reply with no known agent pane is refused" \
   eval '[[ $("$SWITCH" --reply send "echo wts-reply-refused" auth-form auth-form) == "change-prompt("*"not sent> )" ]]'
 refute "and nothing was typed" pane_contains auth-form wts-reply-refused
 # What the agent's hooks record from its own environment ($TMUX_PANE).
-q "INSERT OR REPLACE INTO agent_panes VALUES ('auth-form', '', '$(tmux display-message -p -t "=auth-form:" '#{pane_id}')', strftime('%s','now'))"
+q "INSERT OR REPLACE INTO agent_panes (session, claude_session, pane, at) VALUES ('auth-form', '', '$(tmux display-message -p -t "=auth-form:" '#{pane_id}')', strftime('%s','now'))"
 check "enter sends the line to the pane" \
   eval '[[ $("$SWITCH" --reply send "echo wts-reply-ok" auth-form auth-form) == "clear-query+refresh-preview" ]]'
 check "the line reached the pane" pane_shows auth-form wts-reply-ok
@@ -790,7 +790,7 @@ check "restore rebuilds a context file that disappeared" test -s "$WT/docsess/.w
 
 refute "--send refuses a session whose agent pane is unknown" \
   "$SWITCH" --send docsess "echo wts-doc-send-refused"
-q "INSERT OR REPLACE INTO agent_panes VALUES ('docsess', '', '$(tmux display-message -p -t "=docsess:" '#{pane_id}')', strftime('%s','now'))"
+q "INSERT OR REPLACE INTO agent_panes (session, claude_session, pane, at) VALUES ('docsess', '', '$(tmux display-message -p -t "=docsess:" '#{pane_id}')', strftime('%s','now'))"
 check "--send is the one sender into a pane" \
   "$SWITCH" --send docsess "echo wts-doc-send-ok"
 check "the sent line lands" pane_shows docsess wts-doc-send-ok
@@ -1202,6 +1202,11 @@ check "setup claude --install adds each event hook once" \
   jq -e '[ .hooks.UserPromptSubmit[].hooks[], .hooks.Stop[].hooks[],
            .hooks.Notification[].hooks[], .hooks.SessionEnd[].hooks[]
          | select(.command | test("/wts-hook ")) ] | length == 4' "$settings"
+check "setup claude prints the start hook next to wts-context" eval '
+  out=$("$WTS" setup claude); [[ "$out" == *"wts-context\", \"timeout\": 5 },"*"wts-hook start"* ]]'
+check "setup claude --install puts it on SessionStart, once, next to the user's own" \
+  jq -e '([.hooks.SessionStart[].hooks[] | select(.command | endswith("/wts-hook start"))] | length == 1)
+         and ([.hooks.SessionStart[].hooks[] | select(.command == "echo mine")] | length == 1)' "$settings"
 check "setup tmux adds the status line segment" \
   eval 'out=$("$WTS" setup tmux); [[ "$out" == *"wts-status --line"* ]]'
 
@@ -2087,7 +2092,7 @@ check "the refresh delay is computed under LC_ALL=C" \
 cd "$REPO"
 
 # ─── Agent events: wts-hook ──────────────────────────────────────────────────
-# What the agent reports about itself through the four Claude Code hooks: the
+# What the agent reports about itself through the Claude Code hooks: the
 # state when claude cannot be asked (the stand-in `claude agents` answers []),
 # since when, and what it waits for. WTS_NOTIFY=0 above: no bell, no banner.
 
@@ -2147,9 +2152,34 @@ check "a day later too: the twelve-hour doubt is for agents that said nothing" e
 check "wait returns on it, its tmux session still alive" eval '
   has_session evsess && "$WTS" wait evsess --timeout 2 --json </dev/null \
     | jq -e ".reached and .sessions[0].state == \"stopped\""'
-check "a /clear ends the conversation, not the agent: idle" eval '
+# Without the start hook (an install not set up again since), a /clear is an
+# end of reason clear alone: still idle, the agent is there.
+check "an end of kind clear with no start after it reads idle" eval '
   ev end "{\"session_id\":\"abc-123\",\"reason\":\"clear\"}"
   [[ "$(ev_state)" == idle ]]'
+# With it, a /clear is an end then a start, in the same second: the start is the word.
+check "a /clear ends the conversation, not the agent: idle" eval '
+  ev end "{\"session_id\":\"abc-123\",\"reason\":\"clear\"}"
+  ev start "{\"session_id\":\"abc-456\",\"source\":\"clear\"}"
+  [[ "$(ev_state)" == idle ]]'
+check "the start is recorded with its source, and its conversation is the agent's" eval '
+  [[ "$(q "select kind from agent_events where session = '\''evsess'\'' and event = '\''start'\''")" == clear ]] \
+  && "$WTS" status --json --no-git | jq -e ".[] | select(.name == \"evsess\") | .agent_session == \"abc-456\""'
+# The roadmap bug: claude quit, then run again in the same pane, read stopped
+# until its first prompt, and `wts send` needed --force.
+ev end '{"session_id":"abc-456","reason":"other"}'
+check "an end after it reads stopped again" eval '[[ "$(ev_state)" == stopped ]]'
+q "UPDATE agent_events SET at = at - 5 WHERE session = 'evsess'"
+check "an agent started again after an end reads idle, since its start" eval '
+  ev start "{\"session_id\":\"abc-789\",\"source\":\"startup\"}"
+  st=$(q "select max(at) from agent_events where session = '\''evsess'\'' and event = '\''start'\''")
+  "$WTS" status --json --no-git | jq -e --argjson st "$st" "
+    .[] | select(.name == \"evsess\") | .agent_state == \"idle\" and .agent_since == \$st"'
+check "a compaction leaves the state alone" eval '
+  ev prompt "{\"session_id\":\"abc-789\"}"
+  ev start "{\"session_id\":\"abc-789\",\"source\":\"compact\"}"
+  [[ "$(ev_state)" == working ]]'
+ev stop '{"session_id":"abc-789"}'
 check "ls says since when, next to the state" eval '
   [[ "$("$WTS" ls | grep "^evsess ")" == "evsess "*" idle "[0-9]*s" "* ]]'
 check "ls --wide says what a blocked agent waits for" eval '
@@ -2195,6 +2225,24 @@ check "the default layout renders a --resume pre-fill" eval '
     WTS_RESUME_ID=0123abcd-ef01-2345-6789-abcdef012345 WTS_DOC="" WTS_PROMPT="" \
     tmuxinator debug --project-config "$ROOT/share/wts/layouts/default.yml" \
   | grep -qF "resume\\ 0123abcd-ef01-2345-6789-abcdef012345"'
+check "the default layout names the conversation after the session" eval '
+  out=$(env WTS_NAME=render WTS_ROOT="$SANDBOX" WTS_WORKDIR="$SANDBOX" WTS_DOC="" WTS_PROMPT="fix it" \
+    tmuxinator debug --project-config "$ROOT/share/wts/layouts/default.yml")
+  [[ "$out" == *"claude\\ --name\\ render\\ "* ]]'
+check "but not a name that would read as a flag" eval '
+  out=$(env WTS_NAME="-x" WTS_ROOT="$SANDBOX" WTS_WORKDIR="$SANDBOX" WTS_DOC="" WTS_PROMPT="" \
+    tmuxinator debug --project-config "$ROOT/share/wts/layouts/default.yml")
+  [[ "$out" == *"claude C-m"* && "$out" != *"--name"* ]]'
+check "nor on restore: the resumed conversation keeps its own" eval '
+  out=$(env WTS_NAME=render WTS_ROOT="$SANDBOX" WTS_WORKDIR="$SANDBOX" WTS_RESTORE=1 WTS_RESUME=1 WTS_DOC="" WTS_PROMPT="" \
+    tmuxinator debug --project-config "$ROOT/share/wts/layouts/default.yml")
+  [[ "$out" == *"claude\\ --continue"* && "$out" != *"--name"* ]]'
+for l in feature sentry; do
+  check "the $l example names the conversation too" eval "
+    out=\$(env WTS_NAME=render WTS_ROOT=\"\$SANDBOX\" WTS_WORKDIR=\"\$SANDBOX\" WTS_PROMPT='fix it' \
+      tmuxinator debug --project-config \"\$ROOT/examples/layouts/$l.yml\")
+    [[ \"\$out\" == *'claude\\ --name\\ render\\ '* ]]"
+done
 "$WTS" rm evresume -f >/dev/null
 cd "$REPO"
 
@@ -2226,8 +2274,8 @@ check "the base it was compared against is recorded" eval '
   [[ "$(q "select base from archive where session = '"'"'gcarch'"'"'")" == main ]]'
 check "the worktree really is gone" eval '[[ ! -e "$WT/gcarch" ]]'
 
-check "the schema is at version 9" eval '
-  [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 9 ]]'
+check "the schema is at version 10" eval '
+  [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 10 ]]'
 
 # ─── PR, CI and review state ─────────────────────────────────────────────────
 # gh is a stand-in: it answers from fixtures keyed by what it was asked (a
@@ -2729,6 +2777,21 @@ mkdir -p "$proj_a"
 check "tail prints the agent's last message" eval '[[ "$("$WTS" tail agent-a </dev/null)" == *"done: the docs are written"* ]]'
 check "tail -n 2 --json skips tool calls" eval '
   "$WTS" tail agent-a -n 2 --json </dev/null | jq -e "[.messages[].text] == [\"first answer\", \"done: the docs are written\"]"'
+# The transcript the hooks recorded wins over the one derived from the worktree:
+# Claude Code names it in every payload (transcript_path).
+mkdir -p "$SANDBOX/elsewhere"
+print -r -- '{"type":"assistant","timestamp":"2026-10-03T12:03:00Z","message":{"content":[{"type":"text","text":"from the recorded transcript"}]}}' \
+  > "$SANDBOX/elsewhere/0123abcd-ef01-2345-6789-abcdef0000aa.jsonl"
+(cd "$WT/agent-a" && print -r -- "{\"session_id\":\"0123abcd-ef01-2345-6789-abcdef0000aa\",\"transcript_path\":\"$SANDBOX/elsewhere/0123abcd-ef01-2345-6789-abcdef0000aa.jsonl\"}" \
+  | TMUX_PANE="$pane_a" "$HOOK" stop)
+check "a hook records its agent's transcript" eval '
+  [[ "$(q "SELECT transcript FROM agent_panes WHERE session = '\''agent-a'\''")" == "$SANDBOX/elsewhere/"*.jsonl ]]'
+check "an event without one keeps it" eval '
+  (cd "$WT/agent-a" && print -r -- "{\"session_id\":\"0123abcd-ef01-2345-6789-abcdef0000aa\"}" | TMUX_PANE="$pane_a" "$HOOK" prompt)
+  [[ "$(q "SELECT transcript FROM agent_panes WHERE session = '\''agent-a'\''")" == "$SANDBOX/elsewhere/"*.jsonl ]]'
+check "tail reads the recorded transcript" eval '[[ "$("$WTS" tail agent-a </dev/null)" == *"from the recorded transcript"* ]]'
+rm -f "$SANDBOX/elsewhere/0123abcd-ef01-2345-6789-abcdef0000aa.jsonl"
+check "and the derived one once that file is gone" eval '[[ "$("$WTS" tail agent-a </dev/null)" == *"done: the docs are written"* ]]'
 # A transcript older than the session is a previous session of the same name's:
 # the brief and the retrospective never read one, and tail did.
 proj_b="$CLAUDE_CONFIG_DIR/projects/$(print -r -- "$WT/agent-b" | sed 's/[^a-zA-Z0-9]/-/g')"
@@ -2766,6 +2829,18 @@ check "the first editor hears that a sibling edited its file too" eval '
 check "once" eval '
   out=$(cd "$WT/agent-a" && print -r -- "{\"session_id\":\"s\"}" | env -u TMUX_PANE "$HOOK" prompt)
   [[ "$out" != *"src/api.ts"* ]]'
+
+# A subagent's edit runs the hook in the agent's own session, agent_id set.
+check "an overlap found at a subagent's edit says so" eval '
+  out=$(cd "$WT/agent-b" && print -r -- "{\"tool_name\":\"Edit\",\"agent_id\":\"sub-1\",\"tool_input\":{\"file_path\":\"$WT/agent-b/src/sub.ts\"}}" \
+          | env -u TMUX_PANE "$HOOK" touch)
+  [[ -z "$out" ]] \
+  && out=$(cd "$WT/agent-a" && print -r -- "{\"tool_name\":\"Edit\",\"agent_id\":\"sub-2\",\"tool_input\":{\"file_path\":\"$WT/agent-a/src/sub.ts\"}}" \
+          | env -u TMUX_PANE "$HOOK" touch) \
+  && print -r -- "$out" | jq -e ".hookSpecificOutput.additionalContext
+    | contains(\"src/sub.ts (by a subagent) was edited by session \`agent-b\` too\")"'
+# agent-b hears of it at its next turn: told here, so the notes below start clean.
+(cd "$WT/agent-b" && print -r -- '{"session_id":"s"}' | env -u TMUX_PANE "$HOOK" prompt >/dev/null)
 
 # Notes reach the other agents at their next turn, or at their next edit.
 prompt_as() { (cd "$WT/$1" && print -r -- '{"session_id":"s"}' | env -u TMUX_PANE "$HOOK" prompt) }
@@ -2832,7 +2907,7 @@ check "a sibling hears that it finished, how, and the notes it left" eval '
   [[ -n "$o" && "$out" == *"session \`agent-b\` finished ($o)"*"handoff: schema 9 is mine"* ]]'
 check "once" eval '[[ "$(prompt_as agent-a)" != *"agent-b"* ]]'
 
-# setup claude --install: six hooks, the read-only permissions, the skill.
+# setup claude --install: seven hooks, the read-only permissions, the skill.
 CS="$SANDBOX/claude-setup"
 mkdir -p "$CS"
 CLAUDE_CONFIG_DIR="$CS" "$WTS" setup claude --install >/dev/null
@@ -2844,6 +2919,14 @@ check "and allows the read-only verbs" eval '
          and ((.permissions.allow | index(\"Bash(wts rm:*)\")) | not)" "$CS/settings.json"'
 check "and writes the skill, its paths filled in" eval '
   grep -q "^name: wts$" "$CS/skills/wts/SKILL.md" && ! grep -q "{{" "$CS/skills/wts/SKILL.md"'
+check "doctor finds the seven hooks" eval '[[ "$(CLAUDE_CONFIG_DIR="$CS" "$WTS" doctor)" == *"✓ Claude hooks: all seven"* ]]'
+# An install from before the start hook: wts-context alone on SessionStart.
+jq '.hooks.SessionStart[].hooks |= map(select(.command | endswith(" start") | not))' "$CS/settings.json" > "$CS/s.tmp" \
+  && mv "$CS/s.tmp" "$CS/settings.json"
+check "and names the start hook when an older install lacks it" eval '
+  out=$(CLAUDE_CONFIG_DIR="$CS" "$WTS" doctor)
+  [[ "$out" == *"missing SessionStart (wts-hook start)"* && "$out" != *"from another install"* ]]'
+CLAUDE_CONFIG_DIR="$CS" "$WTS" setup claude --install >/dev/null
 check "doctor finds the skill" eval '[[ "$(CLAUDE_CONFIG_DIR="$CS" "$WTS" doctor)" == *"✓ Claude skill"* ]]'
 print -r -- "my own skill" > "$CS/skills/wts/SKILL.md"
 CLAUDE_CONFIG_DIR="$CS" "$WTS" setup claude --install >/dev/null 2>&1
@@ -2938,7 +3021,17 @@ check "a pr_state from schema 7 gets head on the next command" eval '
   "$WTS" ls >/dev/null
   [[ "$(q "SELECT count(*) FROM pragma_table_info('"'"'pr_state'"'"') WHERE name = '"'"'head'"'"'")" == 1
      && "$(q "SELECT state || head FROM pr_state WHERE session = '"'"'old-pr'"'"'")" == open
-     && "$(q "PRAGMA user_version")" == 9 ]]'
+     && "$(q "PRAGMA user_version")" == 10 ]]'
+# Schema 10 is a column on agent_panes: a table from schema 9 gets transcript,
+# and its rows stay.
+q "INSERT OR REPLACE INTO agent_panes (session, claude_session, pane, at) VALUES ('old-pane', '', '%1', 1);
+   ALTER TABLE agent_panes DROP COLUMN transcript; PRAGMA user_version = 9"
+check "an agent_panes from schema 9 gets transcript on the next command" eval '
+  "$WTS" ls >/dev/null
+  [[ "$(q "SELECT count(*) FROM pragma_table_info('"'"'agent_panes'"'"') WHERE name = '"'"'transcript'"'"'")" == 1
+     && "$(q "SELECT pane || transcript FROM agent_panes WHERE session = '"'"'old-pane'"'"'")" == "%1"
+     && "$(q "PRAGMA user_version")" == 10 ]]'
+q "DELETE FROM agent_panes WHERE session = 'old-pane'"
 # Schema 9 is one table, seen: the prompt hook may be the first to open a
 # database an older wts left at 8, and it must create the table, not fail.
 env WTS_NO_ATTACH=1 "$WTS" schema8 smoke >/dev/null
@@ -2946,7 +3039,7 @@ q "DROP TABLE seen; PRAGMA user_version = 8"
 check "the prompt hook on a schema-8 database exits 0 and prints nothing" eval '
   out=$(cd "$WT/schema8" && print -r -- "{\"session_id\":\"s\"}" | env -u TMUX_PANE "$HOOK" prompt); (( $? == 0 )) && [[ -z "$out" ]]'
 check "and the database has seen afterwards" eval '
-  [[ "$(q "SELECT count(*) FROM sqlite_master WHERE name = '"'"'seen'"'"'") $(q "PRAGMA user_version")" == "1 9" ]]'
+  [[ "$(q "SELECT count(*) FROM sqlite_master WHERE name = '"'"'seen'"'"'") $(q "PRAGMA user_version")" == "1 10" ]]'
 q "DROP TABLE seen; PRAGMA user_version = 8"
 check "a database at schema 8 gets seen on the next command" eval '
   "$WTS" ls >/dev/null; [[ "$(q "SELECT count(*) FROM sqlite_master WHERE name = '"'"'seen'"'"'")" == 1 ]]'

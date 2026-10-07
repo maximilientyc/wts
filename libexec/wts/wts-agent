@@ -193,8 +193,8 @@ cmd_wait() {
 
 # ─── tail ────────────────────────────────────────────────────────────────────
 
-# The transcript of <session>'s agent: the conversation its hooks named, when
-# its file is there, else the newest one of the session's working directory —
+# The transcript of <session>'s agent: the file its hooks named, else the
+# conversation they named, when its file is there, else the newest one of the session's working directory —
 # through db_session_transcript, like the brief and the retrospective. A lookup
 # of its own here had no lower bound on the file's age: under a name used
 # again, `tail` read out the conversation of the session that had it before.
@@ -206,7 +206,7 @@ transcript_of() {  # <session>
                    WHERE name = $(sql_str "$1")" 2>/dev/null)
   [[ "$created" == <-> ]] || created=0
   sid=$(db_claude_session_of "$1") || sid=""
-  db_session_transcript "$wt" "$sub" "$created" "$sid"
+  db_session_transcript "$wt" "$sub" "$created" "$sid" "$1"
 }
 
 cmd_tail() {

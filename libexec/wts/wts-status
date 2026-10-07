@@ -125,12 +125,17 @@ tmux_alive=$(tmux list-sessions -F '#{session_name}' 2>/dev/null)
 # (the event that put the agent in its state) and what it waits for — and stand
 # in for it when it cannot be asked. Split, not `read -d`: this runs inside the
 # switcher's reload (see db_rows in wts-db.zsh).
-typeset -A ev_at ev_kind ev_msg ev_sid ev_last ev_last_at ev_last_kind
+# A `start` of kind compact is left out: a compaction (often in the middle of a
+# turn) changes nothing about what the agent is doing, so the state stays what
+# the events before it said. Ties in the same second go to the later row: a
+# /clear writes its `end` and its `start` together, and the start is the word.
+typeset -A ev_at ev_kind ev_msg ev_sid ev_last ev_last_at ev_last_id ev_last_kind
 if db_available && [[ -s "$WTS_DB" ]]; then
-  ev_rows=$(db_rows "SELECT e.session, e.event, e.kind, e.message, e.claude_session, e.at
+  ev_rows=$(db_rows "SELECT e.session, e.event, e.kind, e.message, e.claude_session, e.at, e.id
                      FROM agent_events e
                      WHERE e.id = (SELECT id FROM agent_events
                                    WHERE session = e.session AND event = e.event
+                                     AND NOT (event = 'start' AND kind = 'compact')
                                    ORDER BY at DESC, id DESC LIMIT 1)" 2>/dev/null)
   for ev_row in "${(@ps:\x1e:)ev_rows}"; do
     ev_f=("${(@ps:\x1f:)ev_row}")
@@ -140,11 +145,11 @@ if db_available && [[ -s "$WTS_DB" ]]; then
       ev_kind[${ev_f[1]}]="${ev_f[3]:-}"
       ev_msg[${ev_f[1]}]="${ev_f[4]:-}"
     fi
-    if (( ${ev_f[6]:-0} >= ${ev_last_at[${ev_f[1]}]:-0} )); then
+    if (( ${ev_f[6]:-0} > ${ev_last_at[${ev_f[1]}]:-0} ||
+          ( ${ev_f[6]:-0} == ${ev_last_at[${ev_f[1]}]:-0} && ${ev_f[7]:-0} > ${ev_last_id[${ev_f[1]}]:-0} ) )); then
       ev_last_at[${ev_f[1]}]="${ev_f[6]:-0}"
+      ev_last_id[${ev_f[1]}]="${ev_f[7]:-0}"
       ev_last[${ev_f[1]}]="${ev_f[2]}"
-      # The kind of whatever came last, not of the notification only: an `end`
-      # carries the reason the conversation closed, and /clear is one of them.
       ev_last_kind[${ev_f[1]}]="${ev_f[3]:-}"
       [[ -n "${ev_f[5]:-}" ]] && ev_sid[${ev_f[1]}]="${ev_f[5]}"
     fi
@@ -345,12 +350,17 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
   # hours, which is an agent that died without saying so.
   # An `end` is the agent saying so: stopped, whatever its age. It used to
   # leave no state at all, and `wts wait` reads no state as "not started yet":
-  # waiting for an agent that had quit timed out every time, for good. Except
-  # after /clear, which ends the conversation and keeps the agent.
+  # waiting for an agent that had quit timed out every time, for good. A
+  # `start` after it (SessionStart: a /clear, or claude run again in the pane)
+  # is an agent waiting for its first prompt: idle. Until it was recorded, the
+  # `end` stayed the last word and that agent read stopped, `wts send` refusing
+  # it without --force. An `end` of kind clear with no start after it still
+  # reads idle: a wts upgraded by brew runs this collector before `wts setup
+  # claude --install` adds the start hook, and /clear must not read stopped there.
   agent_source=null; agent_since=null
   p_at=${ev_at[${name}:prompt]:-0}; s_at=${ev_at[${name}:stop]:-0}
   n_at=${ev_at[${name}:notification]:-0}; n_kind="${ev_kind[$name]:-}"
-  e_at=${ev_at[${name}:end]:-0}
+  e_at=${ev_at[${name}:end]:-0}; st_at=${ev_at[${name}:start]:-0}
   ev_state=""
   if [[ -n "$raw" || "$agent_session" != "null" ]]; then
     agent_source='"agents"'
@@ -360,6 +370,7 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
     case "${ev_last[$name]}" in
       prompt) ev_state=working ;;
       stop)   ev_state=idle ;;
+      start)  ev_state=idle ;;
       end)    ev_state=idle ;;
       notification)
         if needs_human "$n_kind"; then ev_state=blocked
@@ -442,8 +453,9 @@ while IFS= read -r name && IFS= read -r profile && IFS= read -r repo_root \
       elif (( p_at )); then agent_since=$p_at
       fi ;;
     '"idle"')
-      if [[ "$n_kind" == idle_prompt ]] && (( n_at > s_at )); then agent_since=$n_at
-      elif (( e_at > s_at )) && [[ "$ev_state" == idle ]]; then agent_since=$e_at
+      if [[ "${ev_last[$name]:-}" == start ]] && (( st_at )); then agent_since=$st_at
+      elif [[ "${ev_last[$name]:-}" == end ]] && (( e_at )); then agent_since=$e_at
+      elif [[ "$n_kind" == idle_prompt ]] && (( n_at > s_at )); then agent_since=$n_at
       elif (( s_at )); then agent_since=$s_at
       fi ;;
     # Only when the `end` is what said so: `claude agents` can report stopped

@@ -702,11 +702,12 @@ if [[ "$1" == "setup" ]]; then
     if [[ "${3:-}" != "--install" ]]; then
       cat <<EOF
 // ─── wts setup claude (wts $WTS_VERSION) ─────────────────────────────────────
-// Six Claude Code hooks. SessionStart (wts-context): in a wts session it adds
+// Seven Claude Code hooks. SessionStart (wts-context): in a wts session it adds
 // to the agent's context its session, its task, the same repository's other
 // sessions and their notes, and the files both have edited. The others
-// (wts-hook) record what the agent reports about itself — a turn starts, ends,
-// waits for a permission or an answer, the agent quits — which dates the states
+// (wts-hook) record what the agent reports about itself — a conversation
+// starts (startup, resume, /clear, /compact), a turn starts, ends, waits for a
+// permission or an answer, the agent quits — and its transcript, which dates the states
 // in \`wts ls\` and the switcher and rings when an agent needs you
 // (WTS_NOTIFY=0 to turn that off); at a turn's start they hand the agent the
 // notes its siblings left since its last turn; after an edit (PostToolUse)
@@ -725,7 +726,8 @@ if [[ "$1" == "setup" ]]; then
 {
   "hooks": {
     "SessionStart": [
-      { "hooks": [ { "type": "command", "command": "$hook_cmd", "timeout": 5 } ] }
+      { "hooks": [ { "type": "command", "command": "$hook_cmd", "timeout": 5 },
+                   { "type": "command", "command": "$event_cmd start", "timeout": 10 } ] }
     ],
     "UserPromptSubmit": [
       { "hooks": [ { "type": "command", "command": "$event_cmd prompt", "timeout": 10 } ] }
@@ -765,7 +767,9 @@ EOF
            | select((.hooks | length) > 0) ];
          def add(e; c; t): .hooks[e] = (wts_free(e) + [ { hooks: [ { type: "command", command: c, timeout: t } ] } ]);
          def addm(e; m; c; t): .hooks[e] = (wts_free(e) + [ { matcher: m, hooks: [ { type: "command", command: c, timeout: t } ] } ]);
-         add("SessionStart"; $cmd; 5)
+         .hooks["SessionStart"] = (wts_free("SessionStart") + [ { hooks: [
+             { type: "command", command: $cmd, timeout: 5 },
+             { type: "command", command: ($ev + " start"), timeout: 10 } ] } ])
          | add("UserPromptSubmit"; $ev + " prompt"; 10)
          | add("Stop"; $ev + " stop"; 10)
          | add("Notification"; $ev + " notification"; 10)
@@ -776,7 +780,7 @@ EOF
          "$claude_settings.bak" > "$claude_settings.tmp.$$"; then
       mv "$claude_settings.tmp.$$" "$claude_settings"
       echo "→ hooks installed in $claude_settings (backup: settings.json.bak):"
-      echo "   SessionStart (wts-context), UserPromptSubmit, Stop, Notification, SessionEnd, PostToolUse (wts-hook)"
+      echo "   SessionStart (wts-context, wts-hook start), UserPromptSubmit, Stop, Notification, SessionEnd, PostToolUse (wts-hook)"
       echo "   permissions.allow: the read-only wts verbs and the agent's own notes (no prompt for them)"
     else
       rm -f "$claude_settings.tmp.$$"

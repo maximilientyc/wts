@@ -226,7 +226,8 @@ type:
 - **macOS first.** Linux is untested.
 - **Some Claude Code internals are undocumented**: the `tmux` field of
   `~/.claude/sessions/<pid>.json` (used to target the preview pane), the record
-  types of transcript `.jsonl` files and the way their directory is named. When
+  types of transcript `.jsonl` files and the way their directory is named (the
+  fallback when the hooks have not reported a transcript's path). When
   they change, the affected columns and summaries degrade to `-` or raw facts;
   nothing else breaks.
 - The restore pre-fill (`print -z`) assumes zsh in the panes.

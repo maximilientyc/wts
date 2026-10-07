@@ -96,7 +96,13 @@ Both deliver the same news, each item once, to each agent.
   of it before its turn is over. That includes the overlap the moment it
   happens: editing a file another session of the repository has edited says
   which session, on which branch, since when. The session that edited it first
-  hears of it at its own next prompt or edit.
+  hears of it at its own next prompt or edit. When the edit was a subagent's
+  (the payload carries `agent_id`), the line says so, since the agent reading
+  it did not make that edit itself:
+
+  ```
+  wts: src/api.ts (by a subagent) was edited by session `rate-limit` too (branch rate-limit, first edited it 4m ago).
+  ```
 
 Every path edited through those tools is recorded in the `touches` table,
 relative to the worktree. A file changed from the shell (`sed -i`, a formatter,
@@ -195,7 +201,9 @@ It also looks at the agent first, because the caller cannot:
 ### `wts tail`
 
 The agent's last messages, from its transcript; `-n <k>` for how many,
-`--json` for scripts.
+`--json` for scripts. The transcript is the file the agent's hooks named
+(`transcript_path`), else the one derived from the worktree's path
+([How `wts brief` gathers and caches](watching.md#how-wts-brief-gathers-and-caches)).
 
 ### Rules for a caller without a terminal
 

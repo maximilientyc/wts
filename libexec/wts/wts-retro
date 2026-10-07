@@ -181,10 +181,11 @@ cmd_collect() {
   [[ "$shortstat" =~ '([0-9]+) deletion' ]] && removed=${match[1]}
 
   # --- transcript -----------------------------------------------------------
-  # The most recent one of the worktree or its subdirectory, never older than
-  # the session (db_session_transcript in wts-db.zsh).
+  # The one its hooks recorded, else the most recent one of the worktree or its
+  # subdirectory, never older than the session (db_session_transcript in
+  # wts-db.zsh).
   local tr="" sid="" bytes=0 mtime=0
-  tr=$(db_session_transcript "$worktree" "$subdir" "$created") || tr=""
+  tr=$(db_session_transcript "$worktree" "$subdir" "$created" "" "$session") || tr=""
   if [[ -n "$tr" ]]; then
     # The basename IS the Claude session id. Worth taking here: at teardown the
     # agent is already dead, and that id lives nowhere else on disk.

@@ -123,10 +123,10 @@ collect() {
     added=\(.added) removed=\(.removed) ahead=\(.ahead) dirty=\(.dirty)"')"
 
   # --- Claude transcript ----------------------------------------------------
-  # The live agent's one if there is one, otherwise the most recent one of the
-  # worktree (db_session_transcript in wts-db.zsh).
+  # The one its hooks recorded, else the live agent's one, else the most recent
+  # one of the worktree (db_session_transcript in wts-db.zsh).
   local tr
-  tr=$(db_session_transcript "$worktree" "$subdir" "$created" "$sid") || tr=""
+  tr=$(db_session_transcript "$worktree" "$subdir" "$created" "$sid" "$name") || tr=""
 
   local title="" pr="" last_prompt="" texts=""
   if [[ -n "$tr" ]]; then

@@ -79,6 +79,14 @@ rather than type it: tmuxinator types the pane's command before its shell is
 ready, and the terminal then keeps 1024 bytes of a line, so a long phrase typed
 whole loses its end and Claude never starts.
 
+The built-in and example layouts start Claude with `--name <WTS_NAME>`, so the
+conversation carries the session's name in `/resume` and Claude Code's own
+agent list instead of its first prompt. Only on creation: on restore the
+pre-filled `claude --resume` keeps the name the conversation already has. The
+name is checked like `WTS_DOC` (letters, digits, `.`, `_`, `/`, `-`, not a
+leading `-`) before it is interpolated into the pane's command line; any other
+name starts Claude without `--name`.
+
 ## The Claude pane on restore
 
 On `wts restore` the command is pre-filled rather than run
