@@ -2548,9 +2548,37 @@ if ! command -v tmux >/dev/null 2>&1; then
   exit 1
 fi
 
+# ─── .worktreeinclude ────────────────────────────────────────────────────────
+# Claude Code's own convention: gitignore-style patterns naming untracked files
+# (.env, local settings) a new worktree needs and git will not bring. The
+# candidates are the main checkout's untracked files, ignored ones included;
+# the patterns are matched in an empty scratch repository, because in the real
+# one .gitignore is consulted too and a file it ignores would match whatever
+# .worktreeinclude says about it (`check-ignore -v` credits .gitignore).
+copy_worktreeinclude() {  # <main checkout> <new worktree>
+  local src="$1" dst="$2" rules="$1/.worktreeinclude" scratch f n=0
+  [[ -f "$rules" ]] || return 0
+  scratch=$(mktemp -d "${TMPDIR:-/tmp}/wts-include.XXXXXX") || return 0
+  git init -q "$scratch" 2>/dev/null || { rm -rf "$scratch"; return 0; }
+  local -a files
+  # check-ignore exits 1 when nothing matched: an empty list, not a failure.
+  files=(${(0)"$( { git -C "$src" ls-files -z --others --exclude-standard
+                    git -C "$src" ls-files -z --others --ignored --exclude-standard; } 2>/dev/null \
+                  | git -C "$scratch" -c core.excludesFile="$rules" \
+                      check-ignore --no-index --stdin -z 2>/dev/null )"})
+  rm -rf "$scratch"
+  for f in "${files[@]}"; do
+    [[ -n "$f" && -f "$src/$f" ]] || continue
+    mkdir -p "$dst/${f:h}" && cp -p "$src/$f" "$dst/$f" && (( ++n ))
+  done
+  echo "→ .worktreeinclude: $n file(s) copied"
+}
+
 mkdir -p "$worktree_base"
 
+worktree_created=0
 if [[ ! -d "$worktree_path" ]]; then
+  worktree_created=1
   echo "→ creating worktree $worktree_path (branch $BRANCH)"
   if git -C "$repo_root" show-ref --verify --quiet "refs/heads/$BRANCH"; then
     # Existing local branch → checkout
@@ -2578,6 +2606,11 @@ if [[ ! -d "$worktree_path" ]]; then
   fi
 else
   echo "→ existing worktree: $worktree_path"
+fi
+# Only into a worktree just made: an existing one has its own copies, perhaps
+# edited, and copying again would overwrite them.
+if (( worktree_created )); then
+  copy_worktreeinclude "$repo_root" "$worktree_path"
 fi
 
 # ─── Working subdirectory (optional) ─────────────────────────────────────────

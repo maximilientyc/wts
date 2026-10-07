@@ -189,6 +189,29 @@ check "phrase written to .wts/prompt" \
   eval '[[ "$(<"$WT/export-users-csv/.wts/prompt")" == "export users as csv" ]]'
 check "and ignored by git" eval '[[ -z "$(git -C "$WT/export-users-csv" status --porcelain)" ]]'
 
+# .worktreeinclude: untracked files of the main checkout copied into a new
+# worktree, matched by that file's rules alone (.gitignore has its say on the
+# candidates, not on the match). Nothing without the file.
+# The commit is undone below: later tests fast-forward main to a clone's.
+printf '%s\n' '.env' 'config/' > .gitignore
+git add .gitignore && git commit -qm 'ignore .env and config/'
+print 'TOKEN=1' > .env
+print 'SECRET=1' > secret.env
+mkdir -p config && print 'local: 1' > config/local.yml
+WTS_NO_ATTACH=1 "$WTS" noinclude smoke >/dev/null
+refute "without .worktreeinclude nothing is copied" eval 'test -e "$WT/noinclude/.env" || test -e "$WT/noinclude/secret.env" || test -e "$WT/noinclude/config"'
+"$WTS" rm noinclude -f >/dev/null
+printf '%s\n' '*.env' '!secret.env' 'config/' > .worktreeinclude
+out=$(WTS_NO_ATTACH=1 "$WTS" withinclude smoke 2>&1)
+check ".worktreeinclude copies a matching ignored file" eval '[[ "$(<"$WT/withinclude/.env")" == "TOKEN=1" ]]'
+check "and a nested one, its folder created" eval '[[ "$(<"$WT/withinclude/config/local.yml")" == "local: 1" ]]'
+check "and says how many" eval '[[ "$out" == *".worktreeinclude: 2 file(s) copied"* ]]'
+check "which stay untracked (ignored)" eval '[[ -z "$(git -C "$WT/withinclude" status --porcelain)" ]]'
+refute "a negated file is not copied" test -e "$WT/withinclude/secret.env"
+"$WTS" rm withinclude -f >/dev/null
+rm -rf .env secret.env config .worktreeinclude
+git reset -q --hard HEAD~1
+
 # A long phrase reaches claude whole. The layout used to type `claude '<phrase>'`
 # into the pane before its shell was ready: the tty, still in canonical mode,
 # kept 1024 bytes of the line, the closing quote was lost and claude never

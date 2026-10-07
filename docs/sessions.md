@@ -120,6 +120,32 @@ The branch name is the layout's [branch prefix](layouts.md#branch-prefix)
 followed by the session name. To review an origin branch by its exact name, use
 a layout without prefix, such as `default`.
 
+## Untracked files: `.worktreeinclude`
+
+A new worktree has only what git tracks: no `.env`, no local settings. List
+those in a `.worktreeinclude` at the root of the main checkout, Claude Code's
+own convention, in `.gitignore` syntax (globs, `dir/`, `!` to exclude):
+
+```gitignore
+# <repo>/.worktreeinclude
+*.env
+!secret.env
+config/*.local.yml
+```
+
+Right after creating the worktree, `wts` copies every untracked file of the
+main checkout, ignored ones included, that these patterns match, keeping its
+path, mode and dates, and prints one line with the count. Only this file's
+rules decide: a file `.gitignore` ignores is copied when `.worktreeinclude`
+names it, and not otherwise. The copies stay untracked in the worktree (still
+ignored when `.gitignore` ignores them).
+
+Without the file nothing happens. A worktree that already exists (`wts
+<name>` on a stopped session, `wts restore`) is left alone: its copies may
+have been edited. Matching lists every untracked file of the main checkout,
+so a large ignored folder (`node_modules/`) makes a creation slower, and only
+when the file exists.
+
 ## Several at once: `wts new`
 
 ```sh
