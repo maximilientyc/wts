@@ -865,8 +865,9 @@ tmux kill-session -t "=ctrleprobe" 2>/dev/null || true
 tmux new-session -d -s ctrleprobe -x 100 -y 20 "$SANDBOX/bin/ctrl-e-probe"
 pane_contains ctrleprobe "doc>" || true
 tmux send-keys -t "=ctrleprobe:" contra
-# 1/2, not 1/: while fzf still reads the list, the first row alone counts 1/1,
-# unfiltered, and an enter then picks it -- spec, not contract (seen on CI).
+# 1/2, not 1/: one match out of both rows. The picker's --sync is what makes
+# this enough: without it fzf drew the prompt with one row read, matched the
+# filter against that row alone, and the enter picked nothing (seen on CI).
 pane_contains ctrleprobe "1/2" || true
 tmux send-keys -t "=ctrleprobe:" Enter
 check "ctrl-e: a document picked by its slug is attached, then a key is awaited" \

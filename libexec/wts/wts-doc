@@ -726,7 +726,12 @@ pick_doc() {  # -> a slug on stdout, empty when the user gave up
     # slug and the first two words of the title -- "The product spec" showed
     # as "The product", and kind and age never showed at all. The row is
     # already a table; show it whole, the one `wts doc ls` prints.
-    choice=$(doc_table | fzf --reverse --height=100% --no-multi \
+    # --sync: the prompt shows once every row is read. Without it a slug typed
+    # and entered quickly was matched against the rows read so far: on a slow
+    # macOS runner only the first, which did not match, and enter picked
+    # nothing (the smoke test's ctrl-e check, on the 1.10.0 merge). The table
+    # is a few local rows; waiting for it costs nothing a person can see.
+    choice=$(doc_table | fzf --reverse --height=100% --no-multi --sync \
                              --prompt='doc> ' 2>/dev/null)
     print -r -- "${${(z)choice}[1]:-}"
     return 0
