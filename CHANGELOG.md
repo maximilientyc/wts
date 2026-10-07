@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **The document picker waits for its whole list before reading keys**
+  (`ctrl-e` in the switcher, `wts doc use` without a slug). A slug typed and
+  entered quickly was matched against the rows read so far, and on a slow
+  machine enter could pick nothing. fzf now starts with `--sync`. The smoke
+  test's `ctrl-e` check caught it on macOS CI, after the 1.10.0 merge.
+
 ## 1.10.0 — 2026-10-05
 
 - **`WTS_RETRO_MODEL`: the retrospectives get a model of their own.** One
