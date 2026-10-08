@@ -5,7 +5,7 @@
 #   briefs       wts-brief's cache (key line + done/next)
 #   pane_hashes  wts-status's stale watchdog (pane hash, since when)
 #   doc_cache    wts-doc's fetched documents
-#   kv           small caches (wts-doc's connector list)
+#   kv           small caches (wts-doc's connector list, Things, claude.messaging)
 #   notes        what the Claude agents leave for each other (`wts db set`)
 #   tasks        the durable unit of work above a session (a Things 3 task)
 #   task_notes   free text the author keeps ON a task, not on one of its sessions
@@ -285,7 +285,9 @@ CREATE TABLE IF NOT EXISTS notes (
 );
 CREATE INDEX IF NOT EXISTS notes_by_time ON notes(updated_at);
 -- What the agent itself reported, through the Claude Code hooks wts-hook is
--- installed on: prompt (UserPromptSubmit), stop (Stop), notification
+-- installed on: prompt (UserPromptSubmit; kind = message and message = the
+-- sender when the prompt is a message from another Claude session, or notice
+-- for Claude Code's own notice about one), stop (Stop), notification
 -- (Notification, kind = its notification_type, message = its text) and end
 -- (SessionEnd, kind = its reason). Written by the hook only, read by
 -- wts-status for since-when and waiting-for, and as the state itself when
@@ -875,6 +877,152 @@ agent_pane_of() {  # <session>
       return 0
     fi
   fi
+  return 1
+}
+
+# ─── Claude Code's messages between sessions ────────────────────────────────
+# Claude Code 2.1.224 and later delivers messages between the sessions of one
+# machine (SendMessage, ListAgents, notify_when_idle, over a Unix socket per
+# session). An agent that has them reaches a sibling without `wts send`, which
+# can only type into its pane. Measured on 2.1.293: a message to an idle agent
+# starts a turn, one to a working agent is read at its next tool round, and
+# UserPromptSubmit fires for both with the message as the prompt (see
+# claude_peer_prompt below).
+WTS_CLAUDE_MESSAGING_MIN=2.1.224
+
+# claude_messaging [--no-store] [<dir>] — whether this machine's agents can
+# message each other, as one word and a detail:
+#   available                    0
+#   old <version>                1   claude older than WTS_CLAUDE_MESSAGING_MIN
+#   refuse <settings file>       1   crossSessionInbound: refuse, nothing arrives
+#   hold <settings file>         1   crossSessionInbound: hold, each message
+#                                    waits for the user's approval
+#   none                         1   no claude on PATH
+# The version costs a `claude --version` (a quarter of a second) and this runs
+# from the SessionStart hook: the verdict is cached in kv['claude.messaging'],
+# keyed by the resolved binary and the mtimes of the settings that decide it,
+# so it is computed again after an upgrade or a settings change, and not
+# otherwise. <dir>'s own .claude/settings{,.local}.json are read on every call,
+# uncached: a repository may tighten the setting (Claude Code lets it hold or
+# refuse, never accept over the user). --no-store: compute without writing the
+# cache (wts doctor writes nothing).
+claude_messaging() {
+  local store=true dir="" bin real ver verdict key cached f m worst="accept" where=""
+  [[ "${1:-}" == --no-store ]] && { store=false; shift }
+  dir="${1:-}"
+  bin=$(command -v claude 2>/dev/null) || { print -r -- none; return 1 }
+  real="${bin:A}"
+  zmodload -F zsh/stat b:zstat 2>/dev/null
+  local cdir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  local -a settings
+  settings=("$cdir/settings.json" "$cdir/settings.local.json"
+            "/Library/Application Support/ClaudeCode/managed-settings.json"
+            "/etc/claude-code/managed-settings.json")
+  key="$real:$(zstat +mtime "$real" 2>/dev/null)"
+  for f in "${settings[@]}"; do
+    [[ -f "$f" ]] && key+=":$(zstat +mtime "$f" 2>/dev/null)"
+  done
+  if db_available && [[ -s "$WTS_DB" ]]; then
+    cached=$(db_ro "SELECT value FROM kv WHERE key = 'claude.messaging'" 2>/dev/null)
+  fi
+  if [[ -n "${cached:-}" && "${cached%|*}" == "$key" ]]; then
+    verdict="${cached##*|}"
+  else
+    # The native installer's binary is .../versions/<version>: no process.
+    if [[ "$real" =~ '/versions/([0-9]+\.[0-9]+\.[0-9]+)$' ]]; then
+      ver="${match[1]}"
+    else
+      ver=$(perl -e 'alarm shift; exec @ARGV' 5 "$bin" --version 2>/dev/null \
+              | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    fi
+    autoload -Uz is-at-least
+    if [[ -z "$ver" ]] || ! is-at-least "$WTS_CLAUDE_MESSAGING_MIN" "$ver"; then
+      verdict="old ${ver:-unknown}"
+    else
+      verdict=available
+      for f in "${settings[@]}"; do
+        m=$(_claude_inbound_of "$f")
+        case "$m" in
+          refuse) worst=refuse where="$f" ;;
+          hold) [[ "$worst" == refuse ]] || { worst=hold where="$f" } ;;
+        esac
+      done
+      [[ "$worst" != accept ]] && verdict="$worst $where"
+    fi
+    if $store && db_available && [[ -s "$WTS_DB" ]]; then
+      db_q "INSERT OR REPLACE INTO kv VALUES ('claude.messaging', $(sql_str "$key|$verdict"))" \
+        >/dev/null 2>&1
+    fi
+  fi
+  # A repository's own setting, on top of the machine's.
+  if [[ "$verdict" == available || "$verdict" == hold\ * ]] && [[ -n "$dir" ]]; then
+    for f in "$dir/.claude/settings.json" "$dir/.claude/settings.local.json"; do
+      m=$(_claude_inbound_of "$f")
+      if [[ "$m" == refuse ]]; then verdict="refuse $f"; break; fi
+      [[ "$m" == hold && "$verdict" == available ]] && verdict="hold $f"
+    done
+  fi
+  print -r -- "$verdict"
+  [[ "$verdict" == available ]]
+}
+
+# The crossSessionInbound value of one settings file, or nothing. grep first:
+# most files do not mention it, and jq is a process.
+_claude_inbound_of() {  # <settings file>
+  [[ -f "$1" ]] && grep -qs crossSessionInbound "$1" 2>/dev/null || return 0
+  jq -r '.crossSessionInbound // empty | strings' "$1" 2>/dev/null
+}
+
+# The name each live agent answers SendMessage on, from Claude Code's own
+# session files (<claude dir>/sessions/<pid>.json): one line per agent,
+# "<cwd>\x1f<name>", interactive ones first, newest first. Read rather than
+# assumed: a layout that passes `--name <session>` (the built-in ones) makes
+# it the wts name, any other gets a derived one (<folder>-<two hex digits>),
+# and a send to a name that is only a prefix is refused. Files whose pid is
+# gone are skipped: Claude Code leaves them behind after a crash.
+claude_peer_names() {
+  local dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions" row
+  local -a files f
+  files=("$dir"/*.json(N))
+  (( ${#files} )) || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  for row in "${(@f)$(cat "${files[@]}" 2>/dev/null | jq -rs '
+      map(select(type == "object" and .peerProtocol != null and (.name // "") != ""
+                 and (.pid | type) == "number"))
+      | sort_by([(if .kind == "interactive" then 0 else 1 end), -(.startedAt // 0)])
+      | .[] | [(.pid | tostring), .cwd, (.name | gsub("[\\t\\n\\r\u001f\u001e]"; " "))]
+      | join("\u001f")' 2>/dev/null)}"; do
+    f=("${(@ps:\x1f:)row}")
+    (( ${#f} == 3 )) || continue
+    kill -0 "${f[1]}" 2>/dev/null || continue
+    print -r -- "${f[2]}"$'\x1f'"${f[3]}"
+  done
+  return 0
+}
+
+# A prompt that is not the author's: a message from another session, or a
+# notice Claude Code itself sends about one (idle, delivery). Measured on
+# 2.1.293, UserPromptSubmit's prompt is the raw `<cross-session-message from=…
+# from-name="<sender>" from-mode=…>` block, or `[Cross-session idle notice] …`.
+# In the transcript the same turn is a user record with origin.kind "peer" (or
+# isMeta and turnOrigin "system" for a notice), whose content starts with
+# "Another Claude session sent a message:"; one read during a turn is a
+# queued_command attachment, not a user record. JQ_AUTHORED is the test the
+# brief and the retrospective apply to user records, so a sibling's words are
+# not reported as the author's.
+JQ_AUTHORED='def authored:
+  (.isMeta != true) and ((.origin.kind // "human") == "human")
+  and ((.turnOrigin // "human") == "human")
+  and ((.message.content | type) == "string")
+  and (.message.content | (startswith("<") or startswith("[Cross-session ")
+                           or startswith("Another Claude session sent a message")) | not);'
+claude_peer_prompt() {  # <prompt> — prints the sender (or "notice"), fails for the author's own
+  local p="$1"
+  if [[ "$p" == '<cross-session-message'* ]]; then
+    if [[ "${p%%$'\n'*}" =~ 'from-name="([^"]*)"' ]]; then print -r -- "${match[1]}"; else print -r -- "?"; fi
+    return 0
+  fi
+  [[ "$p" == '[Cross-session '* ]] && { print -r -- notice; return 0 }
   return 1
 }
 

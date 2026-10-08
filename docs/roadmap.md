@@ -49,18 +49,21 @@ through the database, and what the person running them sees of it. What the
 agents share reaches the others by a comparison of clocks, half of it one way
 only, and almost none of it is on a screen.
 
-- **A sent line says who sent it, and you see what they share. [M]** Without a
-  terminal, `wts send` types `[wts: from session <me>] <text>`: the receiving
-  agent reads it, the hook records it on the prompt row (`kind = send`), and
-  `wts brief` and the retrospective stop calling it the author's message. No
-  table: the tag is in the transcript, which is what the retrospective reads.
-  `send` then waits a few seconds for the turn to start, which closes the race
-  with a `wait` that returns before it has. `wts status --json` gains
-  `notes_unseen`, `overlap` (`touches`, plus the files each branch changed
-  against its base, so an edit made from the shell counts) and `asked_by`; the
-  switcher preview shows them. Try on a real agent first: a send during a
-  turn, with a draft in the input box, after `/clear`, and whether an edit
-  made by a subagent runs the hook.
+- **You see what they share. [M]** Who sent what no longer needs a tag in
+  the line: between agents, Claude Code's own messages (2.1.224 and later,
+  what the skill now prefers to `wts send`) arrive marked with their sender,
+  `wts-hook prompt` records them as `kind = message`, and `wts brief` and the
+  retrospective leave them out of the author's words. `wts send` keeps
+  `send-keys`, since no command line posts into another session's socket: a
+  line it types is still indistinguishable from the author's, which matters
+  only for scripts and terminals now. Left: `send` waiting a few seconds for
+  the turn to start, which closes the race with a `wait` that returns before
+  it has; `wts status --json` gaining `notes_unseen`, `overlap` (`touches`,
+  plus the files each branch changed against its base, so an edit made from
+  the shell counts) and `asked_by` (the last `kind = message` prompt's
+  sender), shown in the switcher preview. Try on a real agent first: a send
+  with a draft in the input box, after `/clear`, and whether an edit made by a
+  subagent runs the hook.
 - Later: an author on `task_notes` and their delivery during a session (an
   ALTER, and sessions on one task are siblings the notes already reach); a
   mark on the switcher's row (a 12th `--fzf` field); `wts feed`, one timeline

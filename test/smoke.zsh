@@ -25,7 +25,10 @@ export GIT_CONFIG_NOSYSTEM=1
 export WTS_NO_LLM=1
 # The hooks record events here; they must not ring a bell or post a banner.
 export WTS_NOTIFY=0
-unset TMUX WTS_LAYOUTS_PATH WTS_BRANCH_PREFIX WTS_BASE_BRANCH WTS_SUBDIR WTS_WORKTREES_BASE
+# TMUX_PANE too: run from a pane of your tmux, it reached every hook the test
+# runs, which recorded that pane (of your real server) as a sandbox agent's;
+# a check that read agent_panes then passed in a pane and failed outside one.
+unset TMUX TMUX_PANE WTS_LAYOUTS_PATH WTS_BRANCH_PREFIX WTS_BASE_BRANCH WTS_SUBDIR WTS_WORKTREES_BASE
 mkdir -p "$TMUX_TMPDIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME/wts/layouts" "$CLAUDE_CONFIG_DIR" "$SANDBOX/bin"
 
 cleanup() {
@@ -44,7 +47,7 @@ export WTS_SMOKE_AGENTS="$SANDBOX/agents.json"
 cat > "$SANDBOX/bin/claude" <<'EOF'
 #!/bin/sh
 [ "$1" = agents ] && { cat "$WTS_SMOKE_AGENTS" 2>/dev/null || echo '[]'; exit 0; }
-[ "$1" = --version ] && { echo "0.0.0 (smoke stand-in)"; exit 0; }
+[ "$1" = --version ] && { echo "${WTS_SMOKE_CLAUDE_VERSION:-0.0.0} (smoke stand-in)"; exit 0; }
 exec sleep 3600
 EOF
 chmod +x "$SANDBOX/bin/claude"
@@ -1281,6 +1284,64 @@ check "it dates their brief" eval '
   q "DELETE FROM briefs WHERE session = '\''dbpeer'\''"
   [[ "$out" == *"brief, 2h ago: done: login fixed"* ]]'
 
+# Claude Code's messages between sessions: each sibling line names the agent to
+# SendMessage, as Claude Code's session file lists it, and only when messages
+# work here (claude_messaging: the version and crossSessionInbound, cached in kv).
+msg_reset() { q "DELETE FROM kv WHERE key = 'claude.messaging'" }
+peer_file() { # <name> <pid>
+  jq -n --arg c "$WT/dbpeer" --arg n "$1" --argjson p "$2" \
+    '{pid: $p, sessionId: "peer-1", cwd: $c, name: $n, kind: "interactive", peerProtocol: 1, startedAt: 1}' \
+    > "$CLAUDE_CONFIG_DIR/sessions/77777.json"
+}
+mkdir -p "$CLAUDE_CONFIG_DIR/sessions"
+peer_file dbpeer $$
+msg_ctx() { (cd "$WT/dbsess" && env -u TMUX -u TMUX_PANE "$CONTEXT") }
+msg_old_claude() {
+  local out
+  msg_reset; out=$(msg_ctx)
+  [[ "$out" == *"- dbpeer (feature/dbpeer): fix the peer's login"* && "$out" != *SendMessage* ]]
+}
+check "an older claude: no SendMessage in the context" msg_old_claude
+check "and doctor says which version it needs" eval '
+  out=$("$WTS" doctor); [[ "$out" == *"messages between sessions: needs claude >= 2.1.224 (this is 0.0.0)"* ]]'
+export WTS_SMOKE_CLAUDE_VERSION=2.1.300
+msg_reach() { # <name>
+  local out
+  msg_reset; out=$(msg_ctx)
+  [[ "$out" == *"- dbpeer (feature/dbpeer): fix the peer's login — reach \`$1\` with SendMessage"* ]]
+}
+check "a recent one: the sibling line says the name to reach it by" msg_reach dbpeer
+check "the verdict is cached in kv, keyed by the binary" eval '
+  [[ "$(q "SELECT value FROM kv WHERE key = '\''claude.messaging'\''")" == "$SANDBOX/bin/claude:"*"|available" ]]'
+check "doctor: available" eval '
+  out=$("$WTS" doctor); [[ "$out" == *"✓ messages between sessions: available"* ]]'
+# A layout without --name: Claude Code derives one, and a prefix is refused.
+peer_file dbpeer-3c $$
+check "the name is the one Claude Code lists, not the session's" msg_reach dbpeer-3c
+# Claude Code leaves a crashed agent's file behind.
+( : ) & dead=$!; wait $dead
+peer_file dbpeer $dead
+refute "an agent whose process is gone gets no name" msg_reach dbpeer
+peer_file dbpeer $$
+print -r -- '{"crossSessionInbound": "refuse"}' > "$CLAUDE_CONFIG_DIR/settings.json"
+refute "crossSessionInbound refuse: no SendMessage" msg_reach dbpeer
+check "and doctor names the setting and the file" eval '
+  msg_reset; out=$("$WTS" doctor)
+  [[ "$out" == *"⚠ messages between sessions: refused by crossSessionInbound in $CLAUDE_CONFIG_DIR/settings.json"* ]]'
+print -r -- '{"crossSessionInbound": "hold"}' > "$CLAUDE_CONFIG_DIR/settings.json"
+check "hold: doctor says each message waits for approval" eval '
+  msg_reset; out=$("$WTS" doctor); [[ "$out" == *"held by crossSessionInbound"*"waits for your approval"* ]]'
+# A repository may tighten the setting: read on every call, not cached.
+rm -f "$CLAUDE_CONFIG_DIR/settings.json"
+mkdir -p "$WT/dbsess/.claude"
+print -r -- '{"crossSessionInbound": "refuse"}' > "$WT/dbsess/.claude/settings.local.json"
+refute "a worktree's own settings can refuse" msg_reach dbpeer
+rm -rf "$WT/dbsess/.claude"
+check "and without them it is said again" msg_reach dbpeer
+rm -f "$CLAUDE_CONFIG_DIR/sessions/77777.json"
+unset WTS_SMOKE_CLAUDE_VERSION
+msg_reset
+
 settings="$CLAUDE_CONFIG_DIR/settings.json"
 print -r -- '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo mine"}]}]}}' > "$settings"
 check "setup claude prints the hook" eval '"$WTS" setup claude | grep -qF "$ROOT/libexec/wts/wts-context"'
@@ -1546,6 +1607,23 @@ check "the retro is asked as JSON, against its four fields" eval '
   [[ "$args" == *"--output-format json"* && "$args" == *"--json-schema"*"\"abandoned\""* ]]'
 check "its cost goes to the archived incarnation" eval '
   [[ "$(archsess_usage)" == 2\|0.0008 ]]'
+# The retrospective's list of the author's messages leaves out what another
+# session sent: its record opens with "Another Claude session sent a message",
+# which the old filter (a leading "<") let through. After the cost check above,
+# which counts the calls before it.
+retro_facts_skip_peers() {
+  local tr="$SANDBOX/retro-msg.jsonl" facts="$SANDBOX/retro-facts"
+  print -r -- '{"type":"user","message":{"content":"first: build the bucket"}}
+{"type":"user","isMeta":true,"turnOrigin":"peer","origin":{"kind":"peer","name":"rate-limit"},"message":{"content":"Another Claude session sent a message:\nSIBLING-WORDS"}}
+{"type":"user","isMeta":true,"turnOrigin":"system","message":{"content":"[Cross-session idle notice] NOTICE-WORDS"}}
+{"type":"user","message":{"content":"AUTHOR-SECOND use the clock"}}' > "$tr"
+  q "UPDATE archive SET transcript = '$tr' WHERE session = 'archsess'"
+  retro_with "cat > $facts; printf 'delivered: x\n'" >/dev/null
+  q "UPDATE archive SET transcript = '' WHERE session = 'archsess'"
+  [[ "$(<$facts)" == *"AUTHOR-SECOND"* && "$(<$facts)" == *"2 message(s) from the author"* \
+     && "$(<$facts)" != *SIBLING-WORDS* && "$(<$facts)" != *NOTICE-WORDS* ]]
+}
+check "the retrospective's facts leave out a sibling's messages" retro_facts_skip_peers
 # The prose of a model that ignored the schema, which the regex used to fish
 # for: no structured_output, so nothing is stored but the reason.
 check "an answer without its fields is an error, not a retro" eval '
@@ -2286,7 +2364,44 @@ check "a compaction leaves the state alone" eval '
   ev prompt "{\"session_id\":\"abc-789\"}"
   ev start "{\"session_id\":\"abc-789\",\"source\":\"compact\"}"
   [[ "$(ev_state)" == working ]]'
+# A message from another Claude session (SendMessage) is a prompt too: the
+# hook records it with kind message and the sender; the idle notice of
+# notify_when_idle likewise. Prompts as measured on Claude Code 2.1.293.
+check "a message from another session: a prompt of kind message, from its sender" eval '
+  ev prompt "$(jq -n "{session_id: \"abc-789\", prompt: \"<cross-session-message from=\\\"uds:/tmp/cc-socks/1.sock\\\" from-name=\\\"rate-limit\\\" from-mode=\\\"prompting\\\">\\nis /login done?\\n</cross-session-message>\"}")"
+  [[ "$(q "select kind || \"|\" || message from agent_events where session = '\''evsess'\'' and event = '\''prompt'\'' order by id desc limit 1")" == "message|from rate-limit" \
+  && "$(ev_state)" == working ]]'
+check "the idle notice too, with its text" eval '
+  ev prompt "{\"session_id\":\"abc-789\",\"prompt\":\"[Cross-session idle notice] \\\"rate-limit\\\", which you asked to be notified about, is idle now\"}"
+  [[ "$(q "select kind || \"|\" || message from agent_events where session = '\''evsess'\'' and event = '\''prompt'\'' order by id desc limit 1")" == "message|[Cross-session idle notice]"* ]]'
+check "the author's own prompt keeps an empty kind" eval '
+  ev prompt "{\"session_id\":\"abc-789\",\"prompt\":\"<command-name>/review</command-name> and fix it\"}"
+  [[ -z "$(q "select kind from agent_events where session = '\''evsess'\'' and event = '\''prompt'\'' order by id desc limit 1")" ]]'
 ev stop '{"session_id":"abc-789"}'
+# wts brief: a sibling's message is neither the starting task nor the author's
+# last message. A transcript shaped like Claude Code's: the inbound message is a
+# user record with origin.kind peer, and may be the last prompt.
+msg_tr="$SANDBOX/msg-transcript.jsonl"
+cat > "$msg_tr" <<'JSONL'
+{"type":"user","isMeta":true,"promptSource":"system","turnOrigin":"peer","origin":{"kind":"peer","name":"rate-limit"},"message":{"role":"user","content":"Another Claude session sent a message:\n<cross-session-message from-name=\"rate-limit\">\nstart with the 429\n</cross-session-message>"}}
+{"type":"user","promptSource":"typed","turnOrigin":"human","origin":{"kind":"human"},"message":{"role":"user","content":"Add the retry header"}}
+{"type":"last-prompt","lastPrompt":"Add the retry header"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done with the header."}]}}
+{"type":"last-prompt","lastPrompt":"<cross-session-message from=\"uds:/x\" from-name=\"rate-limit\">\nis it done?\n</cross-session-message>"}
+JSONL
+# The row is written here: the hook writes one only under $TMUX_PANE, and the
+# ev calls above run without it.
+q "INSERT INTO agent_panes (session, claude_session, pane, at, transcript)
+   VALUES ('evsess', 'abc-789', '', strftime('%s','now'), '$msg_tr')
+   ON CONFLICT(session) DO UPDATE SET transcript = excluded.transcript"
+q "UPDATE sessions SET prompt = '' WHERE name = 'evsess'"
+brief_skips_peers() {
+  local out
+  out=$("$WTS" brief evsess 2>/dev/null </dev/null)
+  [[ "$out" == *"task:  Add the retry header"* && "$out" == *"you:   Add the retry header"* \
+     && "$out" != *"start with the 429"* && "$out" != *"is it done"* ]]
+}
+check "brief: the task and the author's last message are not a sibling's" brief_skips_peers
 check "ls says since when, next to the state" eval '
   [[ "$("$WTS" ls | grep "^evsess ")" == "evsess "*" idle "[0-9]*s" "* ]]'
 check "ls --wide says what a blocked agent waits for" eval '

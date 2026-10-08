@@ -166,11 +166,38 @@ fi
 db_common_of "$my_repo" >/dev/null
 my_common="${_WTS_COMMON[$my_repo]}"
 
+# Claude Code's messages between sessions (claude_messaging in wts-db.zsh: the
+# version and crossSessionInbound, cached in kv): when they work, each sibling
+# line says the name its agent answers SendMessage on, read from Claude Code's
+# own session files (claude_peer_names). Only a live agent gets one: a session
+# whose agent is not running cannot be messaged, and is not listed by
+# ListAgents either. Without them nothing is said, and the skill's wts send
+# and wts wait are the way.
+typeset -A peer_of
+if claude_messaging "$my_worktree" >/dev/null 2>&1; then
+  while IFS=$'\x1f' read -r pcwd pname; do
+    [[ -n "$pcwd" && -n "$pname" && -z "${peer_of[$pcwd]:-}" ]] && peer_of[$pcwd]="$pname"
+  done < <(claude_peer_names)
+fi
+# The name of the agent working in <worktree> (or a folder of it, WTS_SUBDIR),
+# under either spelling of the path: the registry keeps what wts was given, the
+# session file the resolved one.
+peer_in() {  # <worktree>
+  local wt c
+  (( ${#peer_of} )) || return 1
+  for wt in "$1" "${1:A}"; do
+    for c in "${(@k)peer_of}"; do
+      if [[ "$c" == "$wt" || "$c" == "$wt"/* ]]; then print -r -- "${peer_of[$c]}"; return 0; fi
+    done
+  done
+  return 1
+}
+
 # Eight at most, newest first: a machine with fifty sessions must not flood the
 # context, and the eighth most recent sibling is rarely the one that collides.
 typeset -a siblings sibling_names
 siblings=() sibling_names=()
-while IFS=$'\x1f' read -r -d $'\x1e' name branch root prompt context brief brief_age; do
+while IFS=$'\x1f' read -r -d $'\x1e' name branch root wt prompt context brief brief_age; do
   [[ -n "$name" ]] || continue
   db_common_of "$root" >/dev/null
   [[ "${_WTS_COMMON[$root]}" == "$my_common" ]] || continue
@@ -183,8 +210,9 @@ while IFS=$'\x1f' read -r -d $'\x1e' name branch root prompt context brief brief
   # "2h ago": a brief is a cache of the model's summary, and one written last
   # week reads exactly like one written a minute ago.
   [[ -n "$brief" ]] && line+=" — brief, $(age_ago "$brief_age"): $(cut80 "$brief")"
+  if peer=$(peer_in "$wt"); then line+=" — reach \`$peer\` with SendMessage"; fi
   siblings+=("$line")
-done < <(db_rows "SELECT s.name, s.branch, s.repo_root, s.prompt, s.context,
+done < <(db_rows "SELECT s.name, s.branch, s.repo_root, s.worktree, s.prompt, s.context,
                          coalesce(replace(b.body, char(10), ' / '), ''),
                          coalesce(CAST(strftime('%s', 'now') AS INTEGER) - b.updated_at, '')
                   FROM sessions s LEFT JOIN briefs b ON b.session = s.name

@@ -95,6 +95,36 @@
   row whose agent is at 80% or more starts its subject with `[ctx N%]`.
   `wts status --fzf` has a twelfth field (the context, before the subject).
 
+- **Agents reach each other with Claude Code's own messages.** Claude Code
+  2.1.224 and later delivers messages between the sessions of one machine
+  (`ListAgents`, `SendMessage`, `notify_when_idle`). Measured on 2.1.293 with
+  two wts agents: a message to a working agent is read at its next tool call,
+  one to an idle agent starts a turn, the reply comes back the same way, and
+  the idle notice arrives as a turn of its own. The skill now tells an agent
+  to `SendMessage` a sibling `ListAgents` lists rather than `wts send` it, and
+  to ask `notify_when_idle` rather than `wts wait`; `wts send` and `wts wait`
+  stay for unlisted agents, terminals and scripts. In the `SessionStart`
+  block, each sibling whose agent runs ends with "reach `<name>` with
+  SendMessage", the name Claude Code lists it under, read from its session
+  file: a layout without `--name` gets a derived one (`<session>-3c`), and a
+  prefix is refused. Said only when messages work here: the verdict (Claude
+  Code's version and its `crossSessionInbound` setting) is cached in
+  `kv['claude.messaging']` and computed again after an upgrade or a settings
+  change.
+
+- **A message from another session is not the author's.** It reaches the
+  agent as a prompt, and `UserPromptSubmit` fires for it: `wts-hook prompt`
+  records it with `kind = message` and `message = from <sender>` (or the
+  notice, for `notify_when_idle`). `wts brief` and the retrospective leave
+  such messages out of the author's: "Author's last message" and the starting
+  task skip them, and the retrospective's list of the author's messages no
+  longer counts them (they open with "Another Claude session sent a message",
+  which got past the old filter).
+
+- **`wts doctor` says whether agents can message each other**: available,
+  needs claude >= 2.1.224, refused by `crossSessionInbound`, or held by it
+  (each message waits for your approval), naming the settings file.
+
 ## 1.10.1 — 2026-10-07
 
 - **The document picker waits for its whole list before reading keys**

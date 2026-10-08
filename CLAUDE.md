@@ -76,6 +76,7 @@ docs/demo/                record.zsh + demo.tape (README GIF, make demo)
                           + worktreeinclude.zsh/.tape (.worktreeinclude copied into a new worktree)
                           + structured-cost.zsh/.tape (brief's JSON answer, its cost under wts:brief)
                           + statusline-gauges.zsh/.tape (setup claude --statusline, the line, the gauges)
+                          + native-messaging.zsh/.tape (two real agents, SendMessage between sessions)
 ```
 
 Homebrew, `make install` and a git checkout share this tree, so `bin/wts` works

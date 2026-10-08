@@ -302,11 +302,12 @@ facts() {
     # messages — the best evidence of what resisted — are spread over all of it.
     # \u001f between the three parts and \u001e at the end, because each one
     # contains newlines and `read` must be told where a field stops.
-    IFS=$'\x1f' read -r -d $'\x1e' users texts span < <(read_transcript "$tr" | jq -Rrn '
+    # The author's own: authored (JQ_AUTHORED in wts-db.zsh) leaves out what
+    # another session sent with SendMessage, which is a user record too.
+    IFS=$'\x1f' read -r -d $'\x1e' users texts span < <(read_transcript "$tr" | jq -Rrn "$JQ_AUTHORED"'
       [inputs | fromjson?] as $r
-      | ([$r[] | select(.type == "user" and (.isSidechain | not))
-          | .message.content | select(type == "string")
-          | select(startswith("<") | not)]) as $u
+      | ([$r[] | select(.type == "user" and (.isSidechain | not) and authored)
+          | .message.content]) as $u
       | ([$r[] | select(.type == "assistant" and (.isSidechain | not))
           | .message.content[]? | select(.type == "text") | .text]) as $a
       | ([$r[] | .timestamp // empty]) as $t
