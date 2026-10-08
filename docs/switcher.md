@@ -22,12 +22,16 @@ when the popup is not open.
   tmux sessions unknown to wts are listed after.
 - **Marks.** `*` after a name marks the session you came from, as tmux marks
   its current window. `@` at the start of SUBJECT marks a session that serves a
-  [task](tasks.md).
+  [task](tasks.md). `[ctx 84%]` at its start marks an agent whose context
+  window is 80% full or more, close to compacting: read from its [status
+  line](watching.md#claude-codes-status-line), so only once that is set up.
 - **The tasks.** Under the sessions, the open tasks: see
   [tasks.md](tasks.md#tasks-in-the-switcher).
 - **The preview**, on the right half:
-  1. the agent's state, for how long, and the question it waits on when there
-     is one (`blocked 4m: Bash: rm -rf dist`);
+  1. the agent's state, for how long, the share of its context window in use
+     when its [status line](watching.md#claude-codes-status-line) reported
+     one, and the question it waits on when there is one (`blocked 4m · ctx
+     62%: Bash: rm -rf dist`);
   2. dimmed, what the session already said about itself: the cached `done:` /
      `next:` of `wts brief` with its age, and the last two notes its agent left
      with `wts db set`. These come from the database, never a model call, and

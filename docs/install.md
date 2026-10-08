@@ -131,6 +131,23 @@ The skill is `~/.claude/skills/wts/SKILL.md`. It lets a Claude started
 *anywhere* find wts when you ask about parallel work: see [Driving wts from an
 agent](agents.md#driving-wts-from-an-agent).
 
+### The status line, opt-in
+
+```sh
+wts setup claude --statusline   # makes wts Claude Code's status line (backup kept)
+```
+
+Never part of `--install`: you have one status line, and it may be a script of
+your own. With it, the line under each agent's prompt names its wts session,
+the model, the context in use, how many sessions need you and the notes it has
+not been handed yet, and every refresh records the context, the rate limits and
+Claude Code's cost for `wts status --json` ([Claude Code's status
+line](watching.md#claude-codes-status-line)).
+
+It writes `statusLine` only when there is none or it is wts's. Over one of your
+own it changes nothing, exits 1, and prints a `statusLine` that runs both, one
+line each, for you to put in by hand.
+
 ## Checking it: `wts doctor`
 
 `wts doctor` checks:
@@ -140,7 +157,9 @@ agent](agents.md#driving-wts-from-an-agent).
   fitted preview below 0.46, the key footer below 0.65;
 - whether `claude agents --json` answers;
 - whether the tmux snippet and the Claude hooks are installed and come from
-  this wts, and whether the skill is.
+  this wts, and whether the skill is;
+- which status line Claude Code runs: none, wts's, or yours. Optional, so only
+  a wts one pointing at another install is a warning.
 
 It exits 1 when something required is missing. A creation also checks for tmux
 and tmuxinator itself, before it makes a branch or a worktree.

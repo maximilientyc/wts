@@ -17,6 +17,7 @@
 #   usage        tokens per session, transcript and model, summed from transcripts
 #   pr_state     each session's pull request, CI and review, as gh last saw it
 #   merge_checks whether each session's branch landed in the base, per tip
+#   agent_gauges what each agent's Claude Code status line last reported
 #
 # Why a database: the registry used to be one JSON file rewritten whole with
 # `jq … > tmp && mv` by bin/wts, wts-gc and wts-doc. Two writers at once lost one
@@ -29,7 +30,7 @@
 
 WTS_STATE_DIR="${WTS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wts}"
 WTS_DB="${WTS_DB:-$WTS_STATE_DIR/wts.db}"
-WTS_DB_SCHEMA=11
+WTS_DB_SCHEMA=12
 # Where the helpers are, for the few functions below that call one. Top level:
 # when this file is sourced, $0 is this file.
 WTS_DB_HOME="${0:A:h}"
@@ -538,6 +539,30 @@ CREATE TABLE IF NOT EXISTS seen (
   at      INTEGER NOT NULL,
   PRIMARY KEY (session, stream, ref)
 );
+-- What the agent's own Claude Code status line last reported (schema 12),
+-- written by wts-hook statusline when the user opted into it (wts setup claude
+-- --statusline): the share of the context window in use, the account's rate
+-- limits as that agent saw them, and Claude Code's own running cost of the
+-- conversation. One row per session and conversation, overwritten at every
+-- refresh: the newest row is the gauge, and the sum of cost_usd over the
+-- conversations is cost_reported_usd. A reading, not a ledger: the usage
+-- table and the price table stay what the cost is computed from. NULL when
+-- the payload did not say (no context before the first answer, no rate
+-- limits for an API key). NUMERIC, not REAL: a 41 stays 41 in the JSON,
+-- not 41.0. Rows older than their session are a former session
+-- of the same name and are ignored by the readers; dropped with the session.
+-- Schema 11 is usage.cost_usd; no column is added here, a table is.
+CREATE TABLE IF NOT EXISTS agent_gauges (
+  session        TEXT NOT NULL,
+  claude_session TEXT NOT NULL DEFAULT '',
+  model          TEXT NOT NULL DEFAULT '',
+  cost_usd       NUMERIC,
+  context_pct    NUMERIC,
+  rate_5h        NUMERIC,
+  rate_7d        NUMERIC,
+  at             INTEGER NOT NULL,
+  PRIMARY KEY (session, claude_session)
+);
 $imports
 -- merge_checks is a cache of verdicts: a schema change may come with a new
 -- test (8: squashes of several commits), and an old verdict stays until a tip
@@ -780,9 +805,12 @@ db_repo_siblings() {  # <session>
 # A Notification whose kind means the agent cannot go on without a human. One
 # list, for the collector's state and the hook's banner: with one each,
 # `idle_prompt` read idle in the switcher while its banner said "needs you",
-# right after the "is done" of the same idle turn.
+# right after the "is done" of the same idle turn. The array is for SQL
+# (sql_list): the status line counts the blocked sessions in one query.
+typeset -ga WTS_NEEDS_HUMAN
+WTS_NEEDS_HUMAN=(permission_prompt elicitation_dialog elicitation_url_dialog agent_needs_input)
 needs_human() {  # <notification_type>
-  [[ "$1" == (permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input) ]]
+  (( ${WTS_NEEDS_HUMAN[(Ie)$1]} ))
 }
 
 # The model a retrospective is written with: wts-retro calls it, and gc's dry
@@ -1518,6 +1546,35 @@ seen_prune_sql() {  # <set> [not]
   WHERE session $op $1
      OR (stream IN ('notes', 'overlap')
          AND substr(ref, 1, instr(ref, char(31)) - 1) $op $1);"
+}
+
+# The status line's readings of the sessions in <set> (registry_del) or outside
+# it (gc), as seen_prune_sql: a statement of its own, after the transaction,
+# because a database an older wts left behind has no agent_gauges table.
+gauges_prune_sql() {  # <set> [not]
+  local op="IN"
+  [[ "${2:-}" == not ]] && op="NOT IN"
+  print -r -- "DELETE FROM agent_gauges WHERE session $op $1;"
+}
+
+# What the status line reported for each session, as one JSON object keyed by
+# name: {context_pct, rate_limits: {five_hour, seven_day} | null,
+# cost_reported_usd}, each null when no reading says. The newest row gives the
+# gauges; the cost is the sum over the session's conversations. A row older
+# than its session belongs to a former session of the same name.
+gauges_json_sql() {
+  print -r -- "SELECT json_group_object(s.name, json_object(
+      'context_pct', g.context_pct,
+      'rate_limits', CASE WHEN g.rate_5h IS NULL AND g.rate_7d IS NULL THEN NULL
+                          ELSE json_object('five_hour', g.rate_5h, 'seven_day', g.rate_7d) END,
+      'cost_reported_usd', (SELECT sum(c.cost_usd) FROM agent_gauges c
+                            WHERE c.session = s.name
+                              AND c.at >= CAST(strftime('%s', s.created_at) AS INTEGER))))
+    FROM sessions s
+    JOIN agent_gauges g ON g.rowid = (
+      SELECT x.rowid FROM agent_gauges x
+      WHERE x.session = s.name AND x.at >= CAST(strftime('%s', s.created_at) AS INTEGER)
+      ORDER BY x.at DESC LIMIT 1)"
 }
 
 # What a task cost over every attempt, as a SQL expression yielding a JSON

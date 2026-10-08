@@ -7,7 +7,10 @@
 #   --table colored column rendering for `wts ls`
 #   --wide  with --table: TOKENS, COST and MODEL too (`wts ls --wide`), read
 #           from the usage table that wts brief and the archive fill. --json
-#           carries the same as `usage`, except with --no-git (null there)
+#           carries the same as `usage`, except with --no-git (null there).
+#           CTX is the context window in use, from the status line's gauges
+#           (context_pct, rate_limits, cost_reported_usd in --json, null
+#           without `wts setup claude --statusline`)
 #   --fzf   sorted lines (stuck first, merged last) for wts-switch, fields separated by
 #           \x1f: TAB is an IFS whitespace and would collapse empty fields (an
 #           agent without a tmux pane would shift every column).
@@ -528,11 +531,23 @@ all=$(printf '%s\n' "${objects[@]}" | jq -s "$SORT_KEY")
 # `usage: null` here, filled in below when it is computed: without it --no-git
 # left the key out, where the contract says null — `.usage == null` is true of
 # a missing key too, which is how a check on it passed.
+# The status line's gauges ride along too (agent_gauges, written by `wts-hook
+# statusline` when the user opted into it): one read, and null everywhere
+# without it. Not for --line, which counts states only.
+gauges_map='{}'
+if [[ "$FORMAT" != line ]]; then
+  gauges_map=$(db_ro "$(gauges_json_sql)" 2>/dev/null)
+  [[ "$gauges_map" == '{'* ]] || gauges_map='{}'
+fi
 if merged=$(print -r -- "$all" | jq --slurpfile reg <(print -r -- "$REGISTRY") \
+      --argjson g "$gauges_map" \
       'map(. + {prompt: ($reg[0][.name].prompt // ""),
                 task: ($reg[0][.name].task // ""),
                 task_title: ($reg[0][.name].task_title // ""),
-                usage: null})' 2>/dev/null); then
+                usage: null,
+                context_pct: ($g[.name].context_pct // null),
+                rate_limits: ($g[.name].rate_limits // null),
+                cost_reported_usd: ($g[.name].cost_reported_usd // null)})' 2>/dev/null); then
   all="$merged"
 fi
 
@@ -598,7 +613,8 @@ case "$FORMAT" in
   # Fields 7 and 8, since (epoch) and waiting-for, feed the preview's header.
   # Field 9 is the PR column (db_pr_labels in wts-db.zsh, which the switcher's
   # skeleton reads too), field 10 the repository root (the switcher's REPO
-  # column, named there without a fork), and the subject stays last.
+  # column, named there without a fork), field 11 the context window in use,
+  # rounded, empty without a status line reading, and the subject stays last.
   fzf)   typeset -a label_pairs=()
          for pr_row in "${(@ps:\x1e:)$(db_pr_labels)}"; do
            pr_f=("${(@ps:\x1f:)pr_row}")
@@ -620,6 +636,7 @@ case "$FORMAT" in
                 | gsub("[\\t\\n\\r\u001f\u001e]"; " ")),
                ($labels[.name] // ""),
                (.repo_root // ""),
+               (.context_pct | if type == "number" then round | tostring else "" end),
                subject ]
            | join("")' ;;
   # One line for a status bar, empty when nobody needs you: dead tmux sessions
@@ -662,6 +679,7 @@ case "$FORMAT" in
                elif $s < 3600 then " \($s / 60 | floor)m"
                elif $s < 86400 then " \($s / 3600 | floor)h\(($s % 3600) / 60 | floor)m"
                else " \($s / 86400 | floor)d" end end;
+           def ctx: .context_pct | if type == "number" then "\(round)%" else "-" end;
            def waiting: (.agent_waiting_for // "")
              | (if type == "string" then . else tojson end)
              | gsub("[\\t\\n\\r]"; " ")
@@ -669,7 +687,7 @@ case "$FORMAT" in
            ([$repos[]] | unique | length > 1) as $multi
            | (["SESSION"] + (if $multi then ["REPO"] else [] end)
               + ["AGENT","BRANCH","DELTA","DIRTY","TMUX"]
-              + (if $wide then ["TOKENS","COST","MODEL","WAITING"] else [] end)
+              + (if $wide then ["TOKENS","COST","MODEL","CTX","WAITING"] else [] end)
               + ["SUBJECT"] | @tsv),
            (.[] | [ .name ]
                 + (if $multi then [$repos[.repo_root // ""] // "-"] else [] end)
@@ -680,7 +698,7 @@ case "$FORMAT" in
                     (if $git then "+\(.added)/-\(.removed)" + (if .ahead > 0 then " ^\(.ahead)" else "" end) else "-" end),
                     (if ($git | not) then "-" elif .dirty > 0 then "yes" else "no" end),
                     (if .tmux_alive then "running" else "stopped" end) ]
-                + (if $wide then usage_cells + [waiting] else [] end)
+                + (if $wide then usage_cells + [ctx, waiting] else [] end)
                 + [ (subject | if . == "" then "-" else . end) ] | @tsv)' \
          | column -t -s $'\t' ;;
 esac

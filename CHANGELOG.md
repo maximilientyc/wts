@@ -76,6 +76,25 @@
   (`WTS-FETCH-FAILED: Reached max turns (8) (WTS_DOC_MAX_TURNS)`), instead of
   "answer too short".
 
+- **Claude Code's status line as a source, opt-in.** `wts setup claude
+  --statusline` (never part of `--install`) makes `wts-hook statusline` the
+  `statusLine` of `settings.json`, only when there is none or it is wts's: over
+  a status line of your own it changes nothing, exits 1 and prints one that
+  runs both. In a wts session the line reads `wts <session> · <model> · ctx N%
+  · k session(s) need you · m unseen note(s)` (a zero count left out), outside
+  one `<model> · ctx N%`. Each refresh writes the payload's context window in
+  use, rate limits (five-hour, seven-day) and Claude Code's own cost into a new
+  table, `agent_gauges` (**schema 12**, after 11's `usage.cost_usd`). One sqlite3 process per refresh, no jq, no tmux: ~30 ms.
+  `wts doctor` reports which status line is set, as optional.
+
+- **`wts status --json` gains `context_pct`, `rate_limits` and
+  `cost_reported_usd`** (additive keys: the next release is a minor), `null`
+  without a status line reading. The usage table and the price table stay the
+  ledger; `cost_reported_usd` is Claude Code's figure beside it. `wts ls
+  --wide` has a CTX column; the switcher's preview header adds `ctx N%`, and a
+  row whose agent is at 80% or more starts its subject with `[ctx N%]`.
+  `wts status --fzf` has a twelfth field (the context, before the subject).
+
 ## 1.10.1 — 2026-10-07
 
 - **The document picker waits for its whole list before reading keys**

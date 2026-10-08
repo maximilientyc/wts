@@ -426,7 +426,7 @@ tmux kill-session -t "=namer" 2>/dev/null || true
 
 check "ls shows the session" eval '"$WTS" ls | grep -q "^auth-form "'
 check "status --json" eval '"$WTS" status --json | jq -e "length == 2 and all(.[]; .exists and .tmux_alive)"'
-check "status --fzf has 11 fields" eval '"$WTS" status --fzf | awk -F "\037" "NF != 11 { exit 1 }"'
+check "status --fzf has 12 fields" eval '"$WTS" status --fzf | awk -F "\037" "NF != 12 { exit 1 }"'
 
 # An interactive agent waiting for an answer needs a human: blocked, sorted first.
 jq -n --arg cwd "$WT/export-users-csv" \
@@ -804,8 +804,8 @@ check "a pass over unchanged tips reads the merge verdict from its cache" \
   eval '! grep -qE -- "--merged|patch-id" "$WTS_SMOKE_BRANCHLOG"'
 
 # --no-git: agent and tmux columns only, git columns "-", same field count.
-check "status --fzf --no-git keeps 11 fields" \
-  eval '"$ROOT/libexec/wts/wts-status" --fzf --no-git | awk -F "\037" "NF != 11 { exit 1 }"'
+check "status --fzf --no-git keeps 12 fields" \
+  eval '"$ROOT/libexec/wts/wts-status" --fzf --no-git | awk -F "\037" "NF != 12 { exit 1 }"'
 check "status --fzf --no-git shows - for delta and dirty" \
   eval '"$ROOT/libexec/wts/wts-status" --fzf --no-git | awk -F "\037" "\$4 != \"-\" || \$5 != \"-\" { exit 1 }"'
 check "status --json --no-git lists every session with zeroed git columns" \
@@ -2381,8 +2381,8 @@ check "the base it was compared against is recorded" eval '
   [[ "$(q "select base from archive where session = '"'"'gcarch'"'"'")" == main ]]'
 check "the worktree really is gone" eval '[[ ! -e "$WT/gcarch" ]]'
 
-check "the schema is at version 11" eval '
-  [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 11 ]]'
+check "the schema is at version 12" eval '
+  [[ "$(sqlite3 -init /dev/null -readonly "$DB" "PRAGMA user_version")" == 12 ]]'
 
 # ─── PR, CI and review state ─────────────────────────────────────────────────
 # gh is a stand-in: it answers from fixtures keyed by what it was asked (a
@@ -3076,7 +3076,7 @@ check "ls --wide adds tokens, cost and model" eval '
   [[ "$out" == *TOKENS*COST*MODEL*SUBJECT* && "$(print -r -- "$out" | grep "^agent-a ")" == *"32k"*"\$0.03"*"opus-5-5"* ]]'
 check "plain ls does not" eval '[[ "$("$WTS" ls)" != *TOKENS* ]]'
 check "status --table --wide is the same table" eval '[[ "$("$WTS" status --table --wide)" == *TOKENS* ]]'
-check "the switcher list keeps its 11 fields (usage adds none)" eval '"$WTS" status --fzf | awk -F "\037" "NF != 11 { exit 1 }"'
+check "the switcher list keeps its 12 fields (usage adds none)" eval '"$WTS" status --fzf | awk -F "\037" "NF != 12 { exit 1 }"'
 check "--no-git, what prefix+a and wait poll, has it null" eval '
   "$WTS" status --json --no-git agent-a | jq -e ".[0] | has(\"usage\") and .usage == null"'
 q "UPDATE usage SET input = 999 WHERE session = 'agent-a' AND model = 'claude-opus-5-5'"
@@ -3147,7 +3147,7 @@ check "a pr_state from schema 7 gets head on the next command" eval '
   "$WTS" ls >/dev/null
   [[ "$(q "SELECT count(*) FROM pragma_table_info('"'"'pr_state'"'"') WHERE name = '"'"'head'"'"'")" == 1
      && "$(q "SELECT state || head FROM pr_state WHERE session = '"'"'old-pr'"'"'")" == open
-     && "$(q "PRAGMA user_version")" == 11 ]]'
+     && "$(q "PRAGMA user_version")" == 12 ]]'
 # Schema 10 is a column on agent_panes: a table from schema 9 gets transcript,
 # and its rows stay.
 q "INSERT OR REPLACE INTO agent_panes (session, claude_session, pane, at) VALUES ('old-pane', '', '%1', 1);
@@ -3156,7 +3156,7 @@ check "an agent_panes from schema 9 gets transcript on the next command" eval '
   "$WTS" ls >/dev/null
   [[ "$(q "SELECT count(*) FROM pragma_table_info('"'"'agent_panes'"'"') WHERE name = '"'"'transcript'"'"'")" == 1
      && "$(q "SELECT pane || transcript FROM agent_panes WHERE session = '"'"'old-pane'"'"'")" == "%1"
-     && "$(q "PRAGMA user_version")" == 11 ]]'
+     && "$(q "PRAGMA user_version")" == 12 ]]'
 q "DELETE FROM agent_panes WHERE session = 'old-pane'"
 # Schema 11 is a column, usage.cost_usd: a usage table from schema 9 or 10
 # gets it, and keeps its rows. From 10 is the case the fast path of db_init
@@ -3168,9 +3168,14 @@ for from in 9 10; do
     "$WTS" ls >/dev/null
     [[ "$(q "SELECT count(*) FROM pragma_table_info('"'"'usage'"'"') WHERE name = '"'"'cost_usd'"'"'")" == 1
        && "$(q "SELECT output FROM usage WHERE session = '"'"'old-u'"'"'")" == 3
-       && "$(q "PRAGMA user_version")" == 11 ]]'
+       && "$(q "PRAGMA user_version")" == 12 ]]'
   q "DELETE FROM usage WHERE session = 'old-u'"
 done
+# Schema 12 is one table, agent_gauges: a database at 11 gets it.
+q "DROP TABLE agent_gauges; PRAGMA user_version = 11"
+check "a database at schema 11 gets agent_gauges on the next command" eval '
+  "$WTS" ls >/dev/null
+  [[ "$(q "SELECT count(*) FROM sqlite_master WHERE name = '"'"'agent_gauges'"'"'") $(q "PRAGMA user_version")" == "1 12" ]]'
 # Schema 9 is one table, seen: the prompt hook may be the first to open a
 # database an older wts left at 8, and it must create the table, not fail.
 env WTS_NO_ATTACH=1 "$WTS" schema8 smoke >/dev/null
@@ -3178,11 +3183,101 @@ q "DROP TABLE seen; PRAGMA user_version = 8"
 check "the prompt hook on a schema-8 database exits 0 and prints nothing" eval '
   out=$(cd "$WT/schema8" && print -r -- "{\"session_id\":\"s\"}" | env -u TMUX_PANE "$HOOK" prompt); (( $? == 0 )) && [[ -z "$out" ]]'
 check "and the database has seen afterwards" eval '
-  [[ "$(q "SELECT count(*) FROM sqlite_master WHERE name = '"'"'seen'"'"'") $(q "PRAGMA user_version")" == "1 11" ]]'
+  [[ "$(q "SELECT count(*) FROM sqlite_master WHERE name = '"'"'seen'"'"'") $(q "PRAGMA user_version")" == "1 12" ]]'
 q "DROP TABLE seen; PRAGMA user_version = 8"
 check "a database at schema 8 gets seen on the next command" eval '
   "$WTS" ls >/dev/null; [[ "$(q "SELECT count(*) FROM sqlite_master WHERE name = '"'"'seen'"'"'")" == 1 ]]'
 "$WTS" rm schema8 -f >/dev/null 2>&1
+# ─── The status line: gauges from Claude Code's statusLine payload ───────────
+# A fixture of the payload Claude Code hands its status line command: one row
+# in agent_gauges, one printed line, and the keys wts status --json adds.
+env WTS_NO_ATTACH=1 "$WTS" gauge-a smoke >/dev/null
+env WTS_NO_ATTACH=1 "$WTS" gauge-b smoke >/dev/null
+SL_PAYLOAD='{"session_id":"sl-0001","session_name":"gauge-a","model":{"id":"claude-opus-5-5","display_name":"Opus 5.5"},"cost":{"total_cost_usd":1.25},"context_window":{"used_percentage":83.6},"rate_limits":{"five_hour":{"used_percentage":12},"seven_day":{"used_percentage":40.5}}}'
+check "statusline prints the session, the model and the context" eval '
+  out=$(cd "$WT/gauge-a" && print -r -- "$SL_PAYLOAD" | "$HOOK" statusline); (( $? == 0 )) \
+  && [[ "$out" == "wts gauge-a · Opus 5.5 · ctx 84%" ]]'
+check "and writes one row into agent_gauges" eval '
+  [[ "$(q "SELECT claude_session, model, cost_usd, context_pct, rate_5h, rate_7d FROM agent_gauges WHERE session = '"'"'gauge-a'"'"'")" \
+     == "sl-0001|claude-opus-5-5|1.25|83.6|12|40.5" ]]'
+check "a refresh overwrites it, one row per conversation" eval '
+  (cd "$WT/gauge-a" && print -r -- "$SL_PAYLOAD" | "$HOOK" statusline >/dev/null)
+  [[ "$(q "SELECT count(*) FROM agent_gauges WHERE session = '"'"'gauge-a'"'"'")" == 1 ]]'
+check "status --json exposes context_pct, rate_limits and cost_reported_usd" eval '
+  "$WTS" status --json gauge-a | jq -e ".[0] | .context_pct == 83.6 and .rate_limits.five_hour == 12
+    and .rate_limits.seven_day == 40.5 and .cost_reported_usd == 1.25"'
+check "and null for a session without a reading" eval '
+  "$WTS" status --json gauge-b | jq -e ".[0] | has(\"context_pct\") and .context_pct == null
+    and .rate_limits == null and .cost_reported_usd == null"'
+check "status --fzf carries the context in field 11" eval '
+  [[ "$("$WTS" status --fzf | awk -F "\037" "\$1 == \"gauge-a\" { print \$11 }")" == 84 ]]'
+check "ls --wide has a CTX column" eval '
+  out=$("$WTS" ls --wide)
+  [[ "$out" == *MODEL*CTX*WAITING* && "$(print -r -- "$out" | grep "^gauge-a ")" == *" 84% "* ]]'
+check "the switcher marks the row at 80% or more, rows still padded" eval '
+  out=$(WTS_SWITCH_COLS=120 "$SWITCH" --list)
+  row=$(print -r -- "$out" | grep "^gauge-a ")
+  [[ "${row%%$'"'"'\t'"'"'*}" == *"[ctx 84%]"* ]] && print -r -- "$out" | tail -n +3 | awk -F "\t" "length(\$1) != 120 { exit 1 }"'
+q "INSERT INTO agent_events (session, claude_session, event, kind, message, at)
+   VALUES ('gauge-a', 'sl-0001', 'prompt', '', '', strftime('%s','now'))"
+check "the preview header says ctx after the state" eval '
+  export WTS_SWITCH_META="$SANDBOX/sl.meta"
+  "$SWITCH" --list >/dev/null
+  out=$("$SWITCH" --preview gauge-a gauge-a)
+  l=("${(@f)out}")
+  [[ "${l[1]}" == "working "*" · ctx 84%" ]]'
+unset WTS_SWITCH_META
+# Who needs you, and the notes not handed yet: gauge-b blocked on a
+# permission, then a note of gauge-b that gauge-a has not been told.
+q "INSERT INTO agent_events (session, claude_session, event, kind, message, at)
+   VALUES ('gauge-b', 's-b', 'notification', 'permission_prompt', 'Bash: rm', strftime('%s','now'))"
+q "INSERT OR REPLACE INTO notes VALUES ('gauge-b', 'sl-key', 'a note for the status line', strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
+check "and counts the sessions that need you and the unseen notes" eval '
+  out=$(cd "$WT/gauge-a" && print -r -- "$SL_PAYLOAD" | "$HOOK" statusline)
+  [[ "$out" == "wts gauge-a · Opus 5.5 · ctx 84% · "*" session(s) need you · "*" unseen note(s)" ]]'
+check "a note handed at the next prompt is no longer unseen" eval '
+  (cd "$WT/gauge-a" && print -r -- "{\"session_id\":\"sl-0001\"}" | env -u TMUX_PANE "$HOOK" prompt >/dev/null)
+  out=$(cd "$WT/gauge-a" && print -r -- "$SL_PAYLOAD" | "$HOOK" statusline)
+  [[ "$out" == *"need you"* && "$out" != *"unseen note"* ]]'
+check "outside a wts session: the model and the context, nothing written" eval '
+  n=$(q "SELECT count(*) FROM agent_gauges")
+  out=$(cd "$SANDBOX" && print -r -- "${SL_PAYLOAD/gauge-a/elsewhere}" | "$HOOK" statusline)
+  [[ "$out" == "Opus 5.5 · ctx 84%" && "$(q "SELECT count(*) FROM agent_gauges")" == "$n" ]]'
+check "the session name finds the session when the directory does not" eval '
+  out=$(cd "$SANDBOX" && print -r -- "${SL_PAYLOAD/gauge-a/gauge-b}" | "$HOOK" statusline)
+  [[ "$out" == "wts gauge-b · "* ]]'
+check "a payload that is not JSON exits 0, names the session and writes nothing" eval '
+  n=$(q "SELECT count(*) FROM agent_gauges")
+  out=$(cd "$WT/gauge-a" && print -r -- "not json" | "$HOOK" statusline); (( $? == 0 )) \
+  && [[ "$out" == "wts gauge-a · "*"need you" && "$(q "SELECT count(*) FROM agent_gauges")" == "$n" ]]'
+"$WTS" rm gauge-b -f >/dev/null 2>&1
+check "rm drops the session's gauges" eval '[[ "$(q "SELECT count(*) FROM agent_gauges WHERE session = '"'"'gauge-b'"'"'")" == 0 ]]'
+"$WTS" rm gauge-a -f >/dev/null 2>&1
+
+# setup claude --statusline: opt-in, never over a status line of the user's.
+CSL="$SANDBOX/claude-statusline"
+mkdir -p "$CSL"
+CLAUDE_CONFIG_DIR="$CSL" "$WTS" setup claude --install >/dev/null
+check "setup claude --install does not set the status line" eval 'jq -e "has(\"statusLine\") | not" "$CSL/settings.json"'
+check "doctor reports it as optional, not a warning" eval '
+  [[ "$(CLAUDE_CONFIG_DIR="$CSL" "$WTS" doctor)" == *"✓ Claude status line: not set (optional"* ]]'
+check "setup claude --statusline writes it" eval '
+  CLAUDE_CONFIG_DIR="$CSL" "$WTS" setup claude --statusline >/dev/null
+  jq -e --arg c "$ROOT/libexec/wts/wts-hook statusline" ".statusLine.type == \"command\" and .statusLine.command == \$c
+    and (.hooks.Stop | length) == 1" "$CSL/settings.json"'
+check "and again over its own" eval 'CLAUDE_CONFIG_DIR="$CSL" "$WTS" setup claude --statusline >/dev/null'
+check "doctor finds it" eval '[[ "$(CLAUDE_CONFIG_DIR="$CSL" "$WTS" doctor)" == *"✓ Claude status line: wts'"'"'s"* ]]'
+jq '.statusLine = {type: "command", command: "~/bin/my-line.sh"}' "$CSL/settings.json" > "$CSL/s.tmp" && mv "$CSL/s.tmp" "$CSL/settings.json"
+cp "$CSL/settings.json" "$CSL/mine.json"
+check "--statusline refuses a foreign statusLine, exit 1, and prints both chained" eval '
+  err=$(CLAUDE_CONFIG_DIR="$CSL" "$WTS" setup claude --statusline 2>&1 >/dev/null); (( $? == 1 )) \
+  && [[ "$err" == *"not wts'"'"'s: left untouched"*"my-line.sh"*"wts-hook statusline"* ]]'
+check "and leaves the settings as they were" eval 'cmp -s "$CSL/settings.json" "$CSL/mine.json"'
+CLAUDE_CONFIG_DIR="$CSL" "$WTS" setup claude --install >/dev/null
+check "--install keeps a status line of your own" eval '[[ "$(jq -r .statusLine.command "$CSL/settings.json")" == "~/bin/my-line.sh" ]]'
+check "doctor says it is yours, no warning" eval '
+  [[ "$(CLAUDE_CONFIG_DIR="$CSL" "$WTS" doctor)" == *"✓ Claude status line: your own"* ]]'
+
 check "log, retro, doctor, keys, doc, stop and pr are info commands for wts-fresh" eval '
   line=$(grep -E "^  ls\|status\|" "$ROOT/libexec/wts/wts-fresh")
   for c in log retro doctor keys doc stop pr; do [[ "$line" == *"|$c|"* ]] || exit 1; done'
