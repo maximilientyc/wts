@@ -25,7 +25,10 @@ export GIT_CONFIG_NOSYSTEM=1
 export WTS_NO_LLM=1
 # The hooks record events here; they must not ring a bell or post a banner.
 export WTS_NOTIFY=0
-unset TMUX WTS_LAYOUTS_PATH WTS_BRANCH_PREFIX WTS_BASE_BRANCH WTS_SUBDIR WTS_WORKTREES_BASE
+# TMUX_PANE too: run from a pane of your tmux, it reached every hook the test
+# runs, which recorded that pane (of your real server) as a sandbox agent's;
+# a check that read agent_panes then passed in a pane and failed outside one.
+unset TMUX TMUX_PANE WTS_LAYOUTS_PATH WTS_BRANCH_PREFIX WTS_BASE_BRANCH WTS_SUBDIR WTS_WORKTREES_BASE
 mkdir -p "$TMUX_TMPDIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME/wts/layouts" "$CLAUDE_CONFIG_DIR" "$SANDBOX/bin"
 
 cleanup() {
@@ -2386,7 +2389,11 @@ cat > "$msg_tr" <<'JSONL'
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done with the header."}]}}
 {"type":"last-prompt","lastPrompt":"<cross-session-message from=\"uds:/x\" from-name=\"rate-limit\">\nis it done?\n</cross-session-message>"}
 JSONL
-q "UPDATE agent_panes SET transcript = '$msg_tr' WHERE session = 'evsess'"
+# The row is written here: the hook writes one only under $TMUX_PANE, and the
+# ev calls above run without it.
+q "INSERT INTO agent_panes (session, claude_session, pane, at, transcript)
+   VALUES ('evsess', 'abc-789', '', strftime('%s','now'), '$msg_tr')
+   ON CONFLICT(session) DO UPDATE SET transcript = excluded.transcript"
 q "UPDATE sessions SET prompt = '' WHERE name = 'evsess'"
 brief_skips_peers() {
   local out
