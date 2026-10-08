@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## 1.11.0 — 2026-10-08
+
+**Upgrading.** Run `wts setup claude --install` again: it adds a seventh
+hook, `wts-hook start` on `SessionStart`. `wts setup claude --statusline` is
+new and opt-in. The database moves to schema 12 on the first command
+(`agent_panes.transcript`, `usage.cost_usd`, `agent_gauges`); a wts older than
+1.11.0 that opens it stops writing usage rows (silently, nothing is lost)
+until it is upgraded. Agents are now started with `--name <session>`, so a
+personal layout should pass it too (see `examples/layouts`).
 
 - **A conversation start is an event: an agent started again reads `idle`,
   not `stopped`.** A seventh hook, `wts-hook start`, runs on `SessionStart`
